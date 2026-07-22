@@ -19,7 +19,7 @@ import asyncio
 import json
 import logging
 from pathlib import Path
-from typing import Callable
+from typing import Awaitable, Callable
 
 from .decision import Policy, endpoint, evaluate
 
@@ -40,10 +40,12 @@ class DockerProxy:
         *,
         roots_provider: "Callable[[], list[Path]]",
         real_sock: str = _REAL_SOCK,
+        notify: "Callable[[str], Awaitable[None]] | None" = None,
     ) -> None:
         self.sock_path = Path(sock_path)
         self.roots_provider = roots_provider
         self.real_sock = real_sock
+        self.notify = notify  # подсветка запуска docker в бабле сессии (summary)
         self._server: asyncio.AbstractServer | None = None
         # Сильные ссылки на задачи соединений: иначе при обрыве клиента asyncio
         # освобождает его протокол и теряет ссылку на _handle (ещё ждёт апстрим)
@@ -128,6 +130,8 @@ class DockerProxy:
             up_w.write(body)
             await up_w.drain()
             hijack = False
+            if kind == "create" and self.notify is not None:
+                await self._notify_launch(obj, path)
         else:
             # Не create: hijack (Upgrade) не трогаем — он одноразовый; иначе шлём
             # Connection: close. Тело запроса (build-tar, stdin) уедет сплайсом.
@@ -136,6 +140,19 @@ class DockerProxy:
             await self._send_head(up_w, f"{method} {path} HTTP/1.1", out)
 
         await self._splice(cr, cw, up_r, up_w, hijack=hijack)
+
+    async def _notify_launch(self, obj: dict | None, path: str) -> None:
+        """Подсветить запуск контейнера в бабле сессии (summary = имя/образ)."""
+        image = (obj or {}).get("Image") or "?"
+        name = ""
+        if "name=" in path:
+            from urllib.parse import parse_qs, urlsplit
+            name = parse_qs(urlsplit(path).query).get("name", [""])[0]
+        summary = f"{name} ({image})" if name else image
+        try:
+            await self.notify(summary)
+        except Exception:  # noqa: BLE001 — подсветка не должна ронять запрос
+            logger.debug("docker-proxy: notify упал", exc_info=True)
 
     # ── разбор/перекачка ────────────────────────────────────────────────
     async def _read_head(self, r):

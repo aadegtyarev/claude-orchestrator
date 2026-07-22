@@ -168,6 +168,8 @@ class SessionManager:
         # Вызывается при внезапной смерти Claude (session, exit_code);
         # назначается в launcher.
         self.on_dead: Callable[[Session, int], Awaitable[None]] | None = None
+        # Подсветка запуска docker в бабле (session_name, summary); ставит ядро.
+        self.on_docker_launch: Callable[[str, str], Awaitable[None]] | None = None
         # Модули дописывают env для процесса claude (напр. wallet: $NAME для
         # секретов — маркер/значение). Синхронные, session -> {ИМЯ: значение}.
         self.env_hooks: list[Callable[[Session], dict[str, str]]] = []
@@ -1547,8 +1549,12 @@ class SessionManager:
             return None
         sock = self.config.docker_sock_path(session.name)
         if session.name not in self._docker_proxies:
+            async def _notify(summary: str, name: str = session.name) -> None:
+                if self.on_docker_launch is not None:
+                    await self.on_docker_launch(name, summary)
             proxy = DockerProxy(
-                sock, roots_provider=lambda s=session: self._docker_roots(s))
+                sock, roots_provider=lambda s=session: self._docker_roots(s),
+                notify=_notify)
             await proxy.start()
             self._docker_proxies[session.name] = proxy
             logger.info("docker-прокси сессии %s: %s (allowlist = проект сессии)",
