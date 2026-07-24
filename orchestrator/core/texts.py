@@ -188,6 +188,41 @@ MESSAGES: dict[str, dict[str, str]] = {
         "url_default": "по умолчанию (api.anthropic.com)",
         "wallet_use": "{line}",
         "wallet_denied": "отказано (policy/подтверждение)",
+        "wallet_ask_tool": "wallet 🔓 доступ ВНЕ scope",
+        "wallet_ask_desc": (
+            "модель просит доступ к ресурсу вне разрешённого scope секрета — "
+            "{description}. ✅ — подставить кред ТОЛЬКО в этот запрос "
+            "(разовый грант, scope не расширяется), ❌ — отказать."
+        ),
+        # ASK-грант «навсегда» (§4.6). Оператор ОБЯЗАН видеть, что именно уйдёт в
+        # policy, ДО нажатия: секрет, ключ и точное значение.
+        "wallet_ask_always_btn": "🔒 Разрешить навсегда",
+        # Текст уходит в описание permission-запроса, а его адаптеры ЭКРАНИРУЮТ
+        # (это недоверенный текст) — поэтому здесь обычный текст без тегов.
+        "wallet_ask_always_offer": (
+            "\n🔒 «Разрешить навсегда» запишет в policy секрета «{secret}»: "
+            "scope.{key} += \"{value}\" — {label}. "
+            "Отозвать: /wallet scope {secret} -{value}"
+        ),
+        "wallet_ask_always_off": (
+            "\n🔒 «Навсегда» для этого запроса недоступно (только разовый грант): {reason}."
+        ),
+        "wallet_ask_reason_narrow": (
+            "из запроса не выводится узкий грант (он покрыл бы весь сервис)"
+        ),
+        "wallet_ask_reason_disabled": "правка policy выключена (WALLET_POLICY_EDIT=0)",
+        # notice в чат: markdown (md_to_html), не HTML-теги.
+        "wallet_ask_written": (
+            "🔒 Постоянный грант записан в policy секрета `{secret}`:\n"
+            "`scope.{key} += \"{value}\"`\n"
+            "Такие запросы больше не спрашиваются. Отозвать: "
+            "`/wallet scope {secret} -{value}` (или `vault policy scope {secret} -{value}`)."
+        ),
+        "wallet_ask_write_failed": (
+            "⚠️ Доступ разрешён РАЗОВО, но записать грант в policy НЕ удалось: "
+            "{error}. Следующий такой запрос снова спросит подтверждение; "
+            "правь secrets.toml вручную, если грант нужен постоянный."
+        ),
         "wallet_disabled": "🔐 Кошелёк не подключён (SANDBOX_BWRAP_WALLET + SANDBOX=bwrap). /wallet недоступен.",
         "sendfile_not_found": "❌ Не удалось отправить: файл не найден: {path}",
         "sendfile_too_big": "❌ Не удалось отправить: файл больше 50 МБ (лимит Telegram): {path}",
@@ -208,6 +243,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "perm_allow": "✅ Разрешить",
         "perm_deny": "❌ Отклонить",
         "perm_allowed": "✅ Разрешено: {tool}",
+        "perm_allowed_always": "🔒 Разрешено навсегда (записано в policy): {tool}",
         "perm_denied": "❌ Отклонено: {tool}",
         "perm_fail": "Не удалось передать ответ: {error}",
         "menu_new": "Новая сессия (имя или /путь)",
@@ -430,6 +466,37 @@ MESSAGES: dict[str, dict[str, str]] = {
         "url_default": "default (api.anthropic.com)",
         "wallet_use": "{line}",
         "wallet_denied": "denied (policy/confirmation)",
+        "wallet_ask_tool": "wallet 🔓 access OUTSIDE scope",
+        "wallet_ask_desc": (
+            "the model requests access to a resource outside the secret's "
+            "allowed scope — {description}. ✅ — inject the credential into THIS "
+            "request only (one-off grant, scope is not expanded), ❌ — deny."
+        ),
+        "wallet_ask_always_btn": "🔒 Allow forever",
+        "wallet_ask_always_offer": (
+            "\n🔒 “Allow forever” writes into the policy of secret “{secret}”: "
+            "scope.{key} += \"{value}\" — {label}. "
+            "Revoke: /wallet scope {secret} -{value}"
+        ),
+        "wallet_ask_always_off": (
+            "\n🔒 “Forever” is unavailable for this request (one-off grant only): {reason}."
+        ),
+        "wallet_ask_reason_narrow": (
+            "no narrow grant can be derived from the request (it would cover the "
+            "whole service)"
+        ),
+        "wallet_ask_reason_disabled": "policy editing is off (WALLET_POLICY_EDIT=0)",
+        "wallet_ask_written": (
+            "🔒 Persistent grant written to the policy of secret `{secret}`:\n"
+            "`scope.{key} += \"{value}\"`\n"
+            "Such requests are no longer asked. Revoke: "
+            "`/wallet scope {secret} -{value}` (or `vault policy scope {secret} -{value}`)."
+        ),
+        "wallet_ask_write_failed": (
+            "⚠️ Access granted ONCE, but writing the grant to the policy FAILED: "
+            "{error}. The next such request will ask again; edit secrets.toml "
+            "manually if you want it permanent."
+        ),
         "wallet_disabled": "🔐 Wallet not enabled (SANDBOX_BWRAP_WALLET + SANDBOX=bwrap). /wallet unavailable.",
         "sendfile_not_found": "❌ Cannot send: file not found: {path}",
         "sendfile_too_big": "❌ Cannot send: file exceeds 50 MB (Telegram limit): {path}",
@@ -450,6 +517,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "perm_allow": "✅ Allow",
         "perm_deny": "❌ Deny",
         "perm_allowed": "✅ Allowed: {tool}",
+        "perm_allowed_always": "🔒 Allowed forever (written to policy): {tool}",
         "perm_denied": "❌ Denied: {tool}",
         "perm_fail": "Failed to deliver the verdict: {error}",
         "menu_new": "New session (name or /path)",

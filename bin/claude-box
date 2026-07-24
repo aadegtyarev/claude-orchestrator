@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+"""claude-box — запуск claude в песочнице (Слой 2 редизайна).
+
+Есть: изоляция bwrap|off|agent-vm (--vm), кошелёк (--wallet), профили
+(--profile/init/profile). Под --vm кошелёк и профиль пока отвергаются честным
+отказом (F1/F4/F10 в docs/ARCHITECTURE-claude-box.md), а unattended (-p) и
+подкоманда connect — следующие треки, пока честные заглушки.
+
+Тонкий entrypoint: кладёт корень репозитория в sys.path и зовёт box_cli.cli.main.
+CLI — app поверх слоёв (импортит box + Engine), не часть автономного пакета box/.
+"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from box_cli.cli import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())

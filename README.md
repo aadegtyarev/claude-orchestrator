@@ -35,8 +35,13 @@ permission-кнопки) работает в каждом интерфейсе.
                 ┌───────┴───────┐       └───────────────────┘
                 │ runners/      │  bwrap | agent-vm | off
                 └───────────────┘
- modules/wallet ── демон секретов на хосте + прозрачные обёртки/CLI в песочнице
+ modules/wallet ── тонкий адаптер поверх пакета vault/ (демон секретов, MITM-
+                   прокси, обёртки/CLI в песочнице); в боте и вебе — одинаково
 ```
+
+Кошелёк и launcher вынесены в автономные пакеты `vault/` и `box/` (+ CLI
+`claude-box`), не зависящие от оркестратора; оркестратор — их клиент. Подробности
+— `vault/README.md`, `box/README.md`.
 
 **Кто кого запускает:** оркестратор запускает только процессы `claude`
 (под PTY, через раннер-изоляцию). `channel_server.py` запускает **сам Claude
@@ -80,11 +85,23 @@ orchestrator/
     web/             — aiohttp: SPA (vanilla JS) + WebSocket, REST API
   runners/           — изоляция: direct | bwrap (+sandbox.py) | agentvm
   modules/
-    wallet/          — кошелёк секретов (демон + policy); CLI — bin/wallet
+    wallet/          — ТОНКИЙ адаптер кошелька поверх vault/ (permission-relay,
+                       бабл); домен и демон живут в vault/
+vault/               — АВТОНОМНЫЙ кошелёк секретов (без зависимостей оркестратора):
+                       домен, демон, MITM-прокси, коннекторы, policy; CLI — bin/vault,
+                       клиент в песочнице — bin/wallet. См. vault/README.md
+box/                 — АВТОНОМНЫЙ launcher сессий под PTY (без оркестратора):
+                       launch(), авто-диалоги, готовность «по тишине». box/README.md
+box_cli/             — app-CLI claude-box поверх box/ + runners: standalone-запуск
+                       claude в песочнице (профили, кошелёк, -p); bin/claude-box
 tests/               — офлайн-тесты (run_all.sh гоняет все)
-docs/                — дизайн-доки (agent-vm, secrets-wallet, коннекторы)
+docs/                — дизайн-доки (agent-vm, secrets-wallet, коннекторы, claude-box)
 install.sh           — venv + systemd user-unit (+ --uninstall, миграция имени)
 ```
+
+Кошелёк (`vault/`) и launcher (`box/`) — самостоятельные пакеты: работают без
+оркестратора (`bin/vault serve`, `bin/claude-box`), а оркестратор их клиент через
+тонкие адаптеры. См. `vault/README.md` и `box/README.md`.
 
 ## Требования
 

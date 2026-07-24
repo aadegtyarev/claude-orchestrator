@@ -14,7 +14,9 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from orchestrator.modules.wallet.host import OrchestratorVaultHost  # noqa: E402
 from orchestrator.modules.wallet.module import SecretStore, WalletModule  # noqa: E402
+from vault.daemon import Ctx, VaultDaemon  # noqa: E402
 
 SESSION = SimpleNamespace(name="noos")
 
@@ -36,24 +38,24 @@ class FakeReq:
         return self._b
 
 
-def _mod(store: SecretStore, confirm_ok: bool = True) -> WalletModule:
-    m = WalletModule.__new__(WalletModule)
-    m.store = store
-    m._tokens = {"tok": "noos"}
-
+def _daemon(store: SecretStore, confirm_ok: bool = True) -> VaultDaemon:
     async def rc(*a, **k):
         return confirm_ok
 
     async def bg(*a, **k):
         return None
 
-    m.core = SimpleNamespace(
+    core = SimpleNamespace(
         manager=SimpleNamespace(get=lambda n: SESSION if n == "noos" else None),
         request_confirmation=rc,
         bubbles=SimpleNamespace(append_background=bg),
         _record=lambda *a, **k: None,
     )
-    return m
+    # side-effects _handle_get (confirm/observe/record) — через host над фейк-ядром.
+    daemon = VaultDaemon(store, OrchestratorVaultHost(core), guard_on=True)
+    # Токен "tok" привязан к сессии noos (cwd для _handle_get не нужен).
+    daemon._tokens = {"tok": Ctx("noos", Path("/tmp"))}
+    return daemon
 
 
 def _body(resp) -> dict:
@@ -75,25 +77,25 @@ async def test_wallet_shared():
     assert secrets["host"].mode == "host"
     print("OK parse: shared с value ок (env опц.), без value отброшен")
 
-    m = _mod(st)
-    r = await m._handle_get(FakeReq("tok", {"secret": "openai"}))
+    d = _daemon(st)
+    r = await d._handle_get(FakeReq("tok", {"secret": "openai"}))
     assert r.status == 200
     j = _body(r)
     assert j["value"] == "SHV-123" and j["env"] == "OPENAI_API_KEY", j
     print("OK get shared: значение и env выданы")
 
-    r = await m._handle_get(FakeReq("tok", {"secret": "host"}))
+    r = await d._handle_get(FakeReq("tok", {"secret": "host"}))
     assert r.status == 403 and b"SHV" not in r.body
     assert "не shared" in _body(r).get("reason", "")
     print("OK get не-shared (host) → отказ, значение НЕ выдаётся")
 
-    r = await m._handle_get(FakeReq("tok", {"secret": "ghost"}))
+    r = await d._handle_get(FakeReq("tok", {"secret": "ghost"}))
     assert r.status == 403
     print("OK get неизвестного секрета → отказ")
 
     st2 = _store('[secrets.k]\nshared=true\nvalue="V-secret"\nsessions=["*"]\nconfirm=true\n')
-    m2 = _mod(st2, confirm_ok=False)
-    r = await m2._handle_get(FakeReq("tok", {"secret": "k"}))
+    d2 = _daemon(st2, confirm_ok=False)
+    r = await d2._handle_get(FakeReq("tok", {"secret": "k"}))
     assert r.status == 403 and b"V-secret" not in r.body
     print("OK get с confirm: отказ кнопкой → значение не выдаётся")
 
@@ -106,6 +108,7 @@ async def test_wallet_shared():
     )
     m3 = WalletModule.__new__(WalletModule)
     m3.store = st3
+    m3._proxy_env = {}  # без launch-хука перехвата: вклад пуст
     env = m3.session_env(SESSION)
     assert env["OPENAI_API_KEY"] == "KEYVAL"                 # shared → реальное
     assert env["API_TOKEN"] == "<<wallet:tok>>"             # inject → маркер

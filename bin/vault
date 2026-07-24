@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+"""vault — host-side CLI автономного кошелька (serve/policy).
+
+Тонкий entrypoint: кладёт корень репозитория в sys.path и зовёт vault.cli.main.
+В отличие от stdlib-only `bin/wallet` (клиент внутри песочницы), этот CLI —
+хостовый, использует пакет vault/ и запускается из окружения оркестратора.
+"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from vault.cli import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -179,9 +179,18 @@ function permCard(session, ev) {
     (ev.preview ? "<pre>" + esc(ev.preview) + "</pre>" : "") +
     '<div class="perm-buttons">' +
     '<button class="btn perm-allow">✅ Разрешить</button>' +
-    '<button class="btn perm-deny">❌ Отклонить</button></div>';
+    '<button class="btn perm-deny">❌ Отклонить</button>' +
+    // Третья кнопка — только если ядро её предложило (ASK-грант кошелька):
+    // подпись приходит с сервера и содержит, ЧТО именно записывается в policy.
+    // Нет метки → кнопки ровно две, как и раньше.
+    (ev.always_label
+      ? '<button class="btn perm-always">' + esc(ev.always_label) + "</button>"
+      : "") +
+    "</div>";
   div.querySelector(".perm-allow").onclick = () => permVerdict(session, ev.request_id, "allow");
   div.querySelector(".perm-deny").onclick = () => permVerdict(session, ev.request_id, "deny");
+  const always = div.querySelector(".perm-always");
+  if (always) always.onclick = () => permVerdict(session, ev.request_id, "allow_always");
   els.chat.appendChild(div);
   scrollDown(false);
   return div;
@@ -204,7 +213,9 @@ function markPermResolved(requestId, behavior) {
   if (btns) btns.remove();
   const v = document.createElement("div");
   v.className = "perm-verdict";
-  v.textContent = behavior === "allow" ? "✅ разрешено" : "❌ отклонено";
+  v.textContent = behavior === "allow" ? "✅ разрешено"
+    : behavior === "allow_always" ? "🔒 разрешено навсегда (записано в policy)"
+    : "❌ отклонено";
   card.appendChild(v);
 }
 

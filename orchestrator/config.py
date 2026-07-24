@@ -11,6 +11,12 @@ from pathlib import Path
 from dotenv import load_dotenv
 from urllib.parse import urlsplit, urlunsplit
 
+# host_lan_ip вынесен в общий нижний слой (vault/netloc): его делят оркестратор
+# и Launcher (box_cli/wallet.py биндит vault-прокси кошелька на этот адрес под
+# --vm). Реэкспорт сохраняет обратную совместимость — `from orchestrator.config
+# import host_lan_ip` и внутренние вызовы работают как раньше, поведение 1:1.
+from vault.netloc import host_lan_ip
+
 logger = logging.getLogger(__name__)
 
 # Что сказать оператору, когда модуль пропущен из-за несовпадения песочницы:
@@ -57,45 +63,30 @@ LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]", "0.0.0.0")
 LOOPBACK_HOSTS_PLAIN = ("127.0.0.1", "localhost", "::1", "0.0.0.0")
 
 
-def host_lan_ip() -> str | None:
-    """LAN-адрес хоста, по которому его видит гость microVM.
+def env_number(name: str, cast):
+    """Число из переменной окружения; пусто/не задано → None.
 
-    Зачем не `host.microsandbox.internal`: замерено живьём — agent-vm гонит
-    egress гостя через свой HTTP-CONNECT прокси, и хостовое gateway-имя он не
-    маршрутизирует (запрос к сервису на хосте не доходит). А вот LAN-адрес
-    хоста прокси обходит (он сам кладёт его в `no_proxy` гостя), и с
-    `--allow-egress <этот адрес>` сервис на хосте из гостя ДОСТУПЕН —
-    проверено: гость получил ответ от хостового сервиса.
+    Мусорное значение — SystemExit с внятным сообщением, а не сырой ValueError
+    из недр загрузки конфига: оператор должен увидеть, КАКАЯ переменная плохая
+    и что от неё ждут. То же поведение даёт standalone `claude-box`
+    (box_cli/cli.py agent_vm_env_config) — расходиться на одних и тех же
+    именах переменных нельзя.
 
-    Берём `src` ДЕФОЛТНОГО маршрута с наименьшей метрикой — ровно тот адрес,
-    что выбирает сам agent-vm (сверено: он положил его в `no_proxy` гостя).
-    Трюк «UDP-сокет на 8.8.8.8» здесь НЕ годится: при поднятом VPN он вернёт
-    адрес туннеля (более специфичный маршрут), а гость ходит не туда.
-
-    Переопределяется явно — `AGENT_VM_HOST_IP` (если авто-выбор промахнулся).
+    AGENT_VM_MEMORY_GIB/AGENT_VM_CPUS читаем как ЦЕЛЫЕ: сам agent-vm дробные
+    отвергает («invalid value '2.5' for '--memory <GIB>'»), а раньше «8.5» в
+    .env проходил конфиг, чтобы уронить КАЖДУЮ сессию уже внутри agent-vm.
     """
-    override = os.getenv("AGENT_VM_HOST_IP", "").strip()
-    if override:
-        return override
-    import re
-    import subprocess
-
-    try:
-        out = subprocess.run(
-            ["ip", "-o", "route", "show", "default"],
-            capture_output=True, text=True, timeout=5,
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
+    raw = os.getenv(name, "").strip()
+    if not raw:
         return None
-    best: tuple[int, str] | None = None
-    for line in out.splitlines():
-        m = re.search(r"\bsrc\s+(\d+\.\d+\.\d+\.\d+)", line)
-        if not m:
-            continue
-        metric = int(mm.group(1)) if (mm := re.search(r"\bmetric\s+(\d+)", line)) else 0
-        if best is None or metric < best[0]:
-            best = (metric, m.group(1))
-    return best[1] if best else None
+    try:
+        return cast(raw)
+    except ValueError:
+        kind = "целое число" if cast is int else "число"
+        raise SystemExit(
+            f"{name}={raw!r} — ожидалось {kind}. Исправь значение в .env "
+            f"или убери переменную (тогда возьмётся умолчание)."
+        ) from None
 
 
 @dataclass(frozen=True)
@@ -149,7 +140,7 @@ class Config:
     # По аналогии с sandbox_bwrap_wallet — фича именно bwrap-песочницы.
     sandbox_docker: bool
     # Раннер agent-vm (SANDBOX=agent-vm): ресурсы и пин образа гостя.
-    agent_vm_memory_gib: float | None
+    agent_vm_memory_gib: int | None  # целые GiB: agent-vm дробные отвергает
     agent_vm_cpus: int | None
     agent_vm_image: str | None
     # LAN-адрес хоста для гостя (см. host_lan_ip). Фиксируется ОДИН раз на
@@ -157,6 +148,13 @@ class Config:
     # записан в claude_env, иначе при смене маршрута (VPN/DHCP) URL и
     # --allow-egress разъедутся и гость молча не достучится.
     agent_vm_host_ip: str | None
+    # Egress гостя на ВНЕШНИЙ прокси (форк agent-vm, docs/FORK-agent-vm-egress-proxy.md).
+    # Без них agent-vm ведёт себя как апстрим: весь egress гостя MITM-ит его
+    # собственный прокси, и наш кошелёк обойдён (F10). С ними egress
+    # переоткрывается на указанный прокси, а CA доверяется на UPSTREAM-плече
+    # (гость его не видит — он по-прежнему доверяет CA перехвата agent-vm).
+    agent_vm_egress_proxy: str | None
+    agent_vm_egress_ca: Path | None
     # Кошелёк секретов (MODULES=wallet): файл секретов и политик (0600, вне
     # allowlist песочницы).
     wallet_secrets_file: Path
@@ -309,14 +307,18 @@ class Config:
             # к хостовому GUI); SANDBOX_X11=1 — оставить, если модели нужен X.
             sandbox_x11=cls._parse_bool(os.getenv("SANDBOX_X11", "false")),
             sandbox_docker=cls._parse_bool(os.getenv("SANDBOX_BWRAP_DOCKER", "false")),
-            agent_vm_memory_gib=(
-                float(raw) if (raw := os.getenv("AGENT_VM_MEMORY_GIB", "").strip()) else None
-            ),
-            agent_vm_cpus=(
-                int(raw) if (raw := os.getenv("AGENT_VM_CPUS", "").strip()) else None
-            ),
+            agent_vm_memory_gib=env_number("AGENT_VM_MEMORY_GIB", int),
+            agent_vm_cpus=env_number("AGENT_VM_CPUS", int),
             agent_vm_image=(os.getenv("AGENT_VM_IMAGE", "").strip() or None),
             agent_vm_host_ip=agent_vm_host_ip,
+            agent_vm_egress_proxy=(
+                os.getenv("AGENT_VM_EGRESS_PROXY", "").strip() or None
+            ),
+            agent_vm_egress_ca=(
+                Path(raw).expanduser()
+                if (raw := os.getenv("AGENT_VM_EGRESS_CA", "").strip())
+                else None
+            ),
             wallet_secrets_file=Path(
                 os.getenv(
                     "WALLET_SECRETS_FILE",

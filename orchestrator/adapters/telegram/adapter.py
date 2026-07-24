@@ -338,14 +338,25 @@ class TelegramAdapter:
             desc=html.escape(request.description),
             preview=html.escape(request.preview),
         )
-        markup = InlineKeyboardMarkup(inline_keyboard=[[
+        buttons = [
             InlineKeyboardButton(
                 text=self.t("perm_allow"),
                 callback_data=cbdata.perm_cb(thread_id, request.request_id, "allow")),
             InlineKeyboardButton(
                 text=self.t("perm_deny"),
                 callback_data=cbdata.perm_cb(thread_id, request.request_id, "deny")),
-        ]])
+        ]
+        rows = [buttons]
+        if request.always_label:
+            # Третья кнопка появляется ТОЛЬКО когда запросивший её предложил
+            # (ASK-грант кошелька): у подтверждений тулов always_label=None и
+            # клавиатура остаётся прежней, байт в байт. Отдельной строкой —
+            # чтобы «навсегда» не нажималось случайно рядом с разовым ✅.
+            rows.append([InlineKeyboardButton(
+                text=request.always_label,
+                callback_data=cbdata.perm_cb(
+                    thread_id, request.request_id, "allow_always"))])
+        markup = InlineKeyboardMarkup(inline_keyboard=rows)
         try:
             msg = await self.bot.send_message(
                 chat_id=self.chat_id,
@@ -367,7 +378,13 @@ class TelegramAdapter:
         if stored is None or self.chat_id is None:
             return
         message_id, tool = stored
-        verdict_key = "perm_allowed" if behavior == "allow" else "perm_denied"
+        # Три исхода: разово / навсегда (грант записан в policy) / отказ. Их
+        # различие оператору видно в подтверждении — иначе «навсегда» выглядело
+        # бы как обычное ✅ и правка policy прошла бы незаметно.
+        verdict_key = {
+            "allow": "perm_allowed",
+            "allow_always": "perm_allowed_always",
+        }.get(behavior, "perm_denied")
         try:
             await self.bot.edit_message_reply_markup(
                 chat_id=self.chat_id, message_id=message_id, reply_markup=None

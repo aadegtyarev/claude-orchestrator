@@ -209,6 +209,11 @@ class WebAdapter:
             "type": "perm_request", "session": session.name,
             "request_id": request.request_id, "tool": request.tool,
             "description": request.description, "preview": request.preview,
+            # Третья кнопка («разрешить навсегда», ASK-грант кошелька) — только
+            # если её предложил запросивший; иначе поле пустое и фронт рисует
+            # прежние две. Без этого грант был бы доступен в Telegram и
+            # недоступен в вебе — разное поведение одного вердикта.
+            "always_label": request.always_label or "",
         })
 
     async def permission_resolved(
@@ -528,8 +533,11 @@ class WebAdapter:
         data = await self._json_body(request)
         request_id = str(data.get("request_id", ""))
         behavior = str(data.get("behavior", ""))
-        if not request_id or behavior not in ("allow", "deny"):
-            return self._err("request_id and behavior allow|deny required")
+        # allow_always — постоянный грант ASK кошелька (§4.6). Ядро само проверит,
+        # что у ЭТОГО запроса третья кнопка предлагалась (иначе → отказ), поэтому
+        # здесь достаточно пропустить значение как допустимое.
+        if not request_id or behavior not in ("allow", "deny", "allow_always"):
+            return self._err("request_id and behavior allow|deny|allow_always required")
         try:
             handled = await self.core.permission_verdict(
                 session, request_id, behavior, via=self.name

@@ -1032,6 +1032,22 @@ class OrchestratorCore:
             session, tool, description, preview, timeout
         )
 
+    async def request_choice(
+        self,
+        session: Session,
+        tool: str,
+        description: str,
+        preview: str,
+        timeout: float = 300.0,
+        always_label: str | None = None,
+    ) -> str:
+        """Локальное подтверждение с третьим исходом «разрешить навсегда» (§4.6
+        ASK-грант кошелька) → PermissionRelay. Возвращает "deny"|"allow"|
+        "allow_always"; без `always_label` третьей кнопки нет вовсе."""
+        return await self.perms.request_choice(
+            session, tool, description, preview, timeout, always_label
+        )
+
     async def permission_verdict(
         self, session: Session, request_id: str, behavior: str, via: str
     ) -> bool:

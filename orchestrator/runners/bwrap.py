@@ -41,11 +41,18 @@ class BwrapRunner:
     ) -> list[str]:
         # publish_ports не нужен: сеть у bwrap общая с хостом.
         home = Path.home()
-        config_dir = self.config.claude_config_dir or (home / ".claude")
+        config_dir = self.config.claude_config_dir
         rw = [
             *extra_rw,
-            config_dir,
-            home / ".claude.json",  # глобальное состояние claude (может писаться)
+            config_dir or (home / ".claude"),
+            # Глобальное состояние claude (~/.claude.json, пишется) — ТОЛЬКО когда
+            # config-dir не задан. При заданном CLAUDE_CONFIG_DIR claude кладёт свой
+            # .claude.json ВНУТРЬ него (проверено: живой ~/.claude-proxy/.claude.json),
+            # т.е. файл уже покрыт биндом самого config_dir, и отдельный бинд лишь
+            # утащил бы в песочницу постороннее состояние: под профилем claude-box
+            # (config_dir = <profile>/.claude) это был бы реальный ~/.claude.json
+            # оператора в обход изоляции профиля.
+            *([home / ".claude.json"] if config_dir is None else []),
             *self.config.sandbox_extra_rw,
         ]
         ro = [

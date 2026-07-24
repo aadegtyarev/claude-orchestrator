@@ -9,14 +9,18 @@
 дольше READY_SILENCE_SEC — сдаёмся. Сверху абсолютный потолок, чтобы
 бесконечно «прогрессирующий» процесс не висел вечно.
 
-Запуск: .venv/bin/python tests/ready_deadline_test.py
+Дедлайн переехал в автономный пакет box/ (box.ready, Слой 2 редизайна) —
+импортим из источника; отдельным тестом проверяем, что sessions.py его
+реэкспортит (обратная совместимость).
+
+Запуск: .venv/bin/python tests/box_ready_test.py
 """
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from orchestrator.core.sessions import (  # noqa: E402
+from box.ready import (  # noqa: E402
     READY_SILENCE_SEC,
     READY_TIMEOUT_MAX,
     _ReadyDeadline,
@@ -87,13 +91,25 @@ def test_absolute_cap():
     print("OK абсолютный потолок срабатывает даже при постоянном прогрессе")
 
 
+def test_sessions_reexports_ready_symbols():
+    """sessions.py реэкспортит _ReadyDeadline/READY_* из box — старый код и
+    тесты, ссылающиеся на sessions._ReadyDeadline, не сломаны."""
+    from orchestrator.core import sessions
+
+    assert sessions._ReadyDeadline is _ReadyDeadline
+    assert sessions.READY_SILENCE_SEC == READY_SILENCE_SEC
+    assert sessions.READY_TIMEOUT_MAX == READY_TIMEOUT_MAX
+    print("OK sessions.py реэкспортит _ReadyDeadline/READY_* из box.ready")
+
+
 def main():
     test_silence_expires()
     test_no_cap_by_default_behaves_like_old_timeout()
     test_progress_extends_deadline()
     test_progress_only_when_log_grows()
     test_absolute_cap()
-    print("ALL READY-DEADLINE OK")
+    test_sessions_reexports_ready_symbols()
+    print("ALL BOX-READY OK")
 
 
 if __name__ == "__main__":

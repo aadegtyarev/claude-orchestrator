@@ -47,12 +47,20 @@ class Origin:
 
 @dataclass(frozen=True)
 class PermissionRequest:
-    """Запрос разрешения от Claude Code (permission relay)."""
+    """Запрос разрешения от Claude Code (permission relay).
+
+    `always_label` — текст ТРЕТЬЕЙ кнопки («разрешить навсегда», §4.6 ASK-грант
+    кошелька). None (умолчание) → кнопок ровно две, как было всегда: адаптер
+    третью НЕ рисует. Метка приходит от того, кто поднял запрос, вместе с
+    описанием того, что именно будет записано — оператор обязан видеть это ДО
+    нажатия.
+    """
 
     request_id: str
     tool: str
     description: str
     preview: str
+    always_label: str | None = None
 
 
 @runtime_checkable

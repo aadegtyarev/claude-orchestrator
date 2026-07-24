@@ -10,382 +10,82 @@ Read работают от её имени). Поэтому секрет не п
 приватный $HOME пишется каталог обёрток .wallet-bin (SHIM_DIRNAME), который ядро
 ставит первым в PATH песочницы (SessionManager.path_hooks). Обёртка каждого
 разрешённого инструмента — крошечный скрипт `wallet exec <tool> "$@"`; демон
-подбирает секрет по команде (_resolve_secret) и исполняет. git — особый случай
-(_git_shim): сетевые подкоманды идут через кошелёк, локальные — настоящим git в
-песочнице. Inject-секреты видны как env-переменные $NAME с МАРКЕРОМ вместо
-значения (session_env) — демон разворачивает маркер в реальное значение на хосте
-(_execute). CLI `bin/wallet` остаётся ручным путём (run/exec/get/env/ls/help).
+подбирает секрет по команде и исполняет. git — особый случай (_git_shim): сетевые
+подкоманды идут через кошелёк, локальные — настоящим git в песочнице. Inject-
+секреты видны как env-переменные $NAME с МАРКЕРОМ вместо значения (session_env) —
+демон разворачивает маркер в реальное значение на хосте. CLI `bin/wallet`
+остаётся ручным путём (run/exec/get/env/ls/help).
 
-Аутентификация per-session: на старте (и через core.session_hooks для новых
-сессий) в персистентный $HOME сессии кладётся ~/.wallet.json (0600) с URL
-демона и токеном. Policy — TOML-файл config.wallet_secrets_file (0600, вне
-allowlist песочницы): каким сессиям и каким командам разрешён секрет, нужно ли
-подтверждение кнопками. Отказ по умолчанию: секрет без sessions/commands не
-выдаётся никому и ни на что.
+Этот модуль — оркестраторный АДАПТЕР над автономным демоном (vault/daemon.py):
+провижн (~/.wallet.json, обёртки, CLI-симлинк), хуки сессий (path/env/redact),
+правка policy из бота, старт/стоп демона. Сам HTTP-API секретов, реестр токенов и
+исполнение под секретом живут в vault/ (без зависимостей оркестратора).
+
+Аутентификация per-session: при провижне демон выдаёт токен, привязанный к
+рабочему каталогу сессии (issue_token снимает cwd ОДИН раз — без перерезолва
+посреди запроса), а адаптер кладёт в ~/.wallet.json (0600) URL демона и токен.
+Policy — TOML-файл config.wallet_secrets_file (0600, вне allowlist песочницы).
+Отказ по умолчанию: секрет без sessions/commands не выдаётся никому и ни на что.
 """
 
 from __future__ import annotations
 
-import asyncio
-import fnmatch
-import functools
-import html
 import json
 import logging
 import os
-import re
-import secrets
-import shutil
-import signal
-import socket
-import tempfile
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-try:
-    import tomllib  # stdlib с 3.11
-except ModuleNotFoundError:  # Python 3.10
-    import tomli as tomllib
+# Домен и демон кошелька вынесены в автономный пакет vault/ (без зависимостей
+# оркестратора) — фаза 1 редизайна, docs/ARCHITECTURE-claude-box.md. Модуль
+# здесь — оркестраторный адаптер над ним (провижн/хуки сессий/старт демона).
+from vault.daemon import VaultDaemon
+# Примитивы TLS-перехвата (CA-bundle, атомарная запись, env-довесок, NO_PROXY) —
+# общие с CLI-лончером claude-box (§5.2), одна реализация на обоих потребителей.
+from vault.inject import (
+    atomic_write as _atomic_write,  # локальное имя: симлинк-безопасная запись bundle/.wallet.json
+    build_ca_bundle,
+    merge_no_proxy,
+    proxy_env_vars,
+    system_ca_pem as _system_ca_pem,  # noqa: F401 — ре-экспорт для тестов
+)
+from vault.proxy_pool import ProxyPoolError, SessionProxyPool
+from vault.redact import _redact_text
+from vault.tls import VaultCA, VaultCAError
+from vault.secret import (
+    DEFAULT_HOST_COMMANDS,  # noqa: F401 — ре-экспорт для тестов/обратной совместимости
+    Secret,  # noqa: F401 — ре-экспорт для тестов
+    _always_denied,  # noqa: F401 — ре-экспорт для тестов (движок решения — vault.verdict)
+    _prints_token,  # noqa: F401 — ре-экспорт для тестов (исполнение — vault.daemon)
+    marker,
+)
+# Генератор обёрток общий с CLI claude-box (§5.2): один git-шим на обоих
+# потребителей (box_cli не может импортировать orchestrator.*).
+from vault.shims import SHIM_DIRNAME, git_shim, tool_names, write_shims
+from vault.store import DEFAULT_SECRETS_TOML, SecretStore
 
-from aiohttp import web
-
+from .host import OrchestratorVaultHost
 from .policy import PolicyEditor, PolicyError
 
 if TYPE_CHECKING:
     from ...config import Config
-    from ...core.sessions import Session
 
 logger = logging.getLogger(__name__)
 
-# Таймаут выполнения самой команды под секретом. Бюджет CLI-обёртки
-# (bin/wallet HTTP_TIMEOUT=660с) должен покрывать confirm (request_confirmation
-# по умолчанию 300с) + RUN_TIMEOUT + накладные: 300+300 < 660. Меняешь одно —
-# держи неравенство, иначе CLI отвалится по таймауту, пока команда ещё бежит.
-RUN_TIMEOUT = 300.0
-# Потолок каждого потока вывода — защита от заливки памяти/чата гигабайтами.
-STREAM_LIMIT = 200_000
-# Чем заменяем значения секретов в выводе.
-REDACTED = "•••"
-# Маркер секрета для скрытых inject-секретов. В env песочницы вместо реального
-# значения кладётся `<<wallet:имя>>`; модель пишет привычный `$ENV`, шелл
-# разворачивает его в маркер, а демон подставляет РЕАЛЬНОЕ значение на хосте
-# (в аргумент — inline, либо `:file` — во временный 0600-файл). Значение в
-# песочницу/контекст модели не попадает; из вывода редактируется.
-MARKER_RE = re.compile(r"<<wallet:([A-Za-z0-9_-]+)(:file)?>>")
+# SHIM_DIRNAME (каталог per-session обёрток в приватном доме сессии; ставится
+# ПЕРВЫМ в PATH песочницы через SessionManager.path_hooks) — из vault.shims,
+# ре-экспорт выше: имя знает и ядро (session_home), держим одно на всех.
 
-
-def marker(name: str, as_file: bool = False) -> str:
-    return f"<<wallet:{name}{':file' if as_file else ''}>>"
-# Дефолтный набор для host-passthrough, когда `commands` не задан: инструменты,
-# которые обычно уже авторизованы на хосте и не отдают сам секрет наружу. Смысл
-# кошелька — «используй, но не читай»: gh/git/ssh/scp применяют креды сами,
-# echo/cat/sh их бы просто распечатали, поэтому в дефолт НЕ входят. Хочешь
-# curl/kubectl/своё — допиши commands явно.
-DEFAULT_HOST_COMMANDS = ("gh", "git", "ssh", "scp")
-# Каталог per-session обёрток внутри приватного дома сессии; ставится ПЕРВЫМ в
-# PATH песочницы (SessionManager.path_hooks), поэтому завёрнутые инструменты
-# побеждают настоящие бинари. Имя знает и ядро (session_home) — держим синхронно.
-SHIM_DIRNAME = ".wallet-bin"
-# Сетевые подкоманды git заворачиваем в кошелёк (креды хоста); всё остальное
-# (status/add/commit/log/diff) бежит настоящим git прямо в песочнице — быстро и
-# без хостового раунд-трипа. Список намеренно узкий: только то, что ходит в сеть.
-GIT_NETWORK = ("push", "fetch", "pull", "clone", "ls-remote", "send-pack", "fetch-pack")
-# Дефолтный secrets.toml — создаётся при первом запуске, если файла ещё нет, чтобы
-# кошелёк работал «из коробки»: прокол на хост (host-passthrough) для gh/git/ssh/
-# scp на все сессии, обёртки в PATH заворачивают их сами. Права строго 0600.
-DEFAULT_SECRETS_TOML = """\
-# Кошелёк секретов claude-orchestrator — создан автоматически при первом запуске.
-# Формат, режимы и policy: docs/secrets-wallet.md. Права строго 0600 (иначе файл
-# НЕ загрузится). Правится из бота командой /wallet или руками здесь.
-#
-# Дефолт ниже — «прокол на хост» (host-passthrough) для gh/git/ssh/scp: команды
-# идут на ХОСТ с его кредами (keyring, gh-auth, ~/.ssh), модель их значений не
-# видит. Обёртки в PATH заворачивают эти инструменты сами — модель зовёт gh/git/
-# ssh как обычно. Встроенный guard рубит опасное (печать токена, git-RCE) и здесь.
-
-[secrets.host]
-description = "хостовые креды gh/git/ssh/scp"
-sessions = ["*"]                          # все сессии; сузь при желании: ["dev-*"]
-commands = ["gh", "git", "ssh", "scp"]    # эти инструменты завернутся обёртками
-confirm = false                           # без кнопок подтверждения; guard — щит
-"""
-
-
-def _prints_token(cmd: list[str]) -> bool:
-    """gh-команда, печатающая сам токен: `gh auth token` или `… --show-token`.
-
-    Guard её и так режет (см. `_always_denied`). Выделено отдельно, чтобы НЕ
-    поднимать operator-notice на этот отказ: он самокорректирующийся (модель
-    получает предписывающий reason в stderr), а фоновый поллер Claude Code
-    («PR status» в футере) зовёт ровно `gh auth token --hostname github.com`
-    периодически — с notice это спамило бы чат на каждый опрос. Первая
-    не-флаговая подкоманда, как в guard: `gh --флаг auth token` не проскочит,
-    `gh pr create --title "auth token"` не ложно-сработает."""
-    if not cmd or os.path.basename(cmd[0]) != "gh":
-        return False
-    subs = [a for a in cmd[1:] if not a.startswith("-")]
-    return subs[:1] == ["auth"] and (subs[1:2] == ["token"] or "--show-token" in cmd)
-
-
-def _always_denied(cmd: list[str]) -> str | None:
-    """Опасные вызовы, запрещённые guard'ом — при любой policy, даже `commands=["gh"]`.
-
-    Смысл: голое имя инструмента должно оставаться удобным, не превращаясь в
-    утечку токена или запуск произвольного кода на хосте. Возвращает ПРОЗРАЧНОЕ
-    сообщение модели (что не так + как правильно) либо None. Guard включается
-    флагом WALLET_GUARD (по умолчанию on); применяется в _handle_run.
-
-    Это НЕ полная защита — безфлаговый вектор (подложить `./.git/config` в
-    проекте, который `git push` всё равно прочитает) закрыть аргументами нельзя,
-    только доверием к сессии (см. docs «Известные дыры»).
-    """
-    binary = os.path.basename(cmd[0]) if cmd else ""
-    # 1. Печатают сам секрет — редакция literal-only их не всегда ловит. Смотрим
-    # ПЕРВУЮ не-флаговую подкоманду (чтобы `gh --флаг auth token` не проскочил, но
-    # `gh pr create --title "auth token"` не ложно-сработал: там первая подкоманда
-    # «pr», а не «auth»).
-    if binary == "gh":
-        if _prints_token(cmd):
-            return ("Эта команда печатает сам токен, а кошелёк не выдаёт значения "
-                    "секретов. Токен и НЕ нужен: `git push`/`fetch`/`pull`/`clone` по "
-                    "HTTPS авторизуются на хосте через кошелёк (gh credential helper "
-                    "выдаёт токен внутри себя, НЕ печатая его) — делай обычный "
-                    "`git push`, HTTPS-remote работает из коробки, SSH-костыль не "
-                    "нужен. Для GitHub-операций — gh напрямую (gh pr …, gh api …, "
-                    "gh release …). Печатать токен незачем.")
-    # 2. git → произвольное исполнение на хосте через конфиг/транспорт/флаги.
-    if binary == "git":
-        toks = cmd[1:]
-        if "-c" in toks:  # -c core.sshCommand=… / protocol.ext.allow=… / core.fsmonitor=…
-            return ("Флаг `git -c` переопределяет конфиг и может запустить произвольный "
-                    "код на хосте — поэтому запрещён. Запусти git push/pull/fetch БЕЗ "
-                    "`-c`; если нужен особый git-конфиг, попроси оператора настроить "
-                    "его на хосте.")
-        for t in toks:
-            if t.startswith("ext::"):
-                return ("git-транспорт `ext::` запускает произвольную команду — запрещён. "
-                        "Используй обычный remote (https или ssh) для push/pull/fetch.")
-            if t.startswith(("--receive-pack", "--upload-pack", "--exec")):
-                return ("Флаги --receive-pack/--upload-pack/--exec запускают произвольную "
-                        "команду на той стороне — запрещены. Запусти git push/pull/fetch "
-                        "без них.")
-    return None
-
-
-@dataclass(frozen=True)
-class Secret:
-    """Один секрет/доступ из secrets.toml вместе со своей policy.
-
-    Два вида:
-      * inject — value+env: команда получает секрет в env-переменной (env=…,
-        value=…). Классический кошелёк.
-      * host-passthrough — БЕЗ value/env: команда просто исполняется на ХОСТЕ
-        с хостовым окружением (keyring, gh/git auth). Для инструментов, уже
-        авторизованных на хосте (gh, git), чьи токены лежат в keyring/файле
-        вне песочницы — модель их не видит, а команда работает. Ничего в env
-        не инжектим.
-    """
-
-    name: str
-    value: str  # "" для host-passthrough
-    env: str    # "" для host-passthrough
-    description: str
-    sessions: tuple[str, ...]  # fnmatch-шаблоны имён сессий; пусто = никому
-    # commands: где кошелёк доступен (allow-лист). Голое имя инструмента («gh»,
-    # «ssh») = любой его вызов; строка с пробелом/глобом («curl https://api/*») =
-    # fnmatch по всей команде (тонкая настройка). Для host-passthrough пустое
-    # поле = DEFAULT_HOST_COMMANDS; для inject пустое = ничего (сырой токен не
-    # открываем без явного списка).
-    commands: tuple[str, ...]
-    # deny: точечный запрет ПОВЕРХ commands (deny побеждает allow). Голый токен
-    # («--force», «--hard») = блок этого флага/аргумента где угодно; строка с
-    # пробелом/глобом = fnmatch по всей команде. Для «разрешаю инструмент, но
-    # не эти опасные флаги».
-    deny: tuple[str, ...]
-    # allow_unsafe: точечно отключить встроенный guard (печать токена, git-RCE)
-    # для ЭТОГО секрета — для доверенных специфичных случаев. Глобально guard
-    # рубится WALLET_GUARD=0; это — гранулярно, на один секрет.
-    allow_unsafe: bool
-    confirm: bool  # спрашивать ли подтверждение кнопками перед запуском
-    # shared: секрет, значение которого модель ДОЛЖНА получить (dev-ключ для её
-    # сервиса, логин/пароль для ввода в браузер). Не про конфиденциальность от
-    # модели — про хранение вне чата/репо. Выдаётся `wallet get`/`wallet env`;
-    # при заданном `env` реальное значение сразу лежит в env песочницы (в отличие
-    # от inject, где там маркер). host/inject значения НЕ выдаются никогда.
-    shared: bool
-
-    @property
-    def host_passthrough(self) -> bool:
-        return not (self.value and self.env)
-
-    @property
-    def mode(self) -> str:
-        if self.shared:
-            return "shared"
-        return "host" if self.host_passthrough else "inject"
-
-    @property
-    def effective_commands(self) -> tuple[str, ...]:
-        if self.commands:
-            return self.commands
-        return DEFAULT_HOST_COMMANDS if self.host_passthrough else ()
-
-    def session_allowed(self, session_name: str) -> bool:
-        return any(fnmatch.fnmatch(session_name, pat) for pat in self.sessions)
-
-    @staticmethod
-    def _matches(pat: str, binary: str, cmd: list[str], cmd_str: str) -> bool:
-        """Один шаблон против команды: голый токен = имя инструмента или любой
-        аргумент; строка с пробелом/глобом = fnmatch по всей строке команды."""
-        if " " not in pat and not any(c in pat for c in "*?["):
-            return binary == pat or pat in cmd[1:]
-        return fnmatch.fnmatch(cmd_str, pat)
-
-    def denied_by(self, cmd: list[str]) -> str | None:
-        """Точечный запрет секрета (deny). Возвращает сматчивший шаблон или None."""
-        if not cmd:
-            return None
-        binary = os.path.basename(cmd[0])
-        cmd_str = " ".join(cmd)
-        for pat in self.deny:
-            if self._matches(pat, binary, cmd, cmd_str):
-                return pat
-        return None
-
-    def command_allowed(self, cmd: list[str]) -> bool:
-        """Allow-проверка по commands (guard и deny — отдельно, в _handle_run)."""
-        if not cmd:
-            return False
-        binary = os.path.basename(cmd[0])
-        cmd_str = " ".join(cmd)
-        for pat in self.effective_commands:
-            # allow голым именем — только имя инструмента (не «аргумент где-то»),
-            # иначе commands=["gh"] разрешил бы «git … gh …». Потому не _matches.
-            if " " not in pat and not any(c in pat for c in "*?["):
-                if binary == pat:
-                    return True
-            elif fnmatch.fnmatch(cmd_str, pat):
-                return True
-        return False
-
-
-class SecretStore:
-    """Ленивое чтение secrets.toml с кэшем по (mtime, mode, size).
-
-    mode входит в ключ кэша не случайно: chmod не меняет mtime, а ослабление
-    прав должно немедленно отключать выдачу секретов.
-    """
-
-    def __init__(self, path: Path):
-        self._path = path
-        self._cache_key: tuple | None = None
-        self._secrets: dict[str, Secret] = {}
-
-    def load(self) -> dict[str, Secret]:
-        try:
-            st = self._path.stat()
-        except OSError:
-            # Файла нет — кошелёк работает, но секретов нет (warning на старте).
-            self._cache_key, self._secrets = None, {}
-            return {}
-        key = (st.st_mtime_ns, st.st_mode, st.st_size)
-        if key == self._cache_key:
-            return self._secrets
-        self._cache_key, self._secrets = key, {}
-        # Права шире 0600 — любой локальный пользователь/группа прочитал бы
-        # значения; отказываемся грузить целиком, а не «только пошире-часть».
-        if st.st_mode & 0o077:
-            logger.error(
-                "wallet: %s доступен group/other (права %o) — секреты НЕ загружены; "
-                "выполни chmod 600", self._path, st.st_mode & 0o777,
-            )
-            return {}
-        try:
-            data = tomllib.loads(self._path.read_text(encoding="utf-8"))
-        except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError) as e:
-            logger.error("wallet: не удалось прочитать %s: %s", self._path, e)
-            return {}
-        for name, raw in (data.get("secrets") or {}).items():
-            if not isinstance(raw, dict):
-                logger.error("wallet: запись %r — не таблица, пропущена", name)
-                continue
-            has_value, has_env = "value" in raw, "env" in raw
-            is_shared = bool(raw.get("shared", False))
-            # shared-секрет требует value (env опционален — для env-выдачи);
-            # inject — ОБА поля; host-passthrough — НИ ОДНОГО. Иначе ошибка.
-            if is_shared:
-                if not has_value:
-                    logger.error("wallet: shared-секрет %r без value — пропущен", name)
-                    continue
-            elif has_value != has_env:
-                logger.error(
-                    "wallet: секрет %r — value и env задаются только вместе "
-                    "(inject) либо оба отсутствуют (host-passthrough)", name)
-                continue
-            self._secrets[name] = Secret(
-                name=str(name),
-                value=str(raw.get("value", "")),
-                env=str(raw.get("env", "")),
-                description=str(raw.get("description", "")),
-                sessions=tuple(str(p) for p in raw.get("sessions", ())),
-                commands=tuple(str(p) for p in raw.get("commands", ())),
-                deny=tuple(str(p) for p in raw.get("deny", ())),
-                allow_unsafe=bool(raw.get("allow_unsafe", False)),
-                confirm=bool(raw.get("confirm", True)),
-                shared=is_shared,
-            )
-        return self._secrets
-
-
-def _authed(handler):
-    """Декоратор wallet-роут-хендлеров: резолвит сессию через `_auth`, отдаёт 401
-    если Bearer-токен не признан, иначе зовёт хендлер с готовым `session`. Единая
-    точка 401-политики на все 4 роута (/secrets, /run, /exec, /get)."""
-    @functools.wraps(handler)
-    async def wrapper(self, request: web.Request) -> web.Response:
-        session = self._auth(request)
-        if session is None:
-            return web.json_response({"error": "unauthorized"}, status=401)
-        return await handler(self, request, session)
-    return wrapper
-
-
-def _redact_text(text: str, values) -> str:
-    """Заменить в строке значения ВСЕХ переданных секретов на `REDACTED`.
-
-    Единый примитив редакции для `_redact` (вывод команд, bytes) и
-    `WalletModule.redact_output` (чат-вывод, str) — расхождение реализаций
-    означало бы тихую утечку секрета в одном из путей. Длинные значения
-    первыми — чтобы вложенные не оставляли хвостов; пустые пропускаем.
-
-    ВАЖНО: это ГИГИЕНА против СЛУЧАЙНОГО эха, НЕ барьер. Замена только точных
-    вхождений — любая трансформация (base64/hex/reverse, запись в файл, вывод
-    по буквам) проходит мимо. Настоящая защита от утечки — host-passthrough
-    (значения секрета вообще нет в пространстве модели) + не давать шелл в
-    `commands` секрета. См. модель угроз в docs/REVIEW-2026-07-19.md §1.
-    """
-    for value in sorted((v for v in values if v), key=len, reverse=True):
-        text = text.replace(value, REDACTED)
-    return text
-
-
-def _redact(data: bytes, values: list[str]) -> str:
-    """Вывод команды → строка без значений секретов, обрезанная по лимиту.
-
-    Заменяем значения ВСЕХ известных секретов (не только запрошенного):
-    `gh auth status --show-token` и подобное не должно выносить соседний
-    секрет. Редакция строго ДО обрезки: обрезка могла бы разрезать значение
-    пополам.
-    """
-    text = _redact_text(data.decode("utf-8", errors="replace"), values)
-    if len(text) > STREAM_LIMIT:
-        text = text[:STREAM_LIMIT] + "\n…(обрезано)"
-    return text
+# Объединённый trust-bundle (системные корни + CA Vault) в приватном доме
+# сессии. SSL_CERT_FILE указывает СЮДА, а не только на CA Vault: иначе процесс
+# перестал бы доверять всем прочим сертам (api.anthropic.com, github…) —
+# системный trust надо СОХРАНИТЬ и лишь ДОБАВИТЬ к нему корень Vault. Публичный
+# серт (0644), ключа CA в песочнице нет (каталог CA — вне allowlist).
+CA_BUNDLE_NAME = ".vault-ca-bundle.crt"
 
 
 class WalletModule:
-    """Модуль ядра: aiohttp-демон на 127.0.0.1:<эфемерный порт> + токены сессий."""
+    """Модуль ядра: адаптер над автономным VaultDaemon (провижн/хуки/старт)."""
 
     name = "wallet"
 
@@ -396,11 +96,20 @@ class WalletModule:
         # confirm/new/rm; значения токенов не показывает и не принимает.
         self.policy = PolicyEditor(config.wallet_secrets_file)
         self.core = None
-        self.port: int | None = None
-        self._runner: web.AppRunner | None = None
-        # Токен → имя сессии. Session-объект резолвим на каждый запрос через
-        # manager.get: сессия могла быть удалена после выдачи токена.
-        self._tokens: dict[str, str] = {}
+        # VaultHost: услуги окружения для демона (подтверждение/бабл/аудит/notice).
+        # Ставится в start() поверх ядра; демон ходит через него, не через core.
+        self.host = None
+        # Автономный демон секретов (vault/daemon.py) — создаётся в start().
+        self.daemon: VaultDaemon | None = None
+        # Перехват TLS (§4.2): общий CA Vault + пул per-session MITM-прокси.
+        # Создаются в start() ТОЛЬКО если в policy есть прокси-секрет (иначе
+        # openssl-генерация CA и слушающие сокеты не нужны — «выключено = не
+        # существует», обратная совместимость для сессий без прокси-секретов).
+        self.ca: VaultCA | None = None
+        self.proxies: SessionProxyPool | None = None
+        # session_name → env-вклад перехвата (HTTPS_PROXY + *_CA_BUNDLE). Пишет
+        # launch-хук (порт прокси известен), читает session_env (env процесса).
+        self._proxy_env: dict[str, dict[str, str]] = {}
 
     def handle_command(self, args_str: str) -> str:
         """`/wallet <args>` — просмотр/правка policy кошелька (HTML-текст).
@@ -418,6 +127,11 @@ class WalletModule:
 
     async def start(self, core) -> None:
         self.core = core
+        # policy+тумблер — только ради ASK-гранта «навсегда» (§4.6): при
+        # WALLET_POLICY_EDIT=0 хост третью кнопку не покажет вовсе.
+        self.host = OrchestratorVaultHost(
+            core, policy=self.policy, allow_policy_edit=self.config.wallet_policy_edit
+        )
         # Провижн (~/.wallet.json в приватном доме сессии) виден CLI только
         # когда дом смонтирован КАК $HOME процесса claude — это делает лишь
         # BwrapRunner. Под off/agent-vm CLI не найдёт конфиг → предупреждаем.
@@ -438,33 +152,150 @@ class WalletModule:
             self._write_default_secrets()  # прокол на хост gh/git/ssh/scp «из коробки»
         self.store.load()  # ранняя диагностика прав/синтаксиса — в лог на старте
 
-        app = web.Application()
-        app.router.add_get("/secrets", self._handle_secrets)
-        app.router.add_post("/run", self._handle_run)
-        app.router.add_post("/exec", self._handle_exec)
-        app.router.add_post("/get", self._handle_get)
-        self._runner = web.AppRunner(app)
-        await self._runner.setup()
-        # Порт выдаёт ОС: свой сокет вместо TCPSite, чтобы узнать номер без
-        # залезания в приватные поля aiohttp.
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(("127.0.0.1", 0))
-        self.port = sock.getsockname()[1]
-        await web.SockSite(self._runner, sock).start()
-        logger.info("wallet: демон на 127.0.0.1:%d", self.port)
+        # Перехват TLS (§4.2/§4.3): поднимаем CA+пул прокси ТОЛЬКО при наличии
+        # прокси-секрета в policy. upstream_ssl пула — ДЕФОЛТНЫЙ (системный
+        # trust): НЕ переопределяем, иначе самозванец под сервис получил бы кред
+        # (CRITICAL, см. vault_proxy_test.test_default_upstream_rejects_...).
+        proxies = self._make_proxy_pool()
+
+        self.daemon = VaultDaemon(
+            self.store, self.host, guard_on=self.config.wallet_guard, proxies=proxies
+        )
+        await self.daemon.start()
 
         self._provision_cli()
         for session in core.manager.list_all():
             await self._provision(session)
         core.session_hooks.append(self._provision)
+        # Удаление сессии → отзыв её токена у демона (иначе токен удалённой
+        # сессии остался бы рабочим; раньше это давал _auth через manager.get).
+        core.manager.session_delete_hooks.append(self._revoke)
         # Прозрачный шлюз: каталог обёрток (.wallet-bin) первым в PATH песочницы.
         core.manager.path_hooks.append(self.session_path)
+        # Перехват TLS: поднять per-session прокси ДО старта claude, чтобы
+        # session_env увидел его порт (launch_hooks выполняются перед env_hooks).
+        core.manager.launch_hooks.append(self._start_session_proxies)
         # env для песочницы: shared → реальное значение, inject → маркер $NAME.
         core.manager.env_hooks.append(self.session_env)
         # Вымарывать значения секретов из чат-вывода (shared модель видит и может
         # случайно эхнуть — safety-net, чтобы не улетело в Telegram/историю).
         core.output_redactors.append(self.redact_output)
+
+    # ── перехват TLS: пул прокси и его провижн (§4.2/§4.3) ──────
+
+    def _make_proxy_pool(self) -> SessionProxyPool | None:
+        """Создать общий CA Vault + пул прокси, ЕСЛИ в policy есть прокси-секрет.
+
+        Нет прокси-секретов → None (демон работает как раньше, без CA/сокетов —
+        обратная совместимость). upstream_ssl оставляем ДЕФОЛТНЫМ (системный
+        trust): реориджин к реальному сервису обязан проверять его настоящий серт.
+        """
+        if not any(s.is_proxy for s in self.store.load().values()):
+            return None
+        try:
+            self.ca = VaultCA()
+        except VaultCAError as e:
+            logger.error(
+                "wallet: не удалось создать CA Vault (%s) — перехват TLS выключен, "
+                "прокси-секреты работать не будут", e)
+            self.ca = None
+            return None
+        # host=self.host — ASK-спрос гранта идёт через оркестраторный хост (§4.6);
+        # пул прокидывает его + имя сессии в per-session VaultProxy. Без host ASK
+        # трактовался бы как DENY (host=None), а заглушка ask была бы недостижима.
+        self.proxies = SessionProxyPool(
+            self.ca, self.store, host=self.host  # upstream_ssl=дефолт
+        )
+        logger.info("wallet: перехват TLS включён (есть прокси-секреты в policy)")
+        return self.proxies
+
+    async def _start_session_proxies(self, session) -> None:
+        """launch-хук: поднять MITM-прокси для прокси-секрета сессии и подготовить
+        её env-вклад (HTTPS_PROXY + trust-bundle). Идемпотентно (пул переиспользует
+        порт). Нет пула/прокси-секретов → чистит вклад и выходит (обратная
+        совместимость: обычная сессия ничего нового не получает).
+
+        Несколько прокси-секретов у сессии: HTTPS_PROXY один на процесс, поэтому
+        в этом срезе перехват включаем ТОЛЬКО для ПЕРВОГО (по имени) секрета и
+        громко предупреждаем. Маршрутизация нескольких сервисов — следующий срез.
+        """
+        self._proxy_env.pop(session.name, None)
+        if self.proxies is None:
+            return
+        names = sorted(
+            s.name for s in self.store.load().values()
+            if s.is_proxy and s.session_allowed(session.name)
+        )
+        if not names:
+            return
+        if len(names) > 1:
+            logger.warning(
+                "wallet: сессии %s назначено несколько прокси-секретов (%s) — "
+                "HTTPS_PROXY один на процесс, поэтому перехват включён ТОЛЬКО для "
+                "первого (%s); маршрутизация нескольких сервисов — следующий срез",
+                session.name, ", ".join(names), names[0])
+        secret_name = names[0]
+        # Снять прежние прокси этой сессии для НЕ-выбранного секрета: если
+        # алфавитно первый прокси-секрет сменился между рестартами, старый прокси
+        # иначе висел бы орфаном (лишний listening-порт с валидным MITM). Свой
+        # прокси (secret_name) не трогаем — start ниже переиспользует его порт.
+        for stale in list(self.proxies.ports(session.name)):
+            if stale != secret_name:
+                await self.proxies.stop(session.name, stale)
+        try:
+            port = await self.daemon.start_session_proxy(session.name, secret_name)
+        except ProxyPoolError as e:
+            logger.error(
+                "wallet: прокси сессии %s (секрет %s) не поднят: %s",
+                session.name, secret_name, e)
+            return
+        ca_path = self._provision_ca_bundle(session)
+        if ca_path is None:
+            # Без trust-bundle клиент не доверится leaf прокси — перехват
+            # бесполезен; снимаем прокси, чтобы не висел порт впустую.
+            await self.daemon.stop_session_proxies(session.name)
+            return
+        proxy_url = f"http://127.0.0.1:{port}"
+        # env-довесок перехвата — общий примитив vault.inject.proxy_env_vars
+        # (HTTPS_PROXY + *_CA_BUNDLE + NO_PROXY). HTTP_PROXY НЕ ставится: прокси
+        # обслуживает только CONNECT (HTTPS). NO_PROXY уводит контрольный трафик
+        # самого claude (loopback + хост оркестратора/прокси-модели) МИМО MITM —
+        # иначе одно-проходный форвард (Connection: close, без h2, лимит тела) ломал
+        # бы его egress. Внешние сервисы под секретом на loopback не попадают.
+        self._proxy_env[session.name] = proxy_env_vars(
+            proxy_url, ca_path, self._no_proxy_value())
+        logger.info(
+            "wallet: сессия %s → перехват секрета %s через 127.0.0.1:%d (trust %s)",
+            session.name, secret_name, port, ca_path)
+
+    def _provision_ca_bundle(self, session) -> str | None:
+        """Записать объединённый trust-bundle (системные корни + CA Vault) в
+        приватный дом сессии (0644) и вернуть путь ВНУТРИ песочницы ($HOME/имя).
+
+        Возвращаем None, если системный набор корней не найден: тогда указывать
+        SSL_CERT_FILE только на CA Vault нельзя (сломало бы прочий TLS)."""
+        bundle = build_ca_bundle(self.ca)
+        if bundle is None:
+            logger.error(
+                "wallet: системный CA-bundle не найден — перехват TLS для сессии %s "
+                "не включён (SSL_CERT_FILE на один Vault CA сломал бы прочий TLS)",
+                session.name)
+            return None
+        path = self.core.manager.session_home(session) / CA_BUNDLE_NAME
+        # Атомарно и БЕЗ следования симлинку (модель могла подложить симлинк на
+        # victim-файл под этим именем — см. _atomic_write). 0644: публичный серт.
+        _atomic_write(path, bundle, 0o644)
+        # Под bwrap дом сессии смонтирован КАК $HOME — путь виден изнутри так.
+        return str(Path.home() / CA_BUNDLE_NAME)
+
+    def _no_proxy_value(self) -> str:
+        """NO_PROXY для процесса claude при активном перехвате: loopback + хост
+        оркестратора/прокси-модели, слитые с уже заданным оператором NO_PROXY.
+        Контрольный трафик claude идёт мимо строгого одно-проходного форвард-
+        прокси; внешние сервисы под секретом на loopback не попадают."""
+        extra = [getattr(self.config, attr, "") or "" for attr in ("orch_host", "guest_orch_host")]
+        existing = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+        return merge_no_proxy(extra, existing=existing)
 
     def redact_output(self, text: str) -> str:
         """Заменить значения ВСЕХ секретов (inject/shared) на •••. У host значения
@@ -481,13 +312,20 @@ class WalletModule:
         сертификат) — для inject-секретов."""
         out: dict[str, str] = {}
         for s in self.store.load().values():
-            if not s.env or not s.session_allowed(session.name):
+            # proxy-секрет (connector) в песочницу НЕ эмитим: его кред живёт
+            # только в прокси (§4.4), маркер/значение в env недопустимы. store уже
+            # не активирует proxy-секрет с env — это второй рубеж.
+            if s.is_proxy or not s.env or not s.session_allowed(session.name):
                 continue
             if s.shared:
                 out[s.env] = s.value
             else:
                 out[s.env] = marker(s.name)
                 out[s.env + "_FILE"] = marker(s.name, as_file=True)
+        # Перехват TLS: HTTPS_PROXY + trust-bundle, подготовленные launch-хуком
+        # (_start_session_proxies) ДО этого вызова. Пусто для сессий без
+        # прокси-секретов — обычная сессия ничего нового не получает.
+        out.update(self._proxy_env.get(session.name, {}))
         return out
 
     def _write_default_secrets(self) -> None:
@@ -517,16 +355,30 @@ class WalletModule:
         except ValueError:
             pass
 
+    async def _revoke(self, session_name: str) -> None:
+        """Хук удаления сессии: отозвать её токен у демона и СНЯТЬ её прокси
+        (освободив порт). Корутина — SessionManager.delete её дожидается, поэтому
+        стоп детерминированный: пересоздание сессии с тем же именем не гонится с
+        ещё-не-снятым старым прокси (иначе фон погасил бы уже новый). Гарантийный
+        сброс всех прокси — ещё и в stop() демона (stop_all)."""
+        if self.daemon is not None:
+            self.daemon.revoke_session(session_name)
+        self._proxy_env.pop(session_name, None)
+        if self.daemon is not None and self.proxies is not None:
+            await self.daemon.stop_session_proxies(session_name)
+
     async def stop(self) -> None:
         if self.core is not None:
             self._discard(self.core.session_hooks, self._provision)
+            self._discard(self.core.manager.session_delete_hooks, self._revoke)
             self._discard(self.core.manager.path_hooks, self.session_path)
+            self._discard(self.core.manager.launch_hooks, self._start_session_proxies)
             self._discard(self.core.manager.env_hooks, self.session_env)
             self._discard(self.core.output_redactors, self.redact_output)
-        if self._runner is not None:
-            await self._runner.cleanup()
-            self._runner = None
-        self._tokens.clear()
+        self._proxy_env.clear()
+        if self.daemon is not None:
+            await self.daemon.stop()  # stop_all снимает все прокси, освобождает порты
+            self.daemon = None
 
     def _provision_cli(self) -> None:
         """Симлинк ~/.local/bin/wallet → <репо>/bin/wallet, чтобы CLI был в PATH
@@ -554,27 +406,27 @@ class WalletModule:
             logger.error("wallet: не удалось провизить CLI %s: %s", link, e)
 
     async def _provision(self, session) -> None:
-        """Выдать сессии токен и записать ~/.wallet.json в её приватный $HOME.
+        """Выдать сессии токен (демон привязывает к нему её cwd) и записать
+        ~/.wallet.json в её приватный $HOME.
 
-        Внутри песочницы session_home смонтирован КАК $HOME процесса claude,
-        так что CLI найдёт файл по ~/.wallet.json без настройки.
+        cwd снимаем ЗДЕСЬ, из уже-аутентифицированного объекта сессии, и отдаём
+        демону при выдаче токена — дальше демон его не перерезолвивает (гонка с
+        удалением сессии роняла бы effective_cwd(None)). Внутри песочницы
+        session_home смонтирован КАК $HOME процесса claude — CLI найдёт файл по
+        ~/.wallet.json без настройки.
         """
-        token = secrets.token_urlsafe(32)
+        cwd = self.core.manager.effective_cwd(session)
+        token = self.daemon.issue_token(session.name, cwd)
         path = self.core.manager.session_home(session) / ".wallet.json"
         payload = {
-            "url": f"http://127.0.0.1:{self.port}",
+            "url": self.daemon.url,
             "token": token,
             "session": session.name,
         }
-        # O_CREAT с 0600 — файл ни мгновения не живёт с широкими правами;
-        # chmod дожимает случай, когда файл уже существовал с иными правами.
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(payload, f)
-        os.chmod(path, 0o600)
-        # Перевыдача (рестарт/повторный hook) отзывает прежний токен сессии.
-        self._tokens = {t: n for t, n in self._tokens.items() if n != session.name}
-        self._tokens[token] = session.name
+        # Атомарно, 0600 и БЕЗ следования симлинку: session_home RW-виден модели в
+        # песочнице, симлинком под этим именем она затёрла бы чужой файл токеном
+        # (тот же класс, что у CA-bundle — см. _atomic_write).
+        _atomic_write(path, json.dumps(payload), 0o600)
         self._provision_shims(session)
 
     # ── прозрачные обёртки (шлюз в PATH) ─────────────────────────
@@ -593,336 +445,27 @@ class WalletModule:
         """Голые имена инструментов, которые надо завернуть для этой сессии —
         из `commands` её НЕ-shared секретов. shared пропускаем: их значение уже
         лежит в env песочницы (модель зовёт инструмент напрямую, хостовый
-        раунд-трип не нужен). Из шаблона берём первый токен (`curl https://a/*`
-        → curl); чистые глобы (`*`) не заворачиваем — не бинарь."""
+        раунд-трип не нужен). Отбор имён из шаблонов — vault.shims.tool_names."""
         tools: set[str] = set()
         for s in self.store.load().values():
             if s.shared or not s.session_allowed(session.name):
                 continue
-            for pat in s.effective_commands:
-                parts = pat.split()
-                tool = os.path.basename(parts[0]) if parts else ""
-                if tool and not any(c in tool for c in "*?["):
-                    tools.add(tool)
+            tools |= tool_names(s.effective_commands)
         return tools
 
     def _git_shim(self) -> str:
-        """Обёртка git: сетевые подкоманды → на хост через кошелёк, локальные →
-        настоящий git в песочнице. Путь настоящего git резолвим на хосте (/usr
-        у песочницы тот же RO-бинд, поэтому путь совпадает)."""
-        real = shutil.which("git") or "/usr/bin/git"
-        nets = "|".join(GIT_NETWORK)
-        return (
-            "#!/bin/sh\n"
-            "# Обёртка кошелька (генерируется): сетевые git-подкоманды идут на\n"
-            "# хост через `wallet exec` (креды хоста), локальные — настоящим git.\n"
-            f'case "${{1:-}}" in\n'
-            f'  {nets}) exec wallet exec git "$@" ;;\n'
-            "esac\n"
-            f'exec {real} "$@"\n'
-        )
+        """Обёртка git — общий генератор vault.shims.git_shim (ре-экспорт для тестов)."""
+        return git_shim()
 
     def _provision_shims(self, session) -> None:
         """Полная перегенерация обёрток в <дом-сессии>/.wallet-bin. Заворачиваем
-        gh/curl/ssh/… целиком (→ `wallet exec <tool>`), git — особо (см. _git_shim).
+        gh/curl/ssh/… целиком (→ `wallet exec <tool>`), git — особо (см. git_shim).
         Перегенерация чистит устаревшие обёртки, если секрет/команду отозвали."""
         shim_dir = self.core.manager.session_home(session) / SHIM_DIRNAME
         try:
-            if shim_dir.exists():
-                for old in shim_dir.iterdir():
-                    if old.is_file() or old.is_symlink():
-                        old.unlink()
-            tools = self._session_tools(session)
-            if not tools:
-                return
-            shim_dir.mkdir(parents=True, exist_ok=True)
-            os.chmod(shim_dir, 0o700)
-            for tool in sorted(tools):
-                script = self._git_shim() if tool == "git" else (
-                    f'#!/bin/sh\nexec wallet exec {tool} "$@"\n'
-                )
-                p = shim_dir / tool
-                p.write_text(script)
-                os.chmod(p, 0o755)
-            logger.info(
-                "wallet: обёртки сессии %s: %s", session.name, ", ".join(sorted(tools))
-            )
+            written = write_shims(shim_dir, self._session_tools(session))
+            if written:
+                logger.info(
+                    "wallet: обёртки сессии %s: %s", session.name, ", ".join(written))
         except OSError as e:
             logger.error("wallet: обёртки для %s не созданы: %s", session.name, e)
-
-    # ── HTTP API ────────────────────────────────────────────────
-
-    def _auth(self, request: web.Request):
-        """Bearer-токен → Session. Сравнение constant-time (compare_digest),
-        перебор без раннего выхода — тайминг не выдаёт «почти угадал»."""
-        header = request.headers.get("Authorization", "")
-        token = header[len("Bearer "):].strip() if header.startswith("Bearer ") else ""
-        # На байтах: compare_digest на str с не-ASCII бросает TypeError (был бы
-        # 500 вместо 401). Перебор без раннего выхода — тайминг не выдаёт «почти».
-        token_b = token.encode("utf-8", "replace")
-        found: str | None = None
-        for known, sname in self._tokens.items():
-            if secrets.compare_digest(known.encode("utf-8"), token_b):
-                found = sname
-        if not token or found is None:
-            return None
-        return self.core.manager.get(found)
-
-    @_authed
-    async def _handle_secrets(self, request: web.Request, session: Session) -> web.Response:
-        """Список секретов, разрешённых этой сессии, — БЕЗ значений."""
-        out = [
-            {
-                "name": s.name,
-                "description": s.description,
-                "commands": list(s.effective_commands),
-                "confirm": s.confirm,
-                # host — команда на хосте с его окружением; inject — значение в
-                # env-переменную `env` дочернего процесса; shared — значение
-                # ВЫДАётся сессии (wallet get/env), не прячется.
-                "mode": s.mode,
-                "env": s.env or None,
-            }
-            for s in self.store.load().values()
-            if s.session_allowed(session.name)
-        ]
-        return web.json_response(out)
-
-    @_authed
-    async def _handle_get(self, request: web.Request, session: Session) -> web.Response:
-        """Выдать сессии ЗНАЧЕНИЕ shared-секрета (dev-ключ, логин/пароль).
-
-        Только для shared — host/inject значения не выдаются НИКОГДА (в этом их
-        смысл). shared — про хранение вне чата/репо, не про сокрытие от модели."""
-        try:
-            data = await request.json()
-        except Exception:
-            data = {}
-        name = str(data.get("secret", ""))
-        secret = self.store.load().get(name)
-        if secret is None or not secret.session_allowed(session.name):
-            return web.json_response(
-                {"error": "denied",
-                 "reason": f"нет shared-секрета «{name}» для этой сессии (см. wallet ls)"},
-                status=403,
-            )
-        if not secret.shared:
-            return web.json_response(
-                {"error": "denied",
-                 "reason": f"секрет «{name}» не shared — значение не выдаётся "
-                           "(для host/inject используй wallet run)"},
-                status=403,
-            )
-        if secret.confirm:
-            ok = await self.core.request_confirmation(
-                session, tool="wallet",
-                description=f"выдать значение shared-секрета «{name}» сессии",
-                preview=f"wallet get {name}",
-            )
-            if not ok:
-                return web.json_response(
-                    {"error": "denied", "reason": "отклонено кнопкой подтверждения"},
-                    status=403,
-                )
-        # Наблюдаемость: выдача видна строкой (без значения).
-        await self.core.bubbles.append_background(
-            session.name,
-            f"🔐 <b>wallet get</b> <code>{html.escape(name)}</code>", tool="wallet",
-        )
-        self.core._record(session, "wallet", secret=name, cmd=f"get {name}", allowed=True)
-        return web.json_response(
-            {"name": name, "env": secret.env or None, "value": secret.value}
-        )
-
-    @_authed
-    async def _handle_run(self, request: web.Request, session: Session) -> web.Response:
-        """Явный вызов: `wallet run <name> -- <cmd>` — секрет задан именем."""
-        try:
-            body = await request.json()
-            name = str(body["secret"])
-            cmd = [str(c) for c in body["cmd"]]
-            if not cmd:
-                raise ValueError("пустая команда")
-        except Exception:
-            return web.json_response({"error": "bad request"}, status=400)
-        return await self._run_secret(session, self.store.load().get(name), cmd, name)
-
-    @_authed
-    async def _handle_exec(self, request: web.Request, session: Session) -> web.Response:
-        """Прозрачный шлюз: `wallet exec <cmd>` (зовут обёртки в PATH песочницы)
-        — секрет подбирается ПО КОМАНДЕ (чей `commands` её разрешает). Модель
-        зовёт инструмент как обычно."""
-        try:
-            body = await request.json()
-            cmd = [str(c) for c in body["cmd"]]
-            if not cmd:
-                raise ValueError("пустая команда")
-        except Exception:
-            return web.json_response({"error": "bad request"}, status=400)
-        secret = self._resolve_secret(session, cmd)
-        label = secret.name if secret is not None else os.path.basename(cmd[0])
-        return await self._run_secret(session, secret, cmd, label)
-
-    def _resolve_secret(self, session, cmd: list[str]):
-        """Секрет, чьи commands разрешают эту команду для сессии (авто-подбор для
-        /exec). Первый подходящий; None — если ни один не разрешает."""
-        for s in self.store.load().values():
-            if s.session_allowed(session.name) and s.command_allowed(cmd):
-                return s
-        return None
-
-    async def _run_secret(self, session, secret, cmd: list[str], label: str) -> web.Response:
-        """Общий путь /run и /exec: policy (guard/deny/confirm) + наблюдаемость +
-        выполнение на хосте + редакция вывода."""
-        cmd_str = " ".join(cmd)
-        all_secrets = self.store.load()
-        # Причина отказа для прозрачности: 1) встроенный guard (печать токена,
-        # git-RCE), 2) точечный deny секрета.
-        reason: str | None = None
-        if secret is not None:
-            if self.config.wallet_guard and not secret.allow_unsafe:
-                reason = _always_denied(cmd)
-            if reason is None and (pat := secret.denied_by(cmd)) is not None:
-                reason = f"заблокировано policy этого секрета (deny: {pat})"
-        allowed = (
-            secret is not None
-            and secret.session_allowed(session.name)
-            and secret.command_allowed(cmd)
-            and reason is None
-        )
-        if allowed and secret.confirm:
-            allowed = await self.core.request_confirmation(
-                session, tool="wallet",
-                description=f"{label} → {cmd_str[:200]}", preview=cmd_str,
-            )
-        # Наблюдаемость: КАЖДАЯ попытка видна строкой в бабле; отдельное
-        # уведомление — только на ОТКАЗ (нужно внимание).
-        cmd_disp = f"{label} → {cmd_str[:120]}"
-        bubble_line = f"🔐 <b>wallet</b> <code>{html.escape(cmd_disp)}</code>"
-        await self.core.bubbles.append_background(session.name, bubble_line, tool="wallet")
-        self.core._record(session, "wallet", secret=label, cmd=cmd_str, allowed=bool(allowed))
-        if not allowed:
-            if reason is None:
-                if secret is None:
-                    reason = f"нет секрета для «{cmd_str[:80]}» (проверь `wallet ls`)"
-                elif not secret.session_allowed(session.name):
-                    reason = "секрет не разрешён этой сессии (policy sessions)"
-                elif not secret.command_allowed(cmd):
-                    reason = "команда не в списке разрешённых (policy commands)"
-                else:
-                    reason = "отклонено кнопкой подтверждения"
-            # Operator-notice — только для отказов, требующих его внимания.
-            # `gh auth token`/`--show-token` (печать токена) НЕ шлём: отказ
-            # самокорректирующийся (reason ушёл в stderr модели, аудит — в бабле),
-            # а фоновый поллер Claude Code («PR status») зовёт её периодически —
-            # иначе спам в чат на каждый опрос. git-RCE и policy-отказы — шлём.
-            if not _prints_token(cmd):
-                notice_md = f"🔐 wallet: `{cmd_disp.replace('`', chr(39))}`"
-                await self.core.notice(
-                    session,
-                    self.core.t("wallet_use", line=notice_md) + " — " + self.core.t("wallet_denied"),
-                )
-            return web.json_response({"error": "denied", "reason": reason}, status=403)
-        code, out, err = await self._execute(session, secret, cmd)
-        values = [s.value for s in all_secrets.values()]
-        return web.json_response(
-            {"code": code, "stdout": _redact(out, values), "stderr": _redact(err, values)}
-        )
-
-    async def _execute(self, session, secret: Secret, cmd: list[str]) -> tuple[int, bytes, bytes]:
-        """Запустить команду НА ХОСТЕ (вне песочницы).
-
-        Суть дизайна: секрет/auth живёт только на хосте, никогда — в адресном
-        пространстве песочницы. Два режима (см. Secret):
-          * inject — секрет в env ребёнка (env=…, value=…);
-          * host-passthrough — чистое хостовое окружение (keyring, gh/git auth):
-            ничего не инжектим, глобальный git-конфиг НЕ обнуляем (в нём живёт
-            gh credential helper).
-
-        ⚠️ ОГРАНИЧЕНИЕ (docs/secrets-wallet.md): команда исполняется в cwd
-        проекта, куда модель пишет из песочницы. Узкий шаблон НЕ гарантирует
-        безопасность — модель может подложить `./.git/config` и получить
-        исполнение на хосте. Барьер — policy (sessions/commands/confirm).
-        """
-        env = dict(os.environ)
-        # Строго НЕинтерактивно: команда бежит без TTY (демон). Любой интерактив
-        # (ssh host-verify/пароль, git credential-промпт) иначе всплывает
-        # GUI-диалогом askpass (Ksshaskpass) на десктопе хоста — висит невидимо
-        # для модели. Глушим GUI: пусть команда падает с понятной ошибкой в
-        # stderr (модель увидит и починит/скажет оператору), а не подвешивает.
-        env["SSH_ASKPASS_REQUIRE"] = "never"
-        env["GIT_TERMINAL_PROMPT"] = "0"
-        env.pop("DISPLAY", None)
-        env.pop("SSH_ASKPASS", None)
-
-        tmpdir: str | None = None
-        # Основной секрет-inject → реальное значение в env (env-читающие
-        # инструменты, gh->GH_TOKEN, получают его на хосте).
-        if not secret.host_passthrough:
-            env[secret.env] = secret.value
-            # Частичная защита git от подложенного локального конфига (inject).
-            env.setdefault("GIT_CONFIG_NOSYSTEM", "1")
-            env.setdefault("GIT_CONFIG_GLOBAL", "/dev/null")
-        # Развернуть маркеры <<wallet:имя>> / <<wallet:имя:file>> в аргументах в
-        # РЕАЛЬНОЕ значение на хосте (curl-заголовок, ssh-ключ): модель писала
-        # $ENV → шелл развернул в маркер → тут подставляем значение. Файл — во
-        # временный 0600 на хосте (песочнице невидим, tmpfs /tmp), сносится в
-        # finally. Маркер неизвестного/недоступного секрета → пусто (не течём).
-        all_secrets = self.store.load()
-
-        def _sub(arg: str) -> str:
-            nonlocal tmpdir
-
-            def repl(m: "re.Match") -> str:
-                nonlocal tmpdir
-                s = all_secrets.get(m.group(1))
-                if s is None or not s.session_allowed(session.name) or not s.value:
-                    return ""
-                if not m.group(2):
-                    return s.value
-                if tmpdir is None:
-                    tmpdir = tempfile.mkdtemp(prefix="wallet-")
-                path = os.path.join(tmpdir, m.group(1))
-                if not os.path.exists(path):
-                    data = s.value if s.value.endswith("\n") else s.value + "\n"
-                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                    with os.fdopen(fd, "w") as f:
-                        f.write(data)
-                return path
-
-            return MARKER_RE.sub(repl, arg)
-
-        cmd = [_sub(a) for a in cmd]
-
-        try:
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    cwd=self.core.manager.effective_cwd(session),
-                    env=env,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    start_new_session=True,  # своя группа процессов — killpg по таймауту
-                )
-            except OSError as e:
-                return 127, b"", str(e).encode()
-            try:
-                out, err = await asyncio.wait_for(proc.communicate(), RUN_TIMEOUT)
-                return proc.returncode if proc.returncode is not None else 1, out, err
-            except asyncio.TimeoutError:
-                # Убиваем всю группу: сама команда могла наплодить детей.
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except OSError:
-                    try:
-                        proc.kill()
-                    except OSError:
-                        pass
-                try:
-                    out, err = await proc.communicate()
-                except Exception:
-                    out = err = b""
-                return 124, out, err
-        finally:
-            if tmpdir:
-                shutil.rmtree(tmpdir, ignore_errors=True)

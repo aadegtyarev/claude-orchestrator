@@ -9,14 +9,18 @@
      уходила спурьёзным сообщением («your message was just 2»). Все маркеры —
      СТАРТОВЫЕ диалоги, поэтому матчер живёт только стартовое окно.
 
-Запуск: .venv/bin/python tests/pty_dialogs_test.py
+Матчер переехал в автономный пакет box/ (box.dialog, Слой 2 редизайна) —
+импортим из источника; отдельным тестом проверяем, что sessions.py его
+реэкспортит (обратная совместимость).
+
+Запуск: .venv/bin/python tests/box_dialog_test.py
 """
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from orchestrator.core.sessions import _DIALOGS, _DialogAnswerer  # noqa: E402
+from box.dialog import _DIALOGS, _DialogAnswerer  # noqa: E402
 
 
 def _screen(text: str) -> str:
@@ -152,6 +156,16 @@ def test_answerer_marker_split_across_chunks():
     print("OK маркер на границе чанков матчится")
 
 
+def test_sessions_reexports_dialog_symbols():
+    """sessions.py реэкспортит _DialogAnswerer/_DIALOGS из box — старый код и
+    тесты, ссылающиеся на sessions._DialogAnswerer, не сломаны."""
+    from orchestrator.core import sessions
+
+    assert sessions._DialogAnswerer is _DialogAnswerer
+    assert sessions._DIALOGS is _DIALOGS
+    print("OK sessions.py реэкспортит _DialogAnswerer/_DIALOGS из box.dialog")
+
+
 def main():
     test_no_marker_matches_status_bar()
     test_bypass_marker_matches_dialog()
@@ -165,7 +179,8 @@ def main():
     test_answerer_stops_when_all_answered()
     test_answerer_strips_ansi_and_spaces()
     test_answerer_marker_split_across_chunks()
-    print("ALL PTY-DIALOGS OK")
+    test_sessions_reexports_dialog_symbols()
+    print("ALL BOX-DIALOG OK")
 
 
 if __name__ == "__main__":

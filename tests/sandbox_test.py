@@ -103,8 +103,11 @@ def test_prefix_allowlist():
     s = " ".join(argv)
     # claude_config_dir из конфига — RW (контролируемое значение)
     assert "--bind-try /home/tester/.claude-proxy" in s
-    # прочие пути привязаны к реальному $HOME процесса
-    assert f"--bind-try {Path.home() / '.claude.json'}" in s
+    # При заданном config_dir отдельного бинда ~/.claude.json НЕТ: claude кладёт
+    # свой .claude.json ВНУТРЬ config-dir, который уже прибинден выше. Реальный
+    # ~/.claude.json оператора в песочницу не попадает.
+    assert f"--bind-try {Path.home() / '.claude.json'}" not in s
+    assert "--bind-try /home/tester/.claude.json" not in s
     assert f"--bind-try {work}" in s                       # рабочая папка RW
     assert "--ro-bind-try" in s and "/.local/share/claude" in s  # бинарь RO
     print("OK sandbox_prefix: конфиг+проект RW, бинарь+репозиторий RO")
@@ -232,12 +235,60 @@ def test_available_ok():
     print("OK available: bwrap+userns -> (True, ok)")
 
 
+def _bwrap_rw_paths(claude_config_dir: Path) -> str:
+    """Собрать argv BwrapRunner.wrap с данным claude_config_dir и вернуть строку."""
+    from orchestrator.runners.bwrap import BwrapRunner
+    cfg = SimpleNamespace(
+        sandbox="bwrap",
+        claude_config_dir=claude_config_dir,
+        sandbox_extra_rw=(),
+        sandbox_dbus=False,
+        sandbox_docker=False,  # docker-сокет — пер-сессионный, здесь не проверяем
+    )
+    runner = BwrapRunner(cfg, root=Path("/repo"))
+    argv = runner.wrap([], chdir=Path("/w"), extra_rw=[Path("/w")])
+    return " ".join(argv)
+
+
+def test_bwrap_claude_json_only_without_config_dir():
+    """Реальный ~/.claude.json биндится ТОЛЬКО когда config-dir не задан.
+
+    При заданном CLAUDE_CONFIG_DIR claude ведёт свой .claude.json внутри него, и тот
+    уже покрыт биндом самого config_dir; отдельный бинд утащил бы в песочницу
+    постороннее (под профилем — глобальное состояние оператора):
+      1) дефолт (config_dir=None) → home/.claude.json (как раньше);
+      2) вынесенный config_dir (оркестратор) → бинда нет, файл внутри config_dir;
+      3) профиль (config_dir=<profile>/.claude) → реального home/.claude.json НЕТ.
+    """
+    home = Path.home()
+
+    # 1) Дефолт: claude_config_dir=None → нужен явный бинд ~/.claude.json.
+    s_default = _bwrap_rw_paths(None)
+    assert f"--bind-try {home / '.claude.json'}" in s_default
+    assert f"--bind-try {home / '.claude'} " in s_default + " "
+
+    # 2) Оркестратор: CLAUDE_CONFIG_DIR задан → биндится он сам, отдельного файла нет.
+    s_orch = _bwrap_rw_paths(home / ".claude-proxy")
+    assert f"--bind-try {home / '.claude-proxy'}" in s_orch
+    assert f"--bind-try {home / '.claude.json'}" not in s_orch
+
+    # 3) Профиль: config_dir вынесен → реальный ~/.claude.json скрыт.
+    profile = Path("/tmp/box-profiles/work")
+    s_profile = _bwrap_rw_paths(profile / ".claude")
+    assert f"--bind-try {profile / '.claude'}" in s_profile
+    assert f"--bind-try {home / '.claude.json'}" not in s_profile, (
+        "УТЕЧКА: реальный ~/.claude.json биндится в песочницу профиля"
+    )
+    print("OK bwrap: ~/.claude.json только при пустом config-dir (профиль изолирован)")
+
+
 def main():
     test_build_argv_order()
     test_build_argv_dbus_off()
     test_build_argv_persistent_home()
     test_prefix_off_empty()
     test_prefix_allowlist()
+    test_bwrap_claude_json_only_without_config_dir()
     test_real_isolation()
     test_available_no_bwrap()
     test_available_probe_raises()

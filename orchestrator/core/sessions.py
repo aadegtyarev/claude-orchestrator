@@ -16,17 +16,13 @@ set_model) сериализованы её локом `Session.ops` — пара
 from __future__ import annotations
 
 import asyncio
-import fcntl
+import inspect
 import json
 import logging
 import os
-import pty
 import shutil
 import socket
-import struct
 import sys
-import termios
-import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -44,6 +40,22 @@ from .. import runners as runner_mod
 from ..config import Config
 from ..modules.docker.proxy import DockerProxy
 
+# Launch-механика вынесена в автономный пакет box/ (Слой 2 редизайна,
+# docs/ARCHITECTURE-claude-box.md §5/§11). Реэкспорт для обратной
+# совместимости: код/тесты ссылаются на sessions._DIALOGS/_DialogAnswerer/
+# _ReadyDeadline/READY_* как раньше. Ноль изменений поведения.
+from box import transcript_path as box_transcript
+from box.dialog import _DialogAnswerer, _DIALOGS  # noqa: F401
+from box.launch import launch as box_launch
+# open_pty/start_driver больше не зовутся здесь напрямую (спавн+драйвер собраны
+# в box.launch), но реэкспортятся для обратной совместимости кода/тестов.
+from box.pty import open_pty, start_driver  # noqa: F401
+from box.ready import (  # noqa: F401
+    READY_SILENCE_SEC,
+    READY_TIMEOUT_MAX,
+    _ReadyDeadline,
+)
+
 logger = logging.getLogger(__name__)
 
 # Каталог пакета orchestrator/ (channel_server.py) и корень репозитория
@@ -51,15 +63,10 @@ logger = logging.getLogger(__name__)
 PKG_DIR = Path(__file__).resolve().parent.parent
 ROOT = PKG_DIR.parent
 
-# Готовность сессии ждём по ТИШИНЕ, а не по общему времени: сколько секунд
-# терпим отсутствие признаков жизни (claude.log не растёт). Холодный старт
-# agent-vm тянет OCI-образ минутами, и фиксированный общий таймаут убивал бы
-# сессию до старта Claude; при этом реально зависший процесс должен падать
-# быстро, а не через потолок.
-READY_SILENCE_SEC = 60.0
-# Абсолютный потолок ожидания — чтобы бесконечно «прогрессирующий» процесс
-# (напр. бесконечная перекачка образа по битой сети) не висел вечно.
-READY_TIMEOUT_MAX = 900.0
+# READY_SILENCE_SEC/READY_TIMEOUT_MAX переехали в box.ready (реэкспорт выше) —
+# они неотделимы от _ReadyDeadline. Ниже — launch-timing, который читают методы
+# SessionManager (resume/send); эти методы пока живут здесь, поэтому и константы
+# остаются в sessions.py до соответствующих срезов.
 # Пауза после resume: «claude --resume» без транскрипта умирает не сразу,
 # а через несколько секунд после старта.
 RESUME_GRACE = 5.0
@@ -74,160 +81,13 @@ class SessionError(Exception):
     """Ошибка создания/работы сессией — текст показывается пользователю."""
 
 
-# Стартовые диалоги интерактивного claude и клавиши-ответы.
-# Маркеры ищутся в тексте экрана без пробелов и в нижном регистре.
-_DIALOGS = [
-    ("trustthisfolder", b"\r"),        # «Yes, I trust this folder» — пункт по умолчанию
-    # ВАЖНО: маркер — по тексту ПУНКТА диалога («Yes, I accept»), НЕ по
-    # «bypasspermissions»: последнее ложно совпадает со строкой СТАТУСА
-    # «⏵⏵ bypass permissions on» (постоянная UI-плашка, не диалог) → слался «2»
-    # как сообщение в чат (замечено под agent-vm).
-    ("yes,iaccept", b"2\r"),           # bypass-permissions диалог: «2. Yes, I accept»
-    ("localdevelopment", b"\r"),       # dev-channels: «I am using this for local development»
-    # agent-vm ставит managed-настройки (CLAUDE_CODE_MAX_RETRIES/RETRY_WATCHDOG) —
-    # Claude на старте просит их подтвердить. Доверяем (это настройки самого
-    # sandbox-инструмента, benign retry-конфиг): пункт 1 «Yes, I trust» по умолч.
-    ("managedsettingsrequireapproval", b"\r"),
-]
-
-
-class _ReadyDeadline:
-    """Дедлайн готовности, который продлевается признаками жизни.
-
-    Признак жизни — рост `claude.log`: под agent-vm туда льётся прогресс
-    загрузки образа и бута VM, под bwrap — вывод самого Claude. Пока лог
-    растёт, ждём дальше; замолчал дольше READY_SILENCE_SEC — сдаёмся. Сверху
-    абсолютный потолок READY_TIMEOUT_MAX.
-    """
-
-    def __init__(
-        self,
-        started_at: float,
-        silence: float = READY_SILENCE_SEC,
-        cap: float = READY_SILENCE_SEC,
-    ):
-        # cap по умолчанию = окно тишины: без явного запаса ведём себя ровно как
-        # прежний фиксированный таймаут. Запас даём только там, где он оправдан
-        # (agent-vm с загрузкой образа) — иначе «живой» спиннер зависшего Claude
-        # растил бы лог и держал нас до потолка на самом частом пути (bwrap).
-        self._silence = silence
-        self._cap = started_at + max(cap, silence)
-        self._last_alive = started_at
-        self._last_size = -1
-
-    def note_progress(self, size: int, now: float) -> None:
-        """Сообщить текущий размер лога. Рост = признак жизни."""
-        if size > self._last_size:
-            self._last_size = size
-            self._last_alive = now
-
-    def expired(self, now: float) -> str | None:
-        """None — ждём дальше; 'silence' | 'cap' — причина сдаться."""
-        # Тишина важнее потолка: она точнее описывает, что произошло. При
-        # cap == silence (дефолт, без запаса) обе причины наступают разом —
-        # сообщать надо «молчит», а не «упёрся в потолок».
-        if now - self._last_alive > self._silence:
-            return "silence"
-        if now > self._cap:
-            return "cap"
-        return None
-
-
-class _DialogAnswerer:
-    """Матчер стартовых диалогов: экран → клавиши-ответы.
-
-    Работает ТОЛЬКО до готовности сессии и выключается досрочно, когда все
-    диалоги отвечены. Это принципиально: маркеры ищутся в скользящем окне
-    вывода, а вывод после старта — это уже беседа. Матчер «на всю жизнь сессии»
-    впечатывал клавиши в stdin Claude, когда текст беседы случайно содержал
-    маркер (модель пишет «yes, I accept» → в сессию уходит «2\\r» и вылезает
-    спурьёзным сообщением «your message was just 2»).
-
-    Выключение — по событию, а не по таймеру: `stop()` зовётся, когда
-    channel-сервер ответил на /ping. Это ТОЧНЫЙ признак, что Claude полностью
-    поднялся и стартовые диалоги позади, и он не зависит от того, сколько
-    длился старт (под agent-vm первая загрузка OCI-образа занимает минуты —
-    любое фиксированное окно там оставило бы диалог без ответа).
-
-    Живёт в потоке _pty_driver; `stop()` зовётся из event loop — поэтому
-    флаг проверяется/ставится под локом.
-    """
-
-    def __init__(self) -> None:
-        self._answered: set[str] = set()
-        self._buf = b""
-        self._lock = threading.Lock()
-        self._active = True
-
-    @property
-    def active(self) -> bool:
-        with self._lock:
-            return self._active
-
-    def stop(self) -> None:
-        """Сессия готова — больше не трогаем stdin (весь вывод дальше — беседа)."""
-        with self._lock:
-            self._active = False
-            self._buf = b""
-
-    def feed(self, chunk: bytes) -> list[bytes]:
-        """Скормить кусок вывода. Вернуть клавиши, которые надо послать."""
-        with self._lock:
-            if not self._active:
-                return []
-            self._buf = (self._buf + chunk)[-16384:]
-            screen = strip_ansi(self._buf).replace(b" ", b"")
-            screen_text = screen.decode(errors="replace").lower()
-            out: list[bytes] = []
-            # Один чанк может принести несколько диалогов сразу (под agent-vm
-            # вывод идёт через проброшенный PTY и перерисовки склеиваются) —
-            # отвечаем на все, а не только на первый.
-            for marker, keys in _DIALOGS:
-                if marker in screen_text and marker not in self._answered:
-                    self._answered.add(marker)
-                    out.append(keys)
-            if out:
-                self._buf = b""
-            if len(self._answered) == len(_DIALOGS):
-                self._active = False
-            return out
-
-
-def _pty_driver(
-    master: int, log_file: IO[bytes], name: str, answerer: _DialogAnswerer
-) -> None:
-    """Поток при PTY: дренирует вывод claude (иначе буфер pty переполнится
-    и процесс встанет), пишет его в лог и отвечает на стартовые диалоги.
-
-    Поток владеет master-fd и сам закрывает его на выходе — закрытие из
-    event loop могло бы освободить номер fd, пока поток блокирован в read.
-    """
-    try:
-        while True:
-            try:
-                chunk = os.read(master, 65536)
-            except OSError:
-                return
-            if not chunk:
-                return
-            try:
-                log_file.write(chunk)
-                log_file.flush()
-            except ValueError:  # лог уже закрыт при остановке сессии
-                pass
-            for keys in answerer.feed(chunk):
-                logger.info("Сессия %s: отвечаю на стартовый диалог", name)
-                for key in keys:
-                    try:
-                        os.write(master, bytes([key]))
-                    except OSError:
-                        return
-                    time.sleep(0.3)
-    finally:
-        try:
-            os.close(master)
-        except OSError:
-            pass
+# _DIALOGS/_DialogAnswerer, _ReadyDeadline/READY_* и ядро PTY-запуска (open_pty/
+# start_driver — openpty+winsize и поток-драйвер) переехали в пакет box/
+# (box.dialog, box.ready, box.pty) — самодостаточные launch-хелперы без
+# зависимостей от SessionManager. _DialogAnswerer/_ReadyDeadline/READY_*
+# реэкспортированы в шапке модуля для обратной совместимости. Драйвер box'а
+# отдаёт вывод через колбэк on_output — оркестратор пишет его в claude.log
+# (см. _start_claude), а «куда/как поднят процесс» остаётся здесь же.
 
 
 @dataclass
@@ -294,6 +154,18 @@ class SessionManager:
         # Модули добавляют каталоги в НАЧАЛО PATH песочницы (напр. wallet:
         # обёртки-шлюз gh/git/curl). Синхронные, session -> [каталоги].
         self.path_hooks: list[Callable[[Session], list[str]]] = []
+        # Модули поднимают ресурсы, чей результат нужен env/PATH процесса ДО его
+        # старта (напр. wallet: per-session MITM-прокси — HTTPS_PROXY зависит от
+        # выданного порта). Асинхронные, session -> None; выполняются в начале
+        # _start_claude (перед сборкой env), поэтому env_hooks уже видят порт.
+        # Гоняются на КАЖДОМ старте (create/resume/clear/set_model), чтобы прокси
+        # переустанавливался при возобновлении. Падение хука не роняет запуск.
+        self.launch_hooks: list[Callable[[Session], Awaitable[None]]] = []
+        # Модули узнают об УДАЛЕНИИ сессии (напр. wallet: отзыв токена демона +
+        # снятие её прокси, иначе токен/прокси удалённой сессии остались бы
+        # живыми). По имени; синхронные ИЛИ корутины — delete их дожидается
+        # (детерминированный teardown: пересоздание сессии не гонится со стопом).
+        self.session_delete_hooks: list[Callable[[str], Awaitable[None] | None]] = []
         # Per-session docker-прокси (SANDBOX_BWRAP_DOCKER): у каждой сессии свой,
         # allowlist = только её проект. Живёт, пока жив процесс сессии.
         self._docker_proxies: dict[str, "DockerProxy"] = {}
@@ -727,6 +599,15 @@ class SessionManager:
         if self.config.sandbox == "bwrap" and not self.config.sandbox_x11:
             for var in ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY"):
                 env.pop(var, None)
+        # Пре-старт ресурсов, чей результат нужен env/PATH ниже (wallet: подъём
+        # per-session прокси перехвата, чтобы session_env увидел его порт).
+        # Выполняется ДО сборки PATH/env. Падение хука не должно ронять запуск —
+        # логируем и продолжаем (сессия поднимется, просто без этой обвязки).
+        for hook in self.launch_hooks:
+            try:
+                await hook(session)
+            except Exception:
+                logger.exception("launch_hook для сессии %s", session.name)
         # CLI-обвязка оркестратора (bin/wallet и т.п.): репозиторий RO-виден
         # и в песочнице, поэтому PATH работает и там. Модульные path_hooks
         # (напр. обёртки-шлюз кошелька) кладём ещё раньше — они должны побеждать
@@ -745,6 +626,14 @@ class SessionManager:
         # и т.п.). Сами CLAUDE_ENV_* в дочерний процесс не тащим.
         for key in [k for k in env if k.startswith("CLAUDE_ENV_")]:
             del env[key]
+        # AGENT_VM_MEMORY_GIB/CPUS — env-алиасы флагов самого agent-vm, а мы их
+        # уже прочитали (config) и превратили во флаги (раннер). Оставлять их в
+        # окружении ребёнка значит держать второй источник истины: наш разбор
+        # («0/пусто = не задано, флаг не эмитим») агент-vm бы не увидел и взял
+        # значение сам. Один источник — наш.
+        if self.config.sandbox == "agent-vm":
+            from ..runners.agentvm import strip_own_env
+            strip_own_env(env)
         env.update(self.config.claude_env)
         # Модульные env-вклады (wallet: $NAME для секретов). Env процесса claude
         # наследуют его Bash-тул и сервисы, что он запускает — значит переменная
@@ -778,16 +667,20 @@ class SessionManager:
 
         self._rotate_log(session.session_dir / "claude.log")
         session.log_file = open(session.session_dir / "claude.log", "ab")
-        master, slave = pty.openpty()
-        # Задать размер терминала. Без него winsize = 0×0, и Claude Code
-        # агрессивно зондирует размер через CPR (\x1b[6n); под agent-vm (двойной
-        # PTY через attach) ответы на зонды текут одиночными цифрами в stdin —
-        # мусор в экране, а изредка (если следом CR) уходит спурьёзным
-        # сообщением («your message was just 2»). Фиксированный размер это гасит.
-        try:
-            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
-        except OSError:
-            pass
+        # box-драйвер отдаёт вывод claude через колбэк — пишем его в лог сессии.
+        # Захватываем конкретный log_file (не session.log_file): при рестарте
+        # сессии там окажется новый файл, а этот драйвер владеет прежним PTY и
+        # должен писать в прежний лог, как и раньше. ValueError глотаем — лог мог
+        # закрыться при остановке сессии (драйвер ещё дочитывает буфер PTY).
+        log_file = session.log_file
+
+        def _on_output(chunk: bytes) -> None:
+            try:
+                log_file.write(chunk)
+                log_file.flush()
+            except ValueError:  # лог уже закрыт при остановке сессии
+                pass
+
         try:
             # cwd = папка проекта (если задан линк): натуральное поведение —
             # Claude грузит CLAUDE.md/.mcp.json/.claude проекта. Канал-сервер
@@ -832,29 +725,21 @@ class SessionManager:
                 publish_ports=[session.port],
                 docker_sock=docker_sock,
             )
-            session.process = await asyncio.create_subprocess_exec(
-                *argv,
-                cwd=cwd,
-                stdin=slave,
-                stdout=slave,
-                stderr=slave,
-                env=env,
-                start_new_session=True,
+            # Спавн процесса под PTY + запуск драйвера (дренаж вывода + авто-ответы
+            # на стартовые диалоги) собран в box.launch: он открывает PTY нужного
+            # размера (иначе winsize = 0×0 и claude мусорит зондами CPR), спавнит
+            # процесс на slave и владеет master-fd (закроет сам). Оркестратор даёт
+            # готовые argv/env/cwd и колбэк вывода, забирает ручки из handle.
+            # Сбой спавна launch чистит свои fd (master/slave); лог закрываем мы.
+            handle = await box_launch(
+                argv, cwd=cwd, env=env, on_output=_on_output, name=session.name
             )
         except Exception:
-            os.close(master)
             self._close_log(session)
             raise
-        finally:
-            os.close(slave)
-        session.pty_master = master
-        session.dialog_answerer = _DialogAnswerer()
-        threading.Thread(
-            target=_pty_driver,
-            args=(master, session.log_file, session.name, session.dialog_answerer),
-            name=f"pty-{session.name}",
-            daemon=True,
-        ).start()
+        session.process = handle.process
+        session.pty_master = handle.pty_master
+        session.dialog_answerer = handle.answerer
 
     def _rotate_log(self, path: Path) -> None:
         """Если лог перерос лимит — сдвинуть в .old (одна копия), начать заново."""
@@ -944,6 +829,15 @@ class SessionManager:
                 self._by_name.pop(session.name, None)
                 self._cpu.pop(session.name, None)
             await self._stop_process(session)
+            # Модули: сессия удалена (напр. wallet отзывает её токен). До этого
+            # токен удалённой сессии оставался бы рабочим у демона.
+            for hook in self.session_delete_hooks:
+                try:
+                    result = hook(session.name)
+                    if inspect.isawaitable(result):
+                        await result  # корутинный хук (wallet: стоп прокси) дожидаем
+                except Exception:
+                    logger.exception("session_delete_hook для %s", session.name)
             # Приватный дом песочницы: без удаления /new с тем же slug
             # унаследовал бы прежний $HOME (ключи, ~/.wallet.json, ~/.bashrc-
             # foothold) и каталоги копились бы вечно.
@@ -1392,9 +1286,9 @@ class SessionManager:
             await proxy.stop()
 
     def transcript_path(self, session: Session) -> Path:
-        """Транскрипт сессии в профиле Claude Code (см. transcript.py)."""
-        config_dir = self.config.claude_config_dir or Path.home() / ".claude"
-        return transcript.transcript_path(
+        """Транскрипт сессии в профиле Claude Code (client-config → box)."""
+        config_dir = box_transcript.resolve_config_dir(self.config.claude_config_dir)
+        return box_transcript.transcript_path(
             config_dir, self.effective_cwd(session), session.claude_session_id
         )
 

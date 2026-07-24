@@ -16,7 +16,8 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from orchestrator.modules.wallet.module import Secret, WalletModule, marker  # noqa: E402
+from orchestrator.modules.wallet.module import Secret, marker  # noqa: E402
+from vault.daemon import Ctx, VaultDaemon  # noqa: E402
 
 
 def _secret(**kw) -> Secret:
@@ -27,42 +28,41 @@ def _secret(**kw) -> Secret:
     return Secret(**d)
 
 
-def _mod(cwd: Path, secret: Secret) -> WalletModule:
-    m = WalletModule.__new__(WalletModule)
-    m.core = SimpleNamespace(manager=SimpleNamespace(effective_cwd=lambda s: cwd))
-    m.store = SimpleNamespace(load=lambda: {secret.name: secret})
-    return m
+def _daemon(secret: Secret) -> VaultDaemon:
+    # _execute берёт cwd из ctx токена и store.load; host для _execute не нужен.
+    store = SimpleNamespace(load=lambda: {secret.name: secret})
+    return VaultDaemon(store, host=None, guard_on=False)
 
 
 async def test_wallet_inject():
     cwd = Path(tempfile.mkdtemp())
-    sess = SimpleNamespace(name="noos")
+    ctx = Ctx("noos", cwd)             # контекст токена: имя сессии + её cwd
     s = _secret()
-    mod = _mod(cwd, s)
+    daemon = _daemon(s)
     tmproot = tempfile.gettempdir()
 
     # <<wallet:api>> → реальное значение в аргумент.
-    code, out, err = await mod._execute(sess, s, ["printf", "%s", marker("api")])
+    code, out, err = await daemon._execute(ctx, s, ["printf", "%s", marker("api")])
     assert code == 0 and out == b"TOPSECRET-abc", (code, out, err)
     print("OK <<wallet:api>> → значение подставлено в аргумент")
 
     # <<wallet:api:file>> → путь к 0600-файлу; каталог убран после.
     before = {d for d in os.listdir(tmproot) if d.startswith("wallet-")}
-    code, out, err = await mod._execute(sess, s, ["cat", marker("api", as_file=True)])
+    code, out, err = await daemon._execute(ctx, s, ["cat", marker("api", as_file=True)])
     assert code == 0 and out == b"TOPSECRET-abc\n", (code, out, err)
     after = {d for d in os.listdir(tmproot) if d.startswith("wallet-")}
     assert after == before, f"временный каталог не убран: {after - before}"
     print("OK <<wallet:api:file>> → 0600-файл, путь подставлен, каталог убран")
 
     # inject env: значение доступно процессу на хосте (для gh/aws/kubectl).
-    code, out, err = await mod._execute(sess, s, ["sh", "-c", "printf %s \"$API_TOKEN\""])
+    code, out, err = await daemon._execute(ctx, s, ["sh", "-c", "printf %s \"$API_TOKEN\""])
     assert code == 0 and out == b"TOPSECRET-abc", (code, out, err)
     print("OK env $API_TOKEN доступен процессу на хосте")
 
     # Маркер секрета БЕЗ значения (host-passthrough) → пусто, не течёт.
     hp = _secret(value="", env="")
-    mod_hp = _mod(cwd, hp)
-    code, out, err = await mod_hp._execute(sess, hp, ["printf", "[%s]", marker("api")])
+    daemon_hp = _daemon(hp)
+    code, out, err = await daemon_hp._execute(ctx, hp, ["printf", "[%s]", marker("api")])
     assert code == 0 and out == b"[]", (code, out, err)
     print("OK маркер секрета без значения → пусто")
 

@@ -20,7 +20,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import aiohttp  # noqa: E402
 
-from orchestrator.modules.wallet.module import WalletModule, _redact  # noqa: E402
+from orchestrator.modules.wallet.module import WalletModule  # noqa: E402
+from vault.redact import _redact  # noqa: E402
 
 ROOT = Path(__file__).parent.parent
 
@@ -84,6 +85,8 @@ def make_env(tmp: Path):
             session_home=lambda s: home,
             env_hooks=[],
             path_hooks=[],
+            launch_hooks=[],
+            session_delete_hooks=[],
         ),
         session_hooks=[],
         output_redactors=[],
@@ -101,6 +104,9 @@ def make_env(tmp: Path):
     config = SimpleNamespace(
         wallet_secrets_file=secrets_file, sandbox="bwrap", sessions_dir=tmp,
         wallet_guard=True,
+        # Тумблер правки policy: модуль отдаёт его VaultHost'у (ASK-грант
+        # «навсегда»). В этом харнесе кошелёк проверяется без ASK — держим off.
+        wallet_policy_edit=False,
     )
     return core, config, home, secrets_file, confirm_answer
 

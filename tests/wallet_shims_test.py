@@ -97,12 +97,13 @@ def test_wallet_shims():
     assert "curl" not in got2
     print("OK перегенерация чистит устаревшие обёртки (curl удалён)")
 
-    # _resolve_secret: подбор секрета по команде.
-    assert m._resolve_secret(SESSION, ["gh", "pr", "list"]).name == "host"
-    assert m._resolve_secret(SESSION, ["curl", "-H", "x", "https://api/x"]).name == "api"
-    assert m._resolve_secret(SESSION, ["python", "app.py"]) is None
-    other = SimpleNamespace(name="prod-1")
-    assert m._resolve_secret(other, ["kubectl", "get", "pods"]).name == "other"
+    # _resolve_secret: подбор секрета по команде (переехал в демон, берёт имя).
+    from vault.daemon import VaultDaemon
+    daemon = VaultDaemon(m.store, host=None, guard_on=False)
+    assert daemon._resolve_secret(SESSION.name, ["gh", "pr", "list"]).name == "host"
+    assert daemon._resolve_secret(SESSION.name, ["curl", "-H", "x", "https://api/x"]).name == "api"
+    assert daemon._resolve_secret(SESSION.name, ["python", "app.py"]) is None
+    assert daemon._resolve_secret("prod-1", ["kubectl", "get", "pods"]).name == "other"
     print("OK _resolve_secret: подбор по команде и по сессии")
 
     print("ALL WALLET-SHIMS OK")

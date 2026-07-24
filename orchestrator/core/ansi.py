@@ -1,18 +1,16 @@
 """Снятие ANSI/управляющих escape-последовательностей из байтов вывода PTY.
 
-Раньше один и тот же regex дублировался в sessions.py, bashshell.py и bot.py
-(под именами _ANSI_RE / _LOG_ANSI_RE) — теперь единое место (REVIEW.md D2).
-Все три модуля сыплют похожим набором кодов: CSI-последовательности, OSC
-(заканчивается BEL) и кодировки скобок/charsets.
+Реализация переехала в автономный пакет `box/` (launcher, Слой 2 редизайна):
+от неё зависит матчер стартовых диалогов (box.dialog), а `box/` обязан
+импортироваться без orchestrator. Этот модуль — тонкий РЕЭКСПОРТ из box.ansi
+для обратной совместимости: sessions.py/turn.py/bashshell.py импортируют
+strip_ansi из `orchestrator.core.ansi` как раньше (REVIEW.md D2 — единое место
+снятия ANSI: раньше regex дублировался в sessions/bashshell/bot, теперь один
+источник в box.ansi).
 """
 
 from __future__ import annotations
 
-import re
+from box.ansi import ANSI_RE, strip_ansi
 
-ANSI_RE = re.compile(rb"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[()][0-9A-B]")
-
-
-def strip_ansi(raw: bytes) -> bytes:
-    """Убрать ANSI-раскраску/управление и \\r — для показа в <pre> и парсинга лога."""
-    return ANSI_RE.sub(b"", raw).replace(b"\r", b"")
+__all__ = ["ANSI_RE", "strip_ansi"]

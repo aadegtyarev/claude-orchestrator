@@ -12,18 +12,15 @@ import json
 import re
 from pathlib import Path
 
+# Путь транскрипта — это «конфиг клиента» (КУДА claude пишет транскрипт), а не
+# чтение файла; он вынесен в автономный пакет box/ (Слой 2 редизайна,
+# docs/ARCHITECTURE-claude-box.md §5.2). Реэкспорт: код/тесты ссылаются на
+# transcript.transcript_path как раньше — поведение байт-в-байт то же.
+from box.transcript_path import transcript_path  # noqa: F401
+
 # id «честного» server_tool_use от Anthropic — srvtoolu_<base>; чужой бэкенд
 # (z.ai/GLM) лепит id другого формата, на нём реальный Anthropic падает с 400.
 _SRVTOOLU_RE = re.compile(r"^srvtoolu_[A-Za-z0-9_]+$")
-
-
-def transcript_path(config_dir: Path, cwd: Path, session_id: str) -> Path:
-    """Транскрипт сессии в профиле Claude Code.
-
-    Путь проекта (= cwd Claude) кодируется заменой '/' и '.' на '-'.
-    """
-    encoded = str(cwd).replace("/", "-").replace(".", "-")
-    return config_dir / "projects" / encoded / f"{session_id}.jsonl"
 
 
 def block_snippet(block: dict, limit: int = 280) -> str:
