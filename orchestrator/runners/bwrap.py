@@ -37,6 +37,7 @@ class BwrapRunner:
         extra_rw: list[Path],
         home_dir: Path | None = None,
         publish_ports: Sequence[int] = (),
+        docker_sock: Path | None = None,
     ) -> list[str]:
         # publish_ports не нужен: сеть у bwrap общая с хостом.
         home = Path.home()
@@ -62,5 +63,8 @@ class BwrapRunner:
         prefix = sandbox.build_argv(
             home=home, chdir=chdir, rw_paths=rw, ro_paths=ro, home_dir=home_dir,
             system_dbus=self.config.sandbox_dbus,
+            # docker_sock — per-session прокси-сокет (SessionManager); внутрь
+            # песочницы биндится на /run/docker.sock. Только при sandbox_docker.
+            docker_sock=(docker_sock if self.config.sandbox_docker else None),
         )
         return prefix + list(argv)

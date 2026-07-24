@@ -38,6 +38,7 @@ from .proctree import proc_tree_signals
 from .slug import slugify  # реэкспорт: адаптеры и тесты ждут sessions.slugify
 from .. import runners as runner_mod
 from ..config import Config
+from ..modules.docker.proxy import DockerProxy
 
 # Launch-механика вынесена в автономный пакет box/ (Слой 2 редизайна,
 # docs/ARCHITECTURE-claude-box.md §5/§11). Реэкспорт для обратной
@@ -165,6 +166,9 @@ class SessionManager:
         # живыми). По имени; синхронные ИЛИ корутины — delete их дожидается
         # (детерминированный teardown: пересоздание сессии не гонится со стопом).
         self.session_delete_hooks: list[Callable[[str], Awaitable[None] | None]] = []
+        # Per-session docker-прокси (SANDBOX_BWRAP_DOCKER): у каждой сессии свой,
+        # allowlist = только её проект. Живёт, пока жив процесс сессии.
+        self._docker_proxies: dict[str, "DockerProxy"] = {}
 
     def _http_session(self) -> aiohttp.ClientSession:
         if self._http is None or self._http.closed:
@@ -705,6 +709,8 @@ class SessionManager:
             # дети (channel_server, хуки, Bash-тул) заперты в mount-namespace —
             # видны только папка сессии, папка проекта и конфиг Claude Code.
             extra_rw = [session.session_dir, Path(cwd)]
+            # Per-session docker-прокси (если включён) — сокет биндится в песочницу.
+            docker_sock = await self._ensure_docker_proxy(session)
             argv = self.runner.wrap(
                 [
                     self.config.claude_bin,
@@ -717,6 +723,7 @@ class SessionManager:
                 extra_rw=extra_rw,
                 home_dir=self.session_home(session),
                 publish_ports=[session.port],
+                docker_sock=docker_sock,
             )
             # Спавн процесса под PTY + запуск драйвера (дренаж вывода + авто-ответы
             # на стартовые диалоги) собран в box.launch: он открывает PTY нужного
@@ -982,6 +989,7 @@ class SessionManager:
             session.watcher.cancel()
             session.watcher = None
         await self._terminate(session)
+        await self._stop_docker_proxy(session)
         session.process = None
         # Старт мог упасть до _start_watcher — снимаем резерв порта и здесь,
         # иначе он утёк бы из _inflight_ports навсегда.
@@ -1237,10 +1245,45 @@ class SessionManager:
 
         Пусто при SANDBOX=off. Политика allowlist — в runners.bwrap.
         session задана — команда получает тот же персистентный $HOME, что и
-        claude этой сессии (/bash видит venv, который агент себе поставил).
+        claude этой сессии (/bash видит venv, который агент себе поставил), и тот
+        же docker-прокси (если поднят) — /bash тоже видит docker сессии.
         """
         home_dir = self.session_home(session) if session is not None else None
-        return self.runner.wrap([], chdir=chdir, extra_rw=extra_rw, home_dir=home_dir)
+        dsock = (
+            self.config.docker_sock_path(session.name)
+            if session is not None and session.name in self._docker_proxies
+            else None
+        )
+        return self.runner.wrap(
+            [], chdir=chdir, extra_rw=extra_rw, home_dir=home_dir, docker_sock=dsock)
+
+    # ── per-session docker-прокси (SANDBOX_BWRAP_DOCKER) ────────────────
+    def _docker_roots(self, session: Session) -> list[Path]:
+        """Разрешённые корни bind'ов = проект ЭТОЙ сессии (RW-область песочницы):
+        папка сессии + рабочий каталог проекта + SANDBOX_EXTRA_RW."""
+        roots = [session.session_dir, self.effective_cwd(session)]
+        roots += list(self.config.sandbox_extra_rw)
+        return roots
+
+    async def _ensure_docker_proxy(self, session: Session) -> Path | None:
+        """Поднять per-session docker-прокси (идемпотентно). Возвращает путь его
+        сокета для бинда в песочницу или None, если docker в песочнице выключен."""
+        if not self.config.sandbox_docker or self.config.sandbox != "bwrap":
+            return None
+        sock = self.config.docker_sock_path(session.name)
+        if session.name not in self._docker_proxies:
+            proxy = DockerProxy(
+                sock, roots_provider=lambda s=session: self._docker_roots(s))
+            await proxy.start()
+            self._docker_proxies[session.name] = proxy
+            logger.info("docker-прокси сессии %s: %s (allowlist = проект сессии)",
+                        session.name, sock)
+        return sock
+
+    async def _stop_docker_proxy(self, session: Session) -> None:
+        proxy = self._docker_proxies.pop(session.name, None)
+        if proxy is not None:
+            await proxy.stop()
 
     def transcript_path(self, session: Session) -> Path:
         """Транскрипт сессии в профиле Claude Code (client-config → box)."""

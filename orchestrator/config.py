@@ -132,6 +132,13 @@ class Config:
     # ввод). Off (дефолт) вырезает DISPLAY/XAUTHORITY/WAYLAND_DISPLAY; on —
     # оставить (если модели действительно нужен X в песочнице).
     sandbox_x11: bool
+    # Давать ли модели docker/compose в песочнице (bwrap). Off (дефолт). On: у
+    # КАЖДОЙ сессии свой тонкий прокси-фильтр над docker.sock (per-session
+    # изоляция) — внутрь биндится прокси-сокет на /run/docker.sock, настоящий
+    # скрыт. Прокси пускает bind только под папкой проекта ЭТОЙ сессии + устройства,
+    # режет систему/секреты/escape (см. modules/docker, [[docker-in-sandbox]]).
+    # По аналогии с sandbox_bwrap_wallet — фича именно bwrap-песочницы.
+    sandbox_docker: bool
     # Раннер agent-vm (SANDBOX=agent-vm): ресурсы и пин образа гостя.
     agent_vm_memory_gib: int | None  # целые GiB: agent-vm дробные отвергает
     agent_vm_cpus: int | None
@@ -174,6 +181,14 @@ class Config:
         `orch_host`. reply-сервер биндится на `orch_host` (host-side) — оно
         host-resolvable, а guest-facing имя резолвится только внутри гостя."""
         return AGENT_VM_GUEST_HOST if self.sandbox == "agent-vm" else self.orch_host
+
+    def docker_sock_path(self, session_name: str) -> Path:
+        """Путь unix-сокета per-session docker-прокси. В runtime-каталоге (tmpfs),
+        падаем в sessions_dir. Знают и старт прокси (SessionManager), и бинд в
+        песочницу (bwrap через docker_sock-параметр wrap)."""
+        base = os.getenv("XDG_RUNTIME_DIR")
+        root = Path(base) if base else self.sessions_dir
+        return root / "claude-orchestrator" / f"docker-{session_name}.sock"
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -291,6 +306,7 @@ class Config:
             # X/Wayland в песочницу по умолчанию НЕ прокидываем (закрываем доступ
             # к хостовому GUI); SANDBOX_X11=1 — оставить, если модели нужен X.
             sandbox_x11=cls._parse_bool(os.getenv("SANDBOX_X11", "false")),
+            sandbox_docker=cls._parse_bool(os.getenv("SANDBOX_BWRAP_DOCKER", "false")),
             agent_vm_memory_gib=env_number("AGENT_VM_MEMORY_GIB", int),
             agent_vm_cpus=env_number("AGENT_VM_CPUS", int),
             agent_vm_image=(os.getenv("AGENT_VM_IMAGE", "").strip() or None),

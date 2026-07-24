@@ -24,5 +24,6 @@ class DirectRunner:
         extra_rw: list[Path],
         home_dir: Path | None = None,
         publish_ports: Sequence[int] = (),
+        docker_sock: Path | None = None,
     ) -> list[str]:
         return list(argv)

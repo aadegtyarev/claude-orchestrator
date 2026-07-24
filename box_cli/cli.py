@@ -120,6 +120,12 @@ class EngineConfig:
     claude_config_dir: Path | None = None
     sandbox_extra_rw: tuple[Path, ...] = ()
     sandbox_dbus: bool = True
+    # Docker-прокси в песочнице — ПЕР-СЕССИОННАЯ фича оркестратора: сокет поднимает
+    # SessionManager (allowlist на папку проекта сессии) и передаёт раннеру. У
+    # standalone claude-box сессий/менеджера нет, поднимать и фильтровать сокет
+    # некому — поэтому False, и BwrapRunner docker_sock не биндит. Не «выключено
+    # молча»: включать флаг без прокси-сокета было бы враньём.
+    sandbox_docker: bool = False
     # ── agent-vm ────────────────────────────────────────────────────────────
     # claude_env в standalone CLI ПУСТ: CLAUDE_ENV_* — механизм оркестратора
     # (он доставляет их в гостя через env-блок settings, F1), а тут никакого

@@ -53,6 +53,18 @@ async def main() -> None:
     else:
         logger.info("Раннер: %s — claude и /bash изолированы", runner.name)
 
+    # docker в песочнице (SANDBOX_BWRAP_DOCKER): у КАЖДОЙ сессии свой прокси-фильтр
+    # (поднимается в SessionManager при старте сессии, allowlist = её проект).
+    # Имеет смысл только под bwrap — иначе громко предупреждаем, а не молча no-op.
+    if config.sandbox_docker:
+        if runner.name != "bwrap":
+            logger.warning(
+                "SANDBOX_BWRAP_DOCKER=1, но раннер %s (не bwrap) — docker в песочнице "
+                "недоступен. Работает только под SANDBOX=bwrap.", runner.name)
+        else:
+            logger.info("docker в песочнице включён: per-session прокси, "
+                        "allowlist = папка проекта сессии + устройства")
+
     if not config.allowed_user_ids:
         logger.warning(
             "ALLOWED_USER_IDS пуст — оркестратор игнорирует ВСЕ сообщения. "

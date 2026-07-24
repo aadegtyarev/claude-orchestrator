@@ -49,6 +49,7 @@ class Runner(Protocol):
         extra_rw: list[Path],
         home_dir: Path | None = None,
         publish_ports: Sequence[int] = (),
+        docker_sock: Path | None = None,
     ) -> list[str]:
         """Завернуть команду. chdir — рабочий каталог процесса; extra_rw —
         рабочие пути этой сессии (папка сессии/проекта), доступные на запись;

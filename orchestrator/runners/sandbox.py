@@ -77,6 +77,7 @@ def build_argv(
     ro_paths: list[Path],
     home_dir: Path | None = None,
     system_dbus: bool = True,
+    docker_sock: Path | None = None,
 ) -> list[str]:
     """Собрать argv-префикс bwrap. Итог: [bwrap, …, "--"] — дальше сама команда.
 
@@ -150,6 +151,14 @@ def build_argv(
     # 4) RW-пути (последними — побеждают при пересечении с RO).
     for p in rw_paths:
         _bind(args, "--bind-try", p)
+
+    # 5) docker: возвращаем ПРОКСИ-сокет на место /run/docker.sock (скрытого
+    #    tmpfs /run выше). Настоящий /run/docker.sock внутрь НЕ попадает —
+    #    прокси фильтрует опасное (см. modules/docker). DOCKER_HOST — чтобы
+    #    docker/compose нашли сокет (в песочнице /var/run может не быть).
+    if docker_sock is not None:
+        args += ["--bind-try", str(docker_sock), "/run/docker.sock"]
+        args += ["--setenv", "DOCKER_HOST", "unix:///run/docker.sock"]
 
     args += ["--chdir", str(chdir), "--"]
     return args

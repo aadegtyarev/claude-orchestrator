@@ -83,6 +83,7 @@ def _mgr(mode: str) -> SessionManager:
         sandbox=mode,
         sandbox_extra_rw=(),
         sandbox_dbus=True,
+        sandbox_docker=False,
         claude_config_dir=Path("/home/tester/.claude-proxy"),
     )
     m = SessionManager.__new__(SessionManager)
@@ -110,6 +111,21 @@ def test_prefix_allowlist():
     assert f"--bind-try {work}" in s                       # рабочая папка RW
     assert "--ro-bind-try" in s and "/.local/share/claude" in s  # бинарь RO
     print("OK sandbox_prefix: конфиг+проект RW, бинарь+репозиторий RO")
+
+
+def test_docker_sock_bound_when_passed():
+    # build_argv с docker_sock → прокси-сокет биндится на /run/docker.sock + DOCKER_HOST
+    dsock = Path("/run/user/1000/claude-orchestrator/docker-noos.sock")
+    s = " ".join(sandbox.build_argv(
+        home=Path("/home/t"), chdir=Path("/x"), rw_paths=[Path("/x")], ro_paths=[],
+        docker_sock=dsock))
+    assert f"--bind-try {dsock} /run/docker.sock" in s
+    assert "--setenv DOCKER_HOST unix:///run/docker.sock" in s
+    # без docker_sock → ни сокета, ни DOCKER_HOST
+    s2 = " ".join(sandbox.build_argv(
+        home=Path("/home/t"), chdir=Path("/x"), rw_paths=[Path("/x")], ro_paths=[]))
+    assert "docker.sock" not in s2 and "DOCKER_HOST" not in s2
+    print("OK build_argv: docker.sock+DOCKER_HOST только при переданном docker_sock")
 
 
 def test_real_isolation():
@@ -227,6 +243,7 @@ def _bwrap_rw_paths(claude_config_dir: Path) -> str:
         claude_config_dir=claude_config_dir,
         sandbox_extra_rw=(),
         sandbox_dbus=False,
+        sandbox_docker=False,  # docker-сокет — пер-сессионный, здесь не проверяем
     )
     runner = BwrapRunner(cfg, root=Path("/repo"))
     argv = runner.wrap([], chdir=Path("/w"), extra_rw=[Path("/w")])
