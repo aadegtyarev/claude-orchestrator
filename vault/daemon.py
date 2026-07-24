@@ -278,11 +278,20 @@ class VaultDaemon:
             allowed = await self.host.confirm(
                 ctx.name, f"{label} → {cmd_str[:200]}", cmd_str,
             )
-        # Наблюдаемость: КАЖДАЯ попытка видна строкой в бабле; отдельное
-        # уведомление — только на ОТКАЗ (нужно внимание).
+        # Наблюдаемость: попытка видна строкой в бабле; отдельное уведомление —
+        # только на ОТКАЗ (нужно внимание).
         cmd_disp = f"{label} → {cmd_str[:120]}"
         bubble_line = f"🔐 <b>wallet</b> <code>{html.escape(cmd_disp)}</code>"
-        await self.host.observe(ctx.name, bubble_line)
+        # ИСКЛЮЧЕНИЕ — отказ на `gh auth token`/`--show-token`: фоновый PR-поллер
+        # Claude Code зовёт её периодически САМ (не модель), отказ
+        # самокорректирующийся (reason уходит в stderr вызывающему). Строка в бабл
+        # МЕЖДУ ходами открывает ФОНОВЫЙ бабл, а это отдельное сообщение в чат на
+        # каждый опрос — тот же спам, ради которого PR #50 убрал notice, только
+        # другим каналом. Аудит при этом НЕ теряем: record() ниже пишет попытку
+        # всегда (журнал/история), гасим только всплытие в чат.
+        noisy_self_correcting = not allowed and _prints_token(cmd)
+        if not noisy_self_correcting:
+            await self.host.observe(ctx.name, bubble_line)
         self.host.record(ctx.name, secret=label, cmd=cmd_str, allowed=bool(allowed))
         if not allowed:
             # verdict.reason покрывает policy-отказ; None → отказ пришёл от
