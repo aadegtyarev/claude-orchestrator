@@ -97,6 +97,33 @@ async def main():
                 assert (await r.json())["value"] == "SHV"
             print("OK autonomy: /get shared → значение")
 
+            # `gh auth token` (фоновый PR-поллер Claude Code): отказ НЕ всплывает
+            # оператору ни notice'ом (PR #50), ни СТРОКОЙ В БАБЛЕ — между ходами
+            # она открывала бы фоновый бабл, т.е. отдельное сообщение в чат на
+            # каждый опрос. Аудит при этом остаётся: record() пишет попытку.
+            before_obs, before_rec = len(host.observed), len(host.records)
+            async with http.post(f"{url}/run", headers=good,
+                                 json={"secret": "deploy",
+                                       "cmd": ["gh", "auth", "token",
+                                               "--hostname", "github.com"]}) as r:
+                assert r.status == 403, "gh auth token обязан отвергаться guard'ом"
+            assert len(host.observed) == before_obs, (
+                "строка в бабл на gh auth token → фоновый бабл = спам в чат")
+            assert len(host.records) == before_rec + 1, "аудит попытки потерян"
+            assert not any("auth" in d[1] for d in host.denied), (
+                "operator-notice на gh auth token (PR #50) вернулся")
+            print("OK autonomy: отказ gh auth token не всплывает в чат, аудит цел")
+
+            # А обычный отказ (не самокорректирующийся) — виден и строкой, и notice.
+            before_obs, before_den = len(host.observed), len(host.denied)
+            async with http.post(f"{url}/run", headers=good,
+                                 json={"secret": "deploy",
+                                       "cmd": ["gh", "repo", "delete", "x"]}) as r:
+                assert r.status == 403
+            assert len(host.observed) == before_obs + 1, "обычный отказ пропал из бабла"
+            assert len(host.denied) == before_den + 1, "обычный отказ без notice"
+            print("OK autonomy: обычный отказ по-прежнему виден (строка + notice)")
+
         # перевыдача токена отзывает прежний
         token2 = daemon.issue_token("dev", cwd)
         assert token2 != token
