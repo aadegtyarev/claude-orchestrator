@@ -42,6 +42,7 @@ wallet УЖЕ в PATH — зови `wallet ...` (без полного пути)
 
 Команды:
   wallet ls                    какие секреты доступны (имя, режим, разрешённые команды)
+  wallet doctor                проверить, что переменные кошелька реально в окружении
   wallet run <имя> -- <cmd..>  выполнить команду с конкретным секретом
   wallet exec <cmd..>          выполнить команду, секрет подберётся по ней
   wallet get <имя>             значение shared-секрета (dev-ключ, логин/пароль)
@@ -214,6 +215,52 @@ def cmd_env(cfg: dict, argv: list) -> int:
     return 0
 
 
+def cmd_doctor(cfg: dict) -> int:
+    """Сверить, что policy обещает, с тем, что РЕАЛЬНО в твоём окружении.
+
+    Зачем. Переменные кошелька задаются процессу ОДИН РАЗ при старте сессии, и их
+    легко потерять уже после: `source .env` с пустой строкой `NAME=` перезапишет
+    значение, добавленный позже секрет не появится вовсе. Снаружи это выглядит
+    как «кошелёк не работает», а `env`/`printenv` ради секретов дампить нельзя —
+    поэтому проверка живёт здесь: сравниваем ИМЕНА и ФАКТ наличия, значения не
+    печатаем.
+    """
+    secrets = call(cfg, "GET", "/secrets")
+    rows = [s for s in secrets or [] if s.get("env")]
+    if not rows:
+        print("Секретов с env-переменными для этой сессии нет — сверять нечего.")
+        return 0
+    problems = 0
+    print("Переменные кошелька в твоём окружении:")
+    for s in rows:
+        name, env, mode = s["name"], s["env"], s.get("mode")
+        got = os.environ.get(env)
+        expect_marker = mode == "inject"
+        if got is None:
+            problems += 1
+            state = ("НЕТ в окружении — секрет добавили в policy ПОСЛЕ старта "
+                     "сессии; попроси оператора переоткрыть её")
+        elif got == "":
+            problems += 1
+            state = ("ПУСТО — значение затёрли уже после старта (частая причина: "
+                     f"`source .env`, где есть строка `{env}=`)")
+        elif expect_marker and not got.startswith("<<wallet:"):
+            problems += 1
+            state = ("НЕ маркер кошелька — значение перезаписано; инъекция на "
+                     "хосте не сработает")
+        elif expect_marker:
+            state = "ок (маркер; значение подставит хост)"
+        else:
+            state = f"ок (значение, {len(got)} симв.)"
+        print(f"  ${env}  [{mode}, секрет «{name}»]: {state}")
+    if problems:
+        print(f"\nПроблемных: {problems}. Значения секретов НЕ печатаются — "
+              "смотри на статус, а не дампи окружение.")
+        return 1
+    print("\nВсё на месте.")
+    return 0
+
+
 def main() -> int:
     args = sys.argv[1:]
     if not args or args[0] in ("-h", "--help", "help"):
@@ -222,6 +269,8 @@ def main() -> int:
     cfg = load_config()
     if args[0] == "ls":
         return cmd_ls(cfg)
+    if args[0] == "doctor":
+        return cmd_doctor(cfg)
     if args[0] == "run":
         return cmd_run(cfg, args[1:])
     if args[0] == "exec":
@@ -230,7 +279,7 @@ def main() -> int:
         return cmd_get(cfg, args[1:])
     if args[0] == "env":
         return cmd_env(cfg, args[1:])
-    die(f"неизвестная команда {args[0]!r} (ls | run | exec | get | env)")
+    die(f"неизвестная команда {args[0]!r} (ls | doctor | run | exec | get | env)")
 
 
 if __name__ == "__main__":
