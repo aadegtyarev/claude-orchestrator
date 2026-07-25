@@ -375,14 +375,6 @@ def parse_args(argv: Sequence[str]) -> Options:
     # Границы VM-режима. Отказываем ЗДЕСЬ (код 2), а не «применяем как получится»:
     # под agent-vm оба флага выглядели бы работающими, ничего при этом не делая, —
     # это ровно то враньё, которое запрещает правило прозрачности.
-    if engine == ENGINE_VM and profile is not None:
-        raise CliError(
-            "--profile под --vm не работает: agent-vm ИГНОРИРУЕТ CLAUDE_CONFIG_DIR "
-            "и сеет креды из $HOME своего процесса (замер F4). Подмену $HOME мы "
-            "сознательно не включаем: по §4.7 архитектуры она может пересеять "
-            "отработанный одноразовый refresh-токен и разлогинить учётку — нужен "
-            "живой smoke на машине с KVM. Профили работают под --engine bwrap."
-        )
     # --wallet под --vm ЗДЕСЬ не отвергаем: работоспособность зависит от ВИДА
     # секрета (прокси-секрет — работает через --egress-proxy форка; host/inject —
     # нет), а вид известен только после загрузки secrets.toml. Решение принимает
@@ -665,7 +657,19 @@ async def main_async(argv: Sequence[str]) -> int:
     profile_config_dir: Path | None = None
     if opts.profile is not None:
         from .profiles import ProfileError, profile_env
-        if engine != "bwrap":
+        if engine == ENGINE_VM:
+            # Под VM профиль выбирает УЧЁТКУ (agent-vm сеет креды из $HOME своего
+            # процесса, F4), а не изолирует ФС — изоляция там своя, у самой VM.
+            # Честно говорим про ротацию: refresh-токен claude.ai одноразовый, и
+            # им пользуется ТА учётка, чей файл прочитал agent-vm (§4.7).
+            sys.stderr.write(
+                f"claude-box: --profile «{opts.profile}» под --vm выбирает УЧЁТКУ: "
+                "agent-vm возьмёт креды из <профиль>/.claude/.credentials.json "
+                "(CLAUDE_CONFIG_DIR он игнорирует). Файловой изоляции профиля тут "
+                "нет — её даёт сама VM. ВНИМАНИЕ: refresh-токен claude.ai "
+                "одноразовый и ротируется — если тот же аккаунт параллельно живёт "
+                "на хосте, обновление в одном месте разлогинит другое.\n")
+        elif engine != "bwrap":
             sys.stderr.write(
                 "claude-box: --profile без bwrap НЕ изолирует $HOME — модель видит "
                 "реальную домашку оператора; редирект CLAUDE_CONFIG_DIR работает, но "
@@ -675,8 +679,11 @@ async def main_async(argv: Sequence[str]) -> int:
         except ProfileError as e:
             sys.stderr.write(f"claude-box: --profile: {e}\n")
             return e.code
-        profile_config_dir = pdir / ".claude"
-        profile_rw = [pdir]
+        # Под VM каталог профиля НЕ биндим и config-dir раннеру не отдаём:
+        # песочницы bwrap здесь нет, а agent-vm читает профиль на ХОСТЕ сам.
+        if engine != ENGINE_VM:
+            profile_config_dir = pdir / ".claude"
+            profile_rw = [pdir]
 
     # Раннер и preflight строятся НИЖЕ, внутри try/finally: под --wallet --vm
     # раннеру нужны egress-поля, которые отдаёт уже поднятый кошелёк, а его

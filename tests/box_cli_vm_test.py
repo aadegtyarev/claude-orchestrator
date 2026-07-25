@@ -11,8 +11,9 @@
   • AGENT_VM_MEMORY_GIB/CPUS не текут в окружение дочернего agent-vm (иначе он
     прочитает их сам и упадёт на том, что мы обещали проигнорировать);
   • нет бинаря/KVM → внятный отказ preflight и код 1, а не трейсбек;
-  • --profile/--wallet под --vm отвергаются (F4/F1/F10), а не делают вид, что
-    применились;
+  • --profile под --vm ВЫБИРАЕТ УЧЁТКУ (подмена HOME процессу agent-vm — он сеет
+    креды из $HOME/.claude, F4), а state VM при этом не уезжает в профиль;
+  • --wallet под --vm разбирается, а решение принимает рантайм по виду секрета;
   • --help больше не числит --vm нереализованным.
 
 Запуск: .venv/bin/python tests/box_cli_vm_test.py
@@ -23,7 +24,9 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 from unittest import mock
 
@@ -257,18 +260,45 @@ def test_vm_preflight_refuses_without_kvm():
 
 
 # ── границы: --profile/--wallet под --vm ─────────────────────────────────────
-def test_profile_under_vm_refused():
-    """F4: agent-vm игнорирует CLAUDE_CONFIG_DIR — молча «применить» профиль нельзя."""
-    err = io.StringIO()
-    with contextlib.redirect_stderr(err):
-        assert _exit_code(cli.parse_args, ["--profile", "work", "--vm"]) == 2
-        assert _exit_code(cli.parse_args, ["--vm", "--profile=work"]) == 2
-    msg = err.getvalue()
-    assert "--profile" in msg and "CLAUDE_CONFIG_DIR" in msg, msg
-    assert "bwrap" in msg, "надо сказать, где профиль работает"
-    # Под bwrap/off профиль по-прежнему разбирается.
-    assert cli.parse_args(["--profile", "work"]).profile == "work"
-    print("OK --profile + --vm → честный отказ (код 2)")
+def test_profile_under_vm_selects_account_via_home():
+    """Профиль под --vm ВЫБИРАЕТ УЧЁТКУ: agent-vm сеет креды из
+    `$HOME/.claude/.credentials.json` СВОЕГО процесса (F4, host_paths.rs),
+    поэтому профиль = подмена HOME. CLAUDE_CONFIG_DIR не ставим (agent-vm его
+    игнорирует — ставить значило бы делать вид, что он на что-то влияет), а
+    XDG_STATE_HOME фиксируем на реальный, иначе state VM (кэш образа, F5) уехал
+    бы в профиль и каждая учётка тянула бы образ заново."""
+    from box_cli.profiles import profile_env
+
+    # разбор больше не отказывает
+    assert cli.parse_args(["--profile", "work", "--vm"]).profile == "work"
+    assert cli.parse_args(["--vm", "--profile=work"]).engine == "agent-vm"
+
+    tmp = Path(tempfile.mkdtemp(prefix="box_vm_profile_"))
+    old_box, old_state = os.environ.get("CLAUDE_BOX_HOME"), os.environ.get("XDG_STATE_HOME")
+    os.environ["CLAUDE_BOX_HOME"] = str(tmp)
+    os.environ.pop("XDG_STATE_HOME", None)
+    try:
+        env, pdir = profile_env("work", engine="agent-vm")
+        assert env["HOME"] == str(pdir), env
+        assert "CLAUDE_CONFIG_DIR" not in env, "agent-vm его игнорирует — не ставим"
+        # state остаётся на РЕАЛЬНОЙ домашке, а не в профиле
+        assert env["XDG_STATE_HOME"] == str(Path.home() / ".local" / "state"), env
+        assert not env["XDG_STATE_HOME"].startswith(str(pdir)), "state уехал в профиль"
+        # заданный оператором XDG_STATE_HOME уважаем
+        os.environ["XDG_STATE_HOME"] = "/srv/state"
+        env2, _ = profile_env("work", engine="agent-vm")
+        assert env2["XDG_STATE_HOME"] == "/srv/state", env2
+        # под bwrap контракт прежний: HOME + CLAUDE_CONFIG_DIR
+        envb, pb = profile_env("work", engine="bwrap")
+        assert envb["HOME"] == str(pb) and envb["CLAUDE_CONFIG_DIR"] == str(pb / ".claude")
+    finally:
+        for k, v in (("CLAUDE_BOX_HOME", old_box), ("XDG_STATE_HOME", old_state)):
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("OK --profile + --vm: учётка через HOME, state не уезжает, bwrap не тронут")
 
 
 def test_wallet_under_vm_parses():
@@ -341,7 +371,7 @@ def main() -> None:
     test_help_vm_boundaries_are_readable()
     test_vm_preflight_refuses_without_binary()
     test_vm_preflight_refuses_without_kvm()
-    test_profile_under_vm_refused()
+    test_profile_under_vm_selects_account_via_home()
     test_wallet_under_vm_parses()
     test_help_does_not_call_vm_unimplemented()
     print("ALL BOX-CLI-VM OK")

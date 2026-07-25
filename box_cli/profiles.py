@@ -194,10 +194,31 @@ def profile_env(name: str, *, engine: str) -> tuple[dict[str, str], Path]:
     (изоляция домашки). Под off HOME не трогаем — изоляции $HOME нет, только
     редирект CONFIG_DIR (лончер честно предупреждает про это в stderr).
 
+    Под agent-vm (`--vm`) механизм ДРУГОЙ. Гость — своя VM со своим claude, и
+    хостовый CLAUDE_CONFIG_DIR он ИГНОРИРУЕТ (замер F4). Креды гостю сеет сам
+    agent-vm, читая их по `$HOME/.claude/.credentials.json` СВОЕГО процесса
+    (agent-vm/src/host_paths.rs). Значит выбор учётки под VM = подмена HOME
+    процессу agent-vm — её и делаем; CLAUDE_CONFIG_DIR не ставим, чтобы не
+    делать вид, будто он на что-то влияет.
+
+    XDG_STATE_HOME при этом ФИКСИРУЕМ на реальный: state VM (кэш образа, каталог
+    сессии, транскрипты — F5) живёт в `${XDG_STATE_HOME:-~/.local/state}/agent-vm`,
+    и без этого подмена HOME увела бы его в профиль — каждая учётка тянула бы
+    образ заново и теряла state существующих VM. Профиль выбирает УЧЁТКУ, а не
+    переезд инфраструктуры.
+
     Каталог профиля возвращается, чтобы лончер RW-биндил его в песочницу тем же
     путём (src==dst) — тогда HOME/CONFIG_DIR валидны изнутри.
     """
     path = ensure_profile(name)
+    if engine == "agent-vm":
+        env = {"HOME": str(path)}
+        # Реальный state-корень: явный XDG_STATE_HOME, иначе он вычислится от
+        # подменённого HOME. Берём уже заданный оператором либо дефолт от НАСТОЯЩЕЙ
+        # домашки (Path.home() читает passwd, а не $HOME — подмена его не сдвинет).
+        env["XDG_STATE_HOME"] = os.environ.get(
+            "XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+        return env, path
     env = {"CLAUDE_CONFIG_DIR": str(path / ".claude")}
     if engine == "bwrap":
         env["HOME"] = str(path)
