@@ -27,6 +27,8 @@ import uuid
 from pathlib import Path
 from typing import Awaitable, Callable
 
+import aiohttp
+
 from .bashshell import BashShellManager, clean as bash_clean
 from .bubble import BubbleManager
 from .errors import UserError
@@ -549,9 +551,26 @@ class OrchestratorCore:
         """
         await self.bubbles.freeze_and_open(session.name)
         try:
-            await self.manager.send_to_claude(
-                session, text, self.context_id(session, origin)
-            )
+            try:
+                await self.manager.send_to_claude(
+                    session, text, self.context_id(session, origin)
+                )
+            except aiohttp.ClientConnectorError:
+                # Канал сессии не отвечает, хотя процесс числится живым (типовой
+                # случай: claude жив, а его channel-сервер умер/не поднялся —
+                # например после рестарта оркестратора). Раньше это всплывало
+                # оператору сырым «Cannot connect to host 127.0.0.1:PORT», хотя
+                # чинится тривиально — переподнять сессию. Делаем это САМИ и
+                # ровно один раз: молча пересобираем сессию и повторяем отправку;
+                # не помогло — отдаём честную ошибку прежним путём.
+                logger.warning(
+                    "Сессия %s: канал не отвечает — переподнимаю и повторяю отправку",
+                    session.name)
+                await self.manager.revive(session)
+                await self._notify_state_changed(session)
+                await self.manager.send_to_claude(
+                    session, text, self.context_id(session, origin)
+                )
         except Exception as e:
             logger.error("Сессия %s: не удалось передать сообщение: %s", session.name, e)
             # Бабл уже открыт (freeze_and_open) — закрываем, иначе сессия

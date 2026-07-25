@@ -858,6 +858,25 @@ class SessionManager:
                 return True
             return await self._resume_locked(session)
 
+    async def revive(self, session: Session) -> bool:
+        """Поднять сессию заново, даже если её процесс ЧИСЛИТСЯ живым.
+
+        Случай из жизни: процесс claude жив, а его MCP-канал мёртв (channel-сервер
+        не поднялся/умер) — `running` по процессу True, поэтому обычный resume
+        считает, что делать нечего, и сообщения оператора упираются в закрытый
+        порт. Здесь гасим процесс принудительно и стартуем заново с --resume:
+        для оператора это «сессия сама переподнялась», а не сырая ошибка сокета.
+
+        Возвращает True, если контекст удалось продолжить (как resume).
+        """
+        async with session.ops:
+            if session.running:
+                logger.info(
+                    "Сессия %s: канал мёртв при живом процессе — переподнимаю",
+                    session.name)
+                await self._stop_process(session)
+            return await self._resume_locked(session)
+
     async def _resume_locked(self, session: Session) -> bool:
         # Раннеры с unique_cwd (agent-vm): гвард нужен и на resume/clear, не
         # только на create — иначе восстановленные из .sessions.json две сессии
