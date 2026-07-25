@@ -223,6 +223,15 @@ MESSAGES: dict[str, dict[str, str]] = {
             "{error}. Следующий такой запрос снова спросит подтверждение; "
             "правь secrets.toml вручную, если грант нужен постоянный."
         ),
+        # env задаётся процессу claude ОДИН РАЗ при старте: правка policy на живую
+        # сессию не действует, и без этой строки оператор видел бы только «модель
+        # не видит переменную» без причины.
+        "wallet_policy_drift": (
+            "🔑 Policy кошелька изменилась ({changes}), но эта сессия запущена со "
+            "старым окружением: переменные задаются при старте. Переоткрой сессию "
+            "(/close_session и сообщение), либо бери секрет по требованию — "
+            "<code>wallet run &lt;имя&gt;</code>."
+        ),
         "wallet_disabled": "🔐 Кошелёк не подключён (SANDBOX_BWRAP_WALLET + SANDBOX=bwrap). /wallet недоступен.",
         "sendfile_not_found": "❌ Не удалось отправить: файл не найден: {path}",
         "sendfile_too_big": "❌ Не удалось отправить: файл больше 50 МБ (лимит Telegram): {path}",
@@ -496,6 +505,12 @@ MESSAGES: dict[str, dict[str, str]] = {
             "⚠️ Access granted ONCE, but writing the grant to the policy FAILED: "
             "{error}. The next such request will ask again; edit secrets.toml "
             "manually if you want it permanent."
+        ),
+        "wallet_policy_drift": (
+            "🔑 Wallet policy changed ({changes}), but this session started with the "
+            "old environment: variables are set at launch. Reopen the session "
+            "(/close_session and a message), or fetch the secret on demand — "
+            "<code>wallet run &lt;name&gt;</code>."
         ),
         "wallet_disabled": "🔐 Wallet not enabled (SANDBOX_BWRAP_WALLET + SANDBOX=bwrap). /wallet unavailable.",
         "sendfile_not_found": "❌ Cannot send: file not found: {path}",

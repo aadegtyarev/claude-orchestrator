@@ -30,6 +30,8 @@ Policy — TOML-файл config.wallet_secrets_file (0600, вне allowlist пе
 
 from __future__ import annotations
 
+import contextlib
+import asyncio
 import json
 import logging
 import os
@@ -82,6 +84,10 @@ logger = logging.getLogger(__name__)
 # системный trust надо СОХРАНИТЬ и лишь ДОБАВИТЬ к нему корень Vault. Публичный
 # серт (0644), ключа CA в песочнице нет (каталог CA — вне allowlist).
 CA_BUNDLE_NAME = ".vault-ca-bundle.crt"
+# Как часто сверять policy с env живых сессий (см. _watch_policy). Редко и дёшево:
+# на неизменном secrets.toml это stat из кэша store, а сам факт «сессия отстала»
+# не срочный — оператору важно узнать, а не узнать в ту же секунду.
+POLICY_WATCH_SEC = 30.0
 
 
 class WalletModule:
@@ -107,6 +113,14 @@ class WalletModule:
         # существует», обратная совместимость для сессий без прокси-секретов).
         self.ca: VaultCA | None = None
         self.proxies: SessionProxyPool | None = None
+        # Сторож рассинхрона policy ↔ живые сессии. env процессу задаётся ОДИН РАЗ
+        # при старте, поэтому правка secrets.toml на живую сессию не действует — а
+        # оператору это ниоткуда не видно (живой случай: секреты добавили через 48
+        # минут после старта, модель их не увидела и искала причину в коде).
+        # session_name → имена env, реально доехавшие в процесс / о чём уже сказали.
+        self._env_delivered: dict[str, set[str]] = {}
+        self._env_notified: dict[str, set[str]] = {}
+        self._policy_watch: asyncio.Task | None = None
         # session_name → env-вклад перехвата (HTTPS_PROXY + *_CA_BUNDLE). Пишет
         # launch-хук (порт прокси известен), читает session_env (env процесса).
         self._proxy_env: dict[str, dict[str, str]] = {}
@@ -180,6 +194,8 @@ class WalletModule:
         # Вымарывать значения секретов из чат-вывода (shared модель видит и может
         # случайно эхнуть — safety-net, чтобы не улетело в Telegram/историю).
         core.output_redactors.append(self.redact_output)
+        # Сторож рассинхрона policy ↔ env живых сессий (см. _watch_policy).
+        self._policy_watch = asyncio.create_task(self._watch_policy())
 
     # ── перехват TLS: пул прокси и его провижн (§4.2/§4.3) ──────
 
@@ -310,12 +326,25 @@ class WalletModule:
           * host-passthrough (нет env) → ничего.
         Плюс маркер пути к файлу `<<wallet:имя:file>>` в `$ENV_FILE` (ssh-ключ,
         сертификат) — для inject-секретов."""
+        out = self._env_for(session.name)
+        # Запоминаем ИМЕНА, доехавшие в процесс: env задаётся один раз при старте,
+        # и по ним сторож policy поймёт, что живая сессия отстала (см. _watch_policy).
+        # Запись НЕобязательна: тесты и внешние потребители конструируют модуль
+        # через __new__ (без __init__) — там сторожа нет, и session_env обязан
+        # работать как раньше, а не падать на отсутствующем поле.
+        if isinstance(getattr(self, "_env_delivered", None), dict):
+            self._env_delivered[session.name] = set(out)
+            self._env_notified.pop(session.name, None)  # свежий старт — молчим заново
+        return out
+
+    def _env_for(self, session_name: str) -> dict[str, str]:
+        """Тот же расчёт env, но по ИМЕНИ сессии — нужен и сторожу policy."""
         out: dict[str, str] = {}
         for s in self.store.load().values():
             # proxy-секрет (connector) в песочницу НЕ эмитим: его кред живёт
             # только в прокси (§4.4), маркер/значение в env недопустимы. store уже
             # не активирует proxy-секрет с env — это второй рубеж.
-            if s.is_proxy or not s.env or not s.session_allowed(session.name):
+            if s.is_proxy or not s.env or not s.session_allowed(session_name):
                 continue
             if s.shared:
                 out[s.env] = s.value
@@ -325,8 +354,51 @@ class WalletModule:
         # Перехват TLS: HTTPS_PROXY + trust-bundle, подготовленные launch-хуком
         # (_start_session_proxies) ДО этого вызова. Пусто для сессий без
         # прокси-секретов — обычная сессия ничего нового не получает.
-        out.update(self._proxy_env.get(session.name, {}))
+        out.update(self._proxy_env.get(session_name, {}))
         return out
+
+    async def _watch_policy(self) -> None:
+        """Сказать оператору, что живая сессия отстала от policy.
+
+        env процессу claude задаётся ОДИН РАЗ при старте, поэтому добавленный
+        позже секрет в живую сессию не попадёт — и это ниоткуда не видно: модель
+        просто «не видит переменную», а причина выглядит как баг кошелька (живой
+        случай: секреты добавили через 48 минут после старта сессии).
+
+        Сравниваем ИМЕНА env, которые сессия получила при старте, с тем, что
+        policy отдала бы сейчас. Разошлись — один раз говорим в топик сессии, что
+        нужно её переоткрыть. Значения секретов НЕ трогаем и не печатаем: только
+        имена. Считаем дёшево — store кэширует файл по mtime, на неизменном
+        secrets.toml это stat, а не разбор.
+        """
+        while True:
+            await asyncio.sleep(POLICY_WATCH_SEC)
+            try:
+                if self.core is None:
+                    continue
+                for session in self.core.manager.list_all():
+                    if not session.running:
+                        continue  # у остановленной env соберётся при старте
+                    delivered = self._env_delivered.get(session.name)
+                    if delivered is None:
+                        continue  # env этой сессии мы не отдавали — сравнивать не с чем
+                    fresh = set(self._env_for(session.name))
+                    if fresh == delivered or self._env_notified.get(session.name) == fresh:
+                        continue
+                    self._env_notified[session.name] = fresh
+                    added = sorted(fresh - delivered)
+                    gone = sorted(delivered - fresh)
+                    parts = []
+                    if added:
+                        parts.append("появились: " + ", ".join(added))
+                    if gone:
+                        parts.append("убраны: " + ", ".join(gone))
+                    await self.core.notice(session, self.core.t(
+                        "wallet_policy_drift", changes="; ".join(parts)))
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — сторож не должен ронять модуль
+                logger.exception("wallet: сторож policy упал на итерации")
 
     def _write_default_secrets(self) -> None:
         """Создать secrets.toml с дефолтным host-passthrough (gh/git/ssh/scp на
@@ -368,6 +440,13 @@ class WalletModule:
             await self.daemon.stop_session_proxies(session_name)
 
     async def stop(self) -> None:
+        if self._policy_watch is not None:
+            self._policy_watch.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._policy_watch
+            self._policy_watch = None
+        self._env_delivered.clear()
+        self._env_notified.clear()
         if self.core is not None:
             self._discard(self.core.session_hooks, self._provision)
             self._discard(self.core.manager.session_delete_hooks, self._revoke)
