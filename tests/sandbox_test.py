@@ -134,8 +134,8 @@ def test_real_isolation():
         print(f"SKIP real_isolation: bwrap недоступен ({why})")
         return
     home = Path.home()
-    work = Path(tempfile.mkdtemp(prefix="sbx_", dir=home / "tg-claude-sessions"
-                                  if (home / "tg-claude-sessions").exists() else None))
+    work = Path(tempfile.mkdtemp(prefix="sbx_", dir=home / "claude-orchestrator-sessions"
+                                  if (home / "claude-orchestrator-sessions").exists() else None))
     try:
         wrapper = sandbox.build_argv(
             home=home, chdir=work, rw_paths=[work],

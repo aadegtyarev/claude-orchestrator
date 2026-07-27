@@ -1,19 +1,16 @@
 #!/usr/bin/env bash
 # Установка claude-orchestrator: venv, зависимости, systemd user-сервис.
 # Повторный запуск безопасен (идемпотентен). Удаление: ./install.sh --uninstall
-# Миграция: старый юнит tg-claude-orchestrator снимается автоматически.
 set -euo pipefail
 cd "$(dirname "$0")"
 DIR=$(pwd)
 SERVICE=claude-orchestrator
-OLD_SERVICE=tg-claude-orchestrator
 UNIT_DIR=$HOME/.config/systemd/user
 
 if [ "${1:-}" = "--uninstall" ]; then
     echo "==> Удаляю systemd-сервис (репозиторий, .venv и .env не трогаю)"
     systemctl --user disable --now "$SERVICE" 2>/dev/null || true
-    systemctl --user disable --now "$OLD_SERVICE" 2>/dev/null || true
-    rm -f "$UNIT_DIR/$SERVICE.service" "$UNIT_DIR/$OLD_SERVICE.service"
+    rm -f "$UNIT_DIR/$SERVICE.service"
     systemctl --user daemon-reload
     echo "Готово."
     exit 0
@@ -32,14 +29,6 @@ python3 -m venv .venv
 if [ ! -f .env ]; then
     cp .env.example .env
     echo "==> Создан .env — заполни TELEGRAM_BOT_TOKEN и ALLOWED_USER_IDS"
-fi
-
-# Миграция со старого имени сервиса: гасим и убираем юнит, чтобы два
-# оркестратора не подрались за порт/сессии.
-if [ -f "$UNIT_DIR/$OLD_SERVICE.service" ]; then
-    echo "==> Миграция: снимаю старый сервис $OLD_SERVICE"
-    systemctl --user disable --now "$OLD_SERVICE" 2>/dev/null || true
-    rm -f "$UNIT_DIR/$OLD_SERVICE.service"
 fi
 
 echo "==> systemd user-сервис"

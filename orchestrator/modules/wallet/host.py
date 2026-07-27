@@ -24,7 +24,7 @@ import logging
 from vault.connectors.contract import ScopeGrant
 from vault.host import AskResult
 
-from .policy import PolicyEditor, PolicyError
+from vault.policy import PolicyEditor, PolicyError
 
 logger = logging.getLogger(__name__)
 

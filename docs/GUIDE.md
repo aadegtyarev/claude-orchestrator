@@ -420,7 +420,7 @@ bash.
 
 | Путь | Что это |
 |------|---------|
-| `SESSIONS_DIR` (по умолчанию `~/tg-claude-sessions`) | всё про сессии |
+| `SESSIONS_DIR` (по умолчанию `~/claude-orchestrator-sessions`) | всё про сессии |
 | `SESSIONS_DIR/<имя>/` | папка сессии: `claude.log`, `.mcp.json`, `.claude/` (настройки и хук-диспетчер), `incoming/` |
 | `SESSIONS_DIR/.sessions.json` | список сессий (имя, топик, модель, движок изоляции) |
 | `SESSIONS_DIR/.history.json` | журнал сообщений — из него веб рисует историю после перезапуска |

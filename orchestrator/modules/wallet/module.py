@@ -67,7 +67,7 @@ from vault.shims import SHIM_DIRNAME, git_shim, tool_names, write_shims
 from vault.store import DEFAULT_SECRETS_TOML, SecretStore
 
 from .host import OrchestratorVaultHost
-from .policy import PolicyEditor, PolicyError
+from vault.policy import PolicyEditor, PolicyError
 
 if TYPE_CHECKING:
     from ...config import Config
@@ -324,7 +324,7 @@ class WalletModule:
         Провода кошелька — окружение процесса claude на хосте, приватный $HOME
         сессии (там ~/.wallet.json) и шимы в PATH песочницы; всё это даёт только
         bwrap. Движок теперь выбирается на сессию (`/new … --box`), поэтому
-        глобального MODULE_REQUIRES_SANDBOX мало: сессия с `--box off` под
+        глобального выключателя мало: сессия с `--box off` под
         bwrap-оркестратором получила бы вклад кошелька, который в ней не
         работает (её $HOME — настоящий дом оператора, а не приватный). «Включён
         и молча ничего не делает» — ровно то, чего мы избегаем: и оператор, и

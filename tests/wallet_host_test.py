@@ -203,7 +203,7 @@ def _policy_editor():
     """PolicyEditor на ВРЕМЕННОМ secrets.toml (0600) — реальная запись, не мок."""
     import os
     import tempfile
-    from orchestrator.modules.wallet.policy import PolicyEditor
+    from vault.policy import PolicyEditor
     d = Path(tempfile.mkdtemp(prefix="wallet_host_ask_"))
     path = d / "secrets.toml"
     path.write_text(_SRC)

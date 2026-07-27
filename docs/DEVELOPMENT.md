@@ -148,7 +148,8 @@ Code.
   `make_runner` + значение в `config._parse_sandbox`. И `claude`, и `/bash`
   запускаются через раннер, больше ничего трогать не надо.
 - **Новый модуль** — подпакет в `modules/` (объект с `name`, `start(core)`,
-  `stop()`) + ветка в `modules.make_modules` + имя в `config._parse_modules`.
+  `stop()`) + ветка в `modules.make_modules` + свой выключатель в `config`
+  (общего списка `MODULES` нет — он давал два источника истины для кошелька).
   В ядре для модулей есть `core.session_hooks` (обвязка новых сессий),
   `manager.env_hooks`/`path_hooks`/`launch_hooks` (окружение процесса) и
   `core.request_choice()` (кнопки во всех интерфейсах).
