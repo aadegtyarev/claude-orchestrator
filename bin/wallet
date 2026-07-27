@@ -95,7 +95,8 @@ def load_config() -> dict:
             continue
     die(
         "конфиг не найден (~/.wallet.json). Кошелёк не включён? "
-        "На стороне оркестратора нужен MODULES=wallet в .env."
+        "На стороне оркестратора кошелёк включается SANDBOX_BWRAP_WALLET=true "
+        "(и SANDBOX=bwrap) в .env."
     )
 
 
@@ -127,7 +128,8 @@ def call(cfg: dict, method: str, path: str, payload: dict | None = None) -> dict
                 "или отклонён кнопкой", 3)
         die(f"демон ответил {e.code}: {err}")
     except urllib.error.URLError as e:
-        die(f"демон кошелька недоступен ({e.reason}) — оркестратор запущен с MODULES=wallet?")
+        die(f"демон кошелька недоступен ({e.reason}) — кошелёк включён "
+            "(SANDBOX_BWRAP_WALLET=true при SANDBOX=bwrap)?")
 
 
 def cmd_ls(cfg: dict) -> int:

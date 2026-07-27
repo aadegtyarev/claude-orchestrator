@@ -119,12 +119,41 @@ def test_bwrap_settings_have_no_env_block(tmp_path=None):
     print("OK под bwrap env-блок не добавляется (поведение не меняется)")
 
 
+def test_host_ip_override_wins_over_autodetect():
+    """`AGENT_VM_HOST_IP` — ручной путь, когда авто-выбор промахнулся.
+
+    Автоопределение берёт src маршрута по умолчанию и ошибается при VPN или
+    нескольких интерфейсах; без оверрайда сессия в microVM молча не достучится
+    до прокси оператора и оркестратора. Документация обещала этот параметр
+    раньше, чем он появился в коде — тест сторожит обещание."""
+    keep = os.environ.get("AGENT_VM_HOST_IP")
+    os.environ["AGENT_VM_HOST_IP"] = "10.11.12.13"
+    try:
+        cfg = Config.from_env()
+        if cfg.sandbox != "agent-vm":  # дефолт .env — bwrap: подменяем движок
+            os.environ["SANDBOX"] = "agent-vm"
+            cfg = Config.from_env()
+        assert cfg.agent_vm_host_ip == "10.11.12.13", cfg.agent_vm_host_ip
+        # Пустое значение = «не задано» → возвращаемся к автоопределению.
+        os.environ["AGENT_VM_HOST_IP"] = "   "
+        auto = Config.from_env().agent_vm_host_ip
+        assert auto != "10.11.12.13"
+    finally:
+        os.environ.pop("SANDBOX", None)
+        if keep is None:
+            os.environ.pop("AGENT_VM_HOST_IP", None)
+        else:
+            os.environ["AGENT_VM_HOST_IP"] = keep
+    print("OK AGENT_VM_HOST_IP: ручное значение сильнее автоопределения")
+
+
 def main():
     test_rewrite_loopback_to_host_lan_ip()
     test_egress_allowed_for_host_proxy()
     test_own_proxy_requires_token()
     test_agentvm_puts_claude_env_into_settings()
     test_bwrap_settings_have_no_env_block()
+    test_host_ip_override_wins_over_autodetect()
     print("ALL GUEST-ENV OK")
 
 

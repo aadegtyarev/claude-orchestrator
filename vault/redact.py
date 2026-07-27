@@ -21,7 +21,7 @@ def _redact_text(text: str, values) -> str:
     вхождений — любая трансформация (base64/hex/reverse, запись в файл, вывод
     по буквам) проходит мимо. Настоящая защита от утечки — host-passthrough
     (значения секрета вообще нет в пространстве модели) + не давать шелл в
-    `commands` секрета. См. модель угроз в docs/REVIEW-2026-07-19.md §1.
+    `commands` секрета. См. модель угроз в docs/archive/REVIEW-2026-07-19.md §1.
     """
     for value in sorted((v for v in values if v), key=len, reverse=True):
         text = text.replace(value, REDACTED)

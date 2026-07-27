@@ -1,0 +1,207 @@
+# Для разработчиков: как это устроено и как это менять
+
+Пользовательская документация — [`README.md`](../README.md) (что это и быстрый
+старт), [`docs/GUIDE.md`](GUIDE.md) (руководство) и
+[`docs/CONFIG.md`](CONFIG.md) (справочник `.env`). Здесь — внутреннее
+устройство: кто кого запускает, почему именно так, куда класть новый код.
+
+## Принцип проекта: наблюдаемость
+
+Всё, что модель делает без спроса пользователя, должно быть **видно** — в
+каждом интерфейсе одинаково. Вызов инструмента, сабагент, обращение к кошельку,
+фоновая задача, упёршийся лимит бэкенда. Отсюда следуют почти все решения ниже:
+статус-бабл, хуки, permission relay, строка `🔐 wallet:`.
+
+Второй принцип — **выключено значит не существует**. Недоступная фича не
+оставляет в интерфейсе следов: нет кнопки, нет команды в меню, нет строки в
+`/help`. Кнопка, ведущая к отказу, — ложное обещание.
+
+## Схема
+
+```
+                    ┌───────────── адаптеры (ADAPTERS) ─────────────┐
+ Telegram (топики)◄─┤ adapters/telegram │ adapters/web ├─► Браузер (SPA+WS)
+                    └───────▲───────────┴──────▲───────┘
+                            │   Transport-протокол (core/transport.py)
+                    ┌───────┴──────────────────┴───────┐
+                    │ core/app.py  OrchestratorCore    │  команды, роутинг,
+                    │ core/bubble  core/turn  core/... │  бабл, сторожа, jail
+                    └───────▲──────────────────▲───────┘
+                            │                  │ HTTP :18080 (/reply /event
+                    ┌───────┴────────┐         │  /permission /stop, токен)
+                    │ core/sessions  │         │
+                    │ SessionManager │  ┌──────┴────────────┐
+                    └───┬────────────┘  │ channel_server.py │◄─ спавнит сам
+                        │ PTY + раннер  │ (в песочнице,     │   Claude Code
+                ┌───────┴───────┐       │  stdio)           │
+                │ runners/      │       └───────────────────┘
+                │ bwrap|agent-vm│
+                │ |off          │
+                └───────────────┘
+ modules/wallet ── тонкий адаптер поверх пакета vault/ (демон секретов, MITM-
+                   прокси, обёртки/CLI в песочнице); в боте и вебе — одинаково
+```
+
+**Кто кого запускает.** Оркестратор запускает только процессы `claude` — под
+PTY, завёрнутые раннером изоляции. `channel_server.py` запускает **сам Claude
+Code** по `.mcp.json`, переданному флагом `--mcp-config`. Ядро общается с
+channel-сервером только по HTTP; все внутренние эндпоинты — под bearer-токеном
+(`ORCH_TOKEN`).
+
+**Одна сессия — все интерфейсы.** Сессия принадлежит ядру; каждый адаптер
+хранит свой адрес (binding): у Telegram — форум-топик, вебу адрес не нужен.
+Ответы, статус-бабл и permission-запросы доставляются во все активные адаптеры;
+применяется первый ответ на permission (как с параллельным TUI-диалогом).
+
+**Почему PTY.** Headless-запуск не работает: без TTY `claude` уходит в
+`--print`, а в stream-json режиме channel-события не будят ход (проверено
+живьём). Интерактивная сессия под PTY — документированный сценарий «persistent
+terminal»; стартовые диалоги отвечает автоматика (`box/dialog.py`). Бонус:
+кнопка «⛔ Прервать» — настоящий Esc в терминал, то есть жёсткое прерывание
+хода, которого в channels-протоколе нет.
+
+## Структура пакета
+
+```
+orchestrator/
+  __main__.py        — сборка: config → runner.preflight → core → адаптеры/модули
+  config.py          — .env → неизменяемый Config (ADAPTERS, MODULES, SANDBOX…)
+  channel_server.py  — MCP-канал (raw JSON-RPC + HTTP; проектных импортов нет)
+  core/              — ядро (транспорт-независимое):
+    app.py           — OrchestratorCore: команды, роутинг ответов, jail, bash,
+                       журнал событий, permission relay, подтверждения модулей
+    transport.py     — протокол Transport + Origin/PermissionRequest
+    sessions.py      — SessionManager: PTY-процессы, resume/clear/model,
+                       персистентный дом сессии, движок изоляции на сессию,
+                       состояние на диске
+    turn.py          — TurnSupervisor: typing, вотчдог зависаний, релей ошибок
+    bubble.py        — статус-бабл: строки, схлопывание, заморозка (мульти-адаптер)
+    bashshell.py     — постоянные bash-терминалы (мимо Claude)
+    reply_server.py  — HTTP-приёмник от channel-серверов и хуков
+    toolline/texts/transcript/mdrender/logsignals/ansi/slug/proctree/hookscript
+  adapters/
+    telegram/        — aiogram: топики, кнопки, реакции, файлы
+    web/             — aiohttp: SPA (vanilla JS) + WebSocket, REST API
+  runners/           — изоляция: direct | bwrap (+sandbox.py) | agentvm
+  modules/
+    wallet/          — ТОНКИЙ адаптер кошелька поверх vault/ (permission-relay,
+                       бабл); домен и демон живут в vault/
+    docker/          — per-session прокси над docker.sock (SANDBOX_BWRAP_DOCKER)
+vault/               — АВТОНОМНЫЙ кошелёк секретов (без зависимостей оркестратора):
+                       домен, демон, MITM-прокси, коннекторы, policy; CLI — bin/vault,
+                       клиент в песочнице — bin/wallet. См. vault/README.md
+box/                 — АВТОНОМНЫЙ launcher сессий под PTY (без оркестратора):
+                       launch(), авто-диалоги, готовность «по тишине». box/README.md
+box_cli/             — app-CLI claude-box поверх box/ + runners: standalone-запуск
+                       claude в песочнице (профили, кошелёк, -p); bin/claude-box
+tests/               — тесты (pytest И run_all.sh гоняют одни и те же файлы)
+docs/                — документация и дизайн-доки
+install.sh           — venv + systemd user-unit (+ --uninstall, миграция имени)
+```
+
+`vault/` и `box/` — самостоятельные пакеты: работают без оркестратора
+(`bin/vault serve`, `bin/claude-box`), оркестратор — их клиент через тонкие
+адаптеры. Их собственные README описывают публичный контракт; тест
+`tests/readme_test.py` сторожит, чтобы они не разошлись с кодом.
+
+## Слои изоляции
+
+`runners/` — единственное место, которое знает, во что заворачивается процесс.
+Интерфейс `Runner`: `wrap(argv, …) -> argv`, `preflight() -> (ok, почему)`,
+`unique_cwd`, `supports_prefix`. Движок выбирается **на сессию**
+(`SessionManager.engine_of(session)`; `.env` даёт лишь значение по умолчанию), и
+всё, что зависит от изоляции, обязано спрашивать именно его: провижн
+`.mcp.json`, `python` для channel-сервера, префикс `/bash`, docker-прокси,
+кошелёк. Появится новая ветка `config.sandbox == …` в session-scoped коде —
+это баг: сессия провижнится чужим движком.
+
+## Протокол channels
+
+По [channels-reference](https://code.claude.com/docs/en/channels-reference):
+
+- Capability `claude/channel` + `claude/channel/permission`; push
+  `notifications/claude/channel` c `{content, meta:{context_id}}`.
+- `context_id = <адаптер>:<имя-сессии>:<токен-адаптера>` — по нему ядро находит
+  сессию и отдаёт адаптеру-источнику reply-цитату.
+- Ответ: тул `reply_to_user(context_id, text, complete)`; файлы —
+  `send_file_to_user` (только по явной просьбе пользователя; jail по workspace
+  сессии). MCP-сервер сессии называется `channel-<имя>`.
+- Запуск: `claude --session-id=<uuid> [--model …] [--effort …]
+  --mcp-config <сессия>/.mcp.json --settings <сессия>/.claude/settings.local.json
+  --dangerously-load-development-channels server:channel-<имя>`, cwd = папка
+  проекта; изоляция — через раннер.
+- Хуки (`Stop` + `PreToolUse` + `PostToolUse` + `SubagentStop`) — один
+  скрипт-диспетчер с токеном в 0600-файле; ядро роутит по `hook_event_name`.
+
+⚠️ Channels — research preview: синтаксис флагов и протокол могут меняться.
+Симптом смены протокола — сессия не поднимает channel-сервер (`/ping` молчит);
+ядро в этом случае прямо говорит, что причина может быть в новой версии Claude
+Code.
+
+## Точки расширения
+
+- **Новый интерфейс (Matrix, …)** — подпакет в `adapters/` с реализацией
+  `Transport` + ветка в `adapters.make_adapters` + имя в
+  `config._parse_adapters`. Ядро трогать не нужно
+  ([`docs/messaging-connector.md`](messaging-connector.md)).
+- **Новый способ изоляции** — модуль в `runners/` (протокол `Runner`) + ветка в
+  `make_runner` + значение в `config._parse_sandbox`. И `claude`, и `/bash`
+  запускаются через раннер, больше ничего трогать не надо.
+- **Новый модуль** — подпакет в `modules/` (объект с `name`, `start(core)`,
+  `stop()`) + ветка в `modules.make_modules` + имя в `config._parse_modules`.
+  В ядре для модулей есть `core.session_hooks` (обвязка новых сессий),
+  `manager.env_hooks`/`path_hooks`/`launch_hooks` (окружение процесса) и
+  `core.request_choice()` (кнопки во всех интерфейсах).
+- **Новая команда** — логика в `core/app.py`, тонкие обработчики в адаптерах;
+  тексты — **парой ru/en** в `core/texts.py` (паритет проверяет smoke-тест).
+  Команда, доступная не всегда, объявляется в `features()`/`COMMAND_FEATURE` —
+  тогда она исчезает из меню и `/help` там, где не работает.
+
+## Тесты и CI
+
+```bash
+.venv/bin/python -m pytest        # весь набор
+tests/run_all.sh                  # те же файлы как отдельные скрипты
+.venv/bin/ruff check .            # линт
+```
+
+Каждый тест обязан проходить **обоими** способами: `pytest` делит один процесс,
+`run_all.sh` даёт процесс на файл — расхождение уже ловило реальные баги
+(например, импорт, который работал только при предзагруженном модуле). CI
+(GitHub Actions) гоняет ruff + оба раннера на Python **3.10 и 3.12** — проверяй
+локально обе версии, разрыв по версиям тоже случался (`start_tls` есть только с
+3.11).
+
+Тесты офлайновые: без Telegram и без обращения к Claude. Живые куски (bwrap,
+docker, PTY) мягко скипаются, если инструмента нет в окружении, и **убирают за
+собой** созданные ресурсы — брошенная docker-сеть однажды съела пул подсетей и
+тест начал врать.
+
+Стиль тестов в проекте: докстрока объясняет **зачем** инвариант (что сломается,
+если его нарушить), проверка — живая, без самоподтверждающихся конструкций
+(`try/except` без `else: raise` — типичная ловушка).
+
+## Регламент изменений
+
+- Ветка на изменение, PR в `main`, мерж по зелёному CI.
+- Тесты вперёд: сначала проверка инварианта, потом код.
+- Для заметных изменений — состязательное ревью (отдельная модель ищет дефекты
+  и проверяет их живьём) **до** PR.
+- Комментарии объясняют «почему», а не «что»: код виден и так, а мотив —
+  единственное, что теряется.
+
+## Карта документов
+
+| Документ | Для кого |
+|----------|----------|
+| [`README.md`](../README.md) | вход: что это, быстрый старт |
+| [`docs/GUIDE.md`](GUIDE.md) | пользователь: подробное руководство |
+| [`docs/CONFIG.md`](CONFIG.md) | пользователь: справочник `.env` |
+| [`docs/secrets-wallet.md`](secrets-wallet.md) | пользователь + разработчик: кошелёк секретов, модель угроз |
+| [`docs/agent-vm-integration.md`](agent-vm-integration.md) | разработчик: сессии в microVM |
+| [`docs/ARCHITECTURE-claude-box.md`](ARCHITECTURE-claude-box.md) | разработчик: архитектура `vault/` + `box/` |
+| [`docs/DECISIONS-claude-box.md`](DECISIONS-claude-box.md) | разработчик: почему сделано именно так |
+| [`docs/messaging-connector.md`](messaging-connector.md) | разработчик: памятка для новых адаптеров |
+| [`docs/FORK-agent-vm-egress-proxy.md`](FORK-agent-vm-egress-proxy.md) | разработчик: форк agent-vm |
+| [`vault/README.md`](../vault/README.md), [`box/README.md`](../box/README.md) | разработчик: контракт автономных пакетов |
+| [`docs/archive/`](archive/) | история: ревью, планы рефакторингов, миграции |

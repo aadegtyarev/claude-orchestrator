@@ -23,7 +23,7 @@ proxy.py; прокси стоит ТОЛЬКО в песочнице модел�
 create без разобранного тела → deny (безопасная сторона). Корни резолвятся при
 запросе (сессии приходят/уходят) — Policy строится динамически.
 
-См. [[docker-in-sandbox]].
+См. docs/CONFIG.md (SANDBOX_BWRAP_DOCKER).
 """
 
 from __future__ import annotations
