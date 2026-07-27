@@ -45,8 +45,10 @@
 одна сессия». Здесь — много именованных сессий, привязка к папкам, статус-баблы,
 resume, песочница, несколько интерфейсов сразу.
 
-> Раньше проект назывался **tg-claude-orchestrator**; старый systemd-юнит
-> `install.sh` снимает автоматически.
+> Раньше проект назывался **tg-claude-orchestrator**. Старое имя репозитория
+> продолжает работать (GitHub редиректит), старый systemd-юнит `install.sh`
+> снимает автоматически, а каталог сессий по умолчанию остался прежним
+> (`~/tg-claude-sessions`) — чтобы обновление не потеряло существующие сессии.
 
 ## Требования
 
@@ -71,8 +73,8 @@ Claude Code.
 ## Быстрый старт
 
 ```bash
-git clone https://github.com/aadegtyarev/tg-claude-orchestrator.git
-cd tg-claude-orchestrator
+git clone https://github.com/aadegtyarev/claude-orchestrator.git
+cd claude-orchestrator
 ./install.sh                 # venv, зависимости, systemd user-юнит; создаст .env из примера
 nano .env                    # минимум: TELEGRAM_BOT_TOKEN и ALLOWED_USER_IDS
 systemctl --user enable --now claude-orchestrator

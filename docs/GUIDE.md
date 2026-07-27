@@ -39,8 +39,8 @@
 ## Установка
 
 ```bash
-git clone https://github.com/aadegtyarev/tg-claude-orchestrator.git
-cd tg-claude-orchestrator
+git clone https://github.com/aadegtyarev/claude-orchestrator.git
+cd claude-orchestrator
 ./install.sh
 ```
 
