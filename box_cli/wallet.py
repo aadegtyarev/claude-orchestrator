@@ -55,7 +55,7 @@ from vault.policy import PolicyEditor
 from vault.proxy_pool import ProxyPoolError, SessionProxyPool
 from vault.secret import Secret
 from vault.shims import SHIM_DIRNAME, install_cli, tool_names, write_shims
-from vault.store import SecretStore
+from vault.store import SecretStore, ensure_default_secrets
 from vault.tls import VaultCA, VaultCAError
 from vault.tty_host import TtyVaultHost
 
@@ -242,8 +242,9 @@ async def setup_wallet_intercept(
 
 async def setup_wallet_all(
     *, secrets_path: Path, session_name: str = SESSION_NAME,
-    host: VaultHost | None = None, vm: bool = False,
-) -> WalletIntercept:
+    host: VaultHost | None = None, vm: bool = False, optional: bool = False,
+    may_create: bool = True,
+) -> WalletIntercept | None:
     """`--wallet` без имени: поднять всё, что policy разрешает этой сессии.
 
     Так же работает кошелёк у оркестратора: policy решает, какие секреты видит
@@ -257,6 +258,12 @@ async def setup_wallet_all(
       * под --vm набор не собираем: там вид секрета решает механику доставки
         (inject через --env-file, host-passthrough невозможен), и «всё сразу»
         превратилось бы в тихий частичный отказ.
+
+    optional=True — кошелёк включён УМОЛЧАНИЕМ, а не просьбой оператора: тогда
+    «нечего поднимать» (нет secrets.toml, нет секретов для этой сессии, одни
+    прокси-секреты) — не ошибка, а None: запуск идёт без кошелька. Явную просьбу
+    (`--wallet`) по-прежнему встречает честный отказ с объяснением — оператор
+    просил, значит должен узнать, почему не вышло.
     """
     if vm:
         raise WalletError(
@@ -265,12 +272,44 @@ async def setup_wallet_all(
             "через env-файл, host-passthrough невозможен), поэтому «все разом» "
             "молча сделало бы половину.", code=2)
 
+    # Первый запуск: политики ещё нет. Создаём дефолт — тот же, что у
+    # оркестратора: прокол на хост для gh/git/ssh/scp. Это НЕ создание секретов,
+    # а разрешение пользоваться теми кредами, что уже есть на машине (gh-логин,
+    # ~/.ssh, git credential helper) — и только через кошелёк, без выдачи
+    # значений модели. Иначе «кошелёк включён» означало бы «ничего не работает,
+    # пока не напишешь TOML руками».
+    if optional and may_create and ensure_default_secrets(secrets_path):
+        sys.stderr.write(
+            f"claude-box: создан {secrets_path} — через кошелёк пойдут gh, git, "
+            "ssh, scp с кредами хоста (значения модели не видны). Свой токен: "
+            "`vault policy new <имя>`; выключить кошелёк: "
+            "`claude-box config wallet=false`.\n")
+
     store = SecretStore(secrets_path)
+    loaded = store.load()
+    if not store.last_load_ok:
+        # Файл ЕСТЬ, но не прочитан: битый TOML, права не 0600, нет доступа.
+        # Промолчать нельзя даже в авто-режиме — оператор считал бы, что кошелёк
+        # работает, а секретов в сессии просто не будет. Причина уже в логе
+        # SecretStore; здесь говорим оператору, что кошелёк не поднят.
+        message = (
+            f"политика {secrets_path} не прочитана (битый TOML или права не "
+            "0600) — кошелёк НЕ поднят. Проверь файл: `vault policy`.")
+        if optional:
+            sys.stderr.write(f"claude-box: {message}\n")
+            return None
+        raise WalletError(message, code=2)
+
     available = {
-        name: secret for name, secret in store.load().items()
+        name: secret for name, secret in loaded.items()
         if secret.session_allowed(session_name)
     }
     if not available:
+        if optional:
+            logger.info(
+                "wallet: в %s нет секретов для «%s» — запуск без кошелька",
+                secrets_path, session_name)
+            return None
         raise WalletError(
             f"в {secrets_path} нет секретов, разрешённых «{session_name}»: добавь "
             f'sessions = ["{session_name}"] (или ["*"]) в нужные записи. '
@@ -278,12 +317,17 @@ async def setup_wallet_all(
 
     proxy_names = sorted(n for n, s in available.items() if s.is_proxy)
     shim_secrets = {n: s for n, s in available.items() if not s.is_proxy}
-    if proxy_names:
+    if proxy_names and not optional:
         sys.stderr.write(
             "claude-box: прокси-секреты (" + ", ".join(proxy_names) + ") в набор "
             "не вошли — перехват TLS поднимается под ОДИН секрет. Нужен такой — "
             f"запусти с `--wallet {proxy_names[0]}`.\n")
     if not shim_secrets:
+        if optional:
+            logger.info(
+                "wallet: доступны только прокси-секреты (%s) — их поднимают по "
+                "имени, запуск идёт без кошелька", ", ".join(proxy_names))
+            return None
         raise WalletError(
             "все доступные секреты — прокси-секреты, а их набором не поднять: "
             f"назови нужный явно, напр. `--wallet {proxy_names[0]}`.", code=2)

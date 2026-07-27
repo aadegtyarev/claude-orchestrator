@@ -5,7 +5,7 @@
 
 | Слой | Что это | Кому |
 |------|---------|------|
-| **`claude-box`** | запустить `claude` в песочнице: своя изоляция, отдельная учётка, секреты без выдачи значений | человеку за терминалом и CI |
+| **`claude-box`** | запустить `claude` изолированно — в песочнице или в microVM: отдельная учётка, секреты без выдачи значений | человеку за терминалом и CI |
 | **`vault`** | кошелёк секретов: `git push`, `gh`, `curl` с токеном работают, а значения модели не видны | тому, кто не хочет класть боевой токен в окружение агента |
 | **оркестратор** | много именованных сессий с интерфейсом в Telegram и браузере | тому, кто ведёт несколько проектов и управляет ими с телефона |
 
@@ -17,21 +17,43 @@
 ```bash
 git clone https://github.com/aadegtyarev/claude-orchestrator.git
 cd claude-orchestrator
-sudo apt install bubblewrap           # песочница
-bin/claude-box                        # claude в песочнице, терминал твой
+sudo apt install bubblewrap                       # песочница
+mkdir -p ~/.local/bin
+ln -sfn "$PWD/bin/claude-box" ~/.local/bin/claude-box
+ln -sfn "$PWD/bin/vault" ~/.local/bin/vault
+claude-box                                        # claude в песочнице, терминал твой
 ```
 
-Процесс видит рабочий каталог и свой временный дом — и больше ничего: ни
-`~/.ssh`, ни соседних проектов, ни настоящего `$HOME`. Дальше:
+Зависимостей и venv не нужно — хватает системного Python ≥ 3.10. Процесс видит
+рабочий каталог и свой дом, и больше ничего: ни `~/.ssh`, ни соседних проектов,
+ни настоящего `$HOME`.
+
+Секреты работают сразу: `git push` и `gh` в такой сессии идут через кошелёк с
+кредами хоста, но значений модель не видит (политика создаётся при первом
+запуске, править — `vault policy`).
 
 ```bash
-bin/claude-box init work              # отдельная учётка claude (свой профиль)
-bin/claude-box --profile work         # запуск под ней
-bin/claude-box --wallet gh            # дать доступ к gh, не показывая токен
-bin/claude-box -p "почини тесты"      # без интерактива, для CI
+claude-box init work            # отдельная учётка claude (свой профиль)
+claude-box --profile work       # запуск под ней
+claude-box -p "почини тесты"    # без интерактива, для CI
+claude-box config               # умолчания: движок, кошелёк, профиль
 ```
 
-Подробно — [руководство по `claude-box`](docs/BOX.md).
+**Нужна не песочница, а виртуалка** — тот же CLI, другой движок:
+
+```bash
+# наш форк agent-vm: в нём есть флаги, без которых кошелёк не проведёт секрет в гостя
+mkdir -p ~/.local/share/agent-vm && cd ~/.local/share/agent-vm
+gh release download --repo aadegtyarev/agent-vm --pattern 'agent-vm-linux-x64-*.tar.gz'
+tar xzf agent-vm-linux-x64-*.tar.gz
+ln -sfn "$PWD/agent-vm-linux-x64/bin/agent-vm" ~/.local/bin/agent-vm
+
+agent-vm setup                  # прогреть образ (первый запуск тянет его минутами)
+claude-box --vm                 # сессия в microVM: изолировано ядро ОС, нужен KVM
+```
+
+Подробно — [руководство по `claude-box`](docs/BOX.md): движки, профили, секреты,
+запуск в CI, настройка умолчаний.
 
 ## Дальше: секреты
 
@@ -84,6 +106,7 @@ systemctl --user enable --now claude-orchestrator
   bubblewrap и пользовательского systemd)
 - [Claude Code](https://code.claude.com/docs) ≥ 2.1 в `PATH`, **залогиненный**
 - `bubblewrap` для песочницы: `sudo apt install bubblewrap`
+- для microVM вместо песочницы — KVM и наш форк `agent-vm` (установка выше)
 - `claude-box` и `bin/wallet` обходятся системным Python, без зависимостей
 - оркестратору дополнительно нужны пакеты из `requirements.txt` (ставит
   `install.sh`), бот от [@BotFather](https://t.me/BotFather) и группа с топиками

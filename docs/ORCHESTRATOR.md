@@ -61,6 +61,18 @@ systemctl --user enable --now claude-orchestrator
 journalctl --user -u claude-orchestrator -f
 ```
 
+`enable --now` означает «запустить сейчас и поднимать впредь». Впредь — это в
+том числе **после перезагрузки и без входа в систему**: `install.sh` включает
+для пользователя linger, поэтому его systemd-менеджер стартует вместе с машиной
+и не гасится при разлогине. Проверить:
+
+```bash
+loginctl show-user "$USER" --property=Linger    # ожидаем Linger=yes
+```
+
+`Linger=no` — сервис будет жить только пока ты залогинен; включается командой
+`sudo loginctl enable-linger $USER`.
+
 В логе при старте видно, какие адаптеры поднялись, какая песочница выбрана и
 включён ли кошелёк секретов.
 

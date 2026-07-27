@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 try:
@@ -36,6 +37,31 @@ sessions = ["*"]                          # все сессии; сузь при
 commands = ["gh", "git", "ssh", "scp"]    # эти инструменты завернутся обёртками
 confirm = false                           # без кнопок подтверждения; guard — щит
 """
+
+
+def ensure_default_secrets(path: Path) -> bool:
+    """Создать secrets.toml с дефолтным проколом на хост, если файла ещё нет.
+
+    Возвращает True, если файл создан этим вызовом. Пишем 0600 через O_EXCL —
+    ни мгновения без прав и без гонки с параллельным запуском; недоступный
+    каталог не роняет вызывающего (кошелёк просто не поднимется).
+
+    Дефолт безопасен по построению: он не создаёт НИ ОДНОГО нового секрета, а
+    разрешает пользоваться теми кредами, что уже есть на хосте (gh-логин,
+    ~/.ssh, git credential helper) — и только через кошелёк, не показывая
+    значений модели.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return False
+    except OSError as e:
+        logger.error("vault: не удалось создать %s: %s", path, e)
+        return False
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(DEFAULT_SECRETS_TOML)
+    return True
 
 
 class SecretStore:

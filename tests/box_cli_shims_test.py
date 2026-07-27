@@ -378,6 +378,100 @@ async def test_setup_all_takes_what_policy_allows():
     print("OK --wallet без имени: объединяет секреты сессии, чужие не берёт")
 
 
+async def test_setup_all_optional_first_run_creates_policy():
+    """Первый запуск с кошелёком-по-умолчанию: политики нет → создаём дефолт.
+
+    Иначе «кошелёк включён из коробки» означало бы «ничего не работает, пока не
+    напишешь TOML руками». Дефолт не создаёт секретов — он разрешает
+    пользоваться кредами, которые уже есть на хосте, и только через кошелёк."""
+    tmp = Path(tempfile.mkdtemp(prefix="box_shims_first_"))
+    secrets = tmp / "secrets.toml"
+    restore = _patch_daemon(_FakeDaemon())
+    intercept = None
+    try:
+        intercept = await boxwallet.setup_wallet_all(
+            secrets_path=secrets, session_name=SESSION, optional=True)
+        assert secrets.exists(), "политика должна быть создана"
+        assert oct(secrets.stat().st_mode & 0o777) == "0o600", "строго 0600"
+        assert intercept is not None, "дефолт даёт рабочий набор обёрток"
+        shim_dir = Path(intercept.env["PATH"].split(os.pathsep)[0])
+        assert {p.name for p in shim_dir.iterdir()} == {
+            "gh", "git", "ssh", "scp", "wallet"}
+    finally:
+        restore()
+        if intercept is not None:
+            await intercept.close()
+    print("OK первый запуск: политика создана (0600), обёртки gh/git/ssh/scp")
+
+
+async def test_setup_all_optional_is_soft():
+    """Кошелёк включён умолчанием, а поднимать нечего — это не сбой.
+
+    Просьбу оператора (`--wallet`) встречает честный отказ; умолчание молча
+    отступает, иначе пустая политика ломала бы каждый запуск claude-box."""
+    alien = _secrets_for_other_session()
+    restore = _patch_daemon(_FakeDaemon())
+    try:
+        assert await boxwallet.setup_wallet_all(
+            secrets_path=alien, session_name=SESSION, optional=True) is None
+        # ...а без optional — отказ с объяснением.
+        try:
+            await boxwallet.setup_wallet_all(secrets_path=alien, session_name=SESSION)
+        except boxwallet.WalletError as e:
+            assert e.code == 2
+        else:
+            raise AssertionError("явная просьба должна получать отказ")
+    finally:
+        restore()
+    print("OK умолчание отступает молча, явная просьба — честный отказ")
+
+
+async def test_setup_all_optional_does_not_hide_broken_policy():
+    """Мягкий режим отступает только когда поднимать НЕЧЕГО, а не когда сломано.
+
+    Битый TOML, права шире 0600, нет доступа — SecretStore возвращает пустой
+    набор и пишет причину в лог. Промолчать тут нельзя: оператор считал бы, что
+    кошелёк работает, а секретов в сессии просто нет."""
+    tmp = Path(tempfile.mkdtemp(prefix="box_shims_broken_"))
+    bad = tmp / "secrets.toml"
+    bad.write_text("[secrets.x]\nvalue = ", encoding="utf-8")
+    os.chmod(bad, 0o600)
+    restore = _patch_daemon(_FakeDaemon())
+    try:
+        # авто-режим: не поднимаем, но ГОВОРИМ (текст проверяем через stderr ниже)
+        assert await boxwallet.setup_wallet_all(
+            secrets_path=bad, session_name=SESSION, optional=True) is None
+        # явная просьба — честный отказ, а не «тихо без кошелька»
+        try:
+            await boxwallet.setup_wallet_all(secrets_path=bad, session_name=SESSION)
+        except boxwallet.WalletError as e:
+            assert e.code == 2 and "не прочитана" in str(e), (e.code, str(e))
+        else:
+            raise AssertionError("битая политика должна отвергаться")
+    finally:
+        restore()
+    print("OK битая политика: авто-режим предупреждает, явный --wallet отказывает")
+
+
+async def test_setup_all_never_creates_policy_at_foreign_path():
+    """Дефолт создаём только по своему пути.
+
+    Оператор указал `--secrets ./my.toml` — значит файл его, и посеять там наш
+    дефолт (да ещё и с проколом на хост) значит насорить в чужом каталоге."""
+    tmp = Path(tempfile.mkdtemp(prefix="box_shims_foreign_"))
+    mine = tmp / "sub" / "my.toml"
+    restore = _patch_daemon(_FakeDaemon())
+    try:
+        assert await boxwallet.setup_wallet_all(
+            secrets_path=mine, session_name=SESSION, optional=True,
+            may_create=False) is None
+        assert not mine.exists(), "по чужому пути политику не создаём"
+        assert not mine.parent.exists(), "и каталог под неё тоже"
+    finally:
+        restore()
+    print("OK по указанному оператором пути дефолтная политика не создаётся")
+
+
 async def test_setup_all_refusals():
     """Набор не собрать — говорим почему, а не поднимаем половину."""
     tmp = Path(tempfile.mkdtemp(prefix="box_shims_none_"))
@@ -542,6 +636,10 @@ def main() -> None:
     test_write_shims_permissions()
     asyncio.run(test_setup_shims_env_and_teardown())
     asyncio.run(test_setup_all_takes_what_policy_allows())
+    asyncio.run(test_setup_all_optional_first_run_creates_policy())
+    asyncio.run(test_setup_all_optional_is_soft())
+    asyncio.run(test_setup_all_optional_does_not_hide_broken_policy())
+    asyncio.run(test_setup_all_never_creates_policy_at_foreign_path())
     asyncio.run(test_setup_all_refusals())
     asyncio.run(test_shims_refusals())
     asyncio.run(test_non_oserror_cleans_up_everything())

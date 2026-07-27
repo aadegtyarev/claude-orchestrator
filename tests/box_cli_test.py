@@ -63,13 +63,16 @@ def test_parse_wallet_and_secrets():
     opts2 = cli.parse_args(["--wallet=svc", "--secrets=/tmp/s.toml"])
     assert opts2.wallet == "svc"
     assert opts2.secrets == Path("/tmp/s.toml")
-    # --secrets без --wallet — бессмысленно → отказ код 2.
+    # --secrets без --wallet: под bwrap кошелёк включён умолчанием, поэтому путь
+    # к политике осмыслен и запуск идёт. А там, где кошелька нет (движок off), —
+    # по-прежнему отказ: путь никуда бы не применился.
+    assert cli.parse_args(["--secrets", "/tmp/s.toml"]).secrets == Path("/tmp/s.toml")
     try:
-        cli.parse_args(["--secrets", "/tmp/s.toml"])
+        cli.parse_args(["--engine", "off", "--secrets", "/tmp/s.toml"])
     except SystemExit as e:
         assert e.code == 2
     else:
-        raise AssertionError("--secrets без --wallet должен упасть")
+        raise AssertionError("--secrets без кошелька должен падать")
     # --wallet без значения — не отказ, а «все секреты, что разрешает policy»
     # (как у сессии оркестратора): имя обязательным быть перестало.
     bare = cli.parse_args(["--wallet"])
