@@ -52,6 +52,49 @@ case ":$PATH:" in
     *) echo "    ВНИМАНИЕ: $HOME/.local/bin не в PATH — добавь его в ~/.profile" ;;
 esac
 
+# Базовая конфигурация claude-box: как выглядит «просто claude-box» на этой
+# машине. Спрашиваем ОДИН раз и только у живого терминала — в CI и при повторной
+# установке молча ничего не трогаем (готовый конфиг оператора не перезаписываем).
+BOX_CONFIG="${CLAUDE_BOX_CONFIG:-$HOME/.config/claude-box/config.toml}"
+if [ -t 0 ] && [ ! -f "$BOX_CONFIG" ] && [ "${1:-}" != "--no-config" ]; then
+    echo "==> Базовая конфигурация claude-box (Enter — значение по умолчанию)"
+    printf '    Изоляция по умолчанию [bwrap/off/vm] (bwrap): '
+    read -r box_engine || box_engine=""
+    case "${box_engine:-bwrap}" in
+        bwrap|off) ;;
+        vm|agent-vm) box_engine=agent-vm ;;
+        *) echo "    не понял «$box_engine» — беру bwrap"; box_engine=bwrap ;;
+    esac
+    printf '    Кошелёк секретов, когда изоляция есть? [Y/n]: '
+    read -r box_wallet || box_wallet=""
+    case "$box_wallet" in [nNнН]*) box_wallet=false ;; *) box_wallet=true ;; esac
+    printf '    Профиль claude по умолчанию (пусто — общий ~/.claude): '
+    read -r box_profile || box_profile=""
+    # Имя профиля идёт и в TOML, и в путь каталога. Кавычка внутри имени
+    # сломала бы файл настроек так, что claude-box перестал бы запускаться
+    # ВООБЩЕ (умолчания читаются раньше разбора аргументов, даже для --help),
+    # поэтому валидируем тем же allowlist, что и сам claude-box.
+    if [ -n "$box_profile" ] && ! printf '%s' "$box_profile" | grep -qE '^[A-Za-z0-9._-]{1,64}$'; then
+        echo "    имя «$box_profile» не годится (допустимо: латиница, цифры, . _ -) — пропускаю"
+        box_profile=""
+    fi
+
+    mkdir -p "$(dirname "$BOX_CONFIG")"
+    {
+        echo "# Умолчания claude-box (флаг в командной строке всегда сильнее)."
+        echo "# Справочник: docs/BOX.md"
+        echo "engine = \"${box_engine:-bwrap}\""
+        echo "wallet = $box_wallet"
+        [ -n "$box_profile" ] && echo "profile = \"$box_profile\""
+    } > "$BOX_CONFIG"
+    echo "    записано в $BOX_CONFIG"
+    if [ -n "$box_profile" ]; then
+        "$DIR/bin/claude-box" init "$box_profile" >/dev/null 2>&1 \
+            && echo "    профиль «$box_profile» создан" \
+            || echo "    профиль «$box_profile» создать не удалось — сделай позже: claude-box init $box_profile"
+    fi
+fi
+
 echo "==> systemd user-сервис"
 # PATH юнита: каталог с бинарём claude определяем по факту (npm-global,
 # ~/.local/bin, nvm — у всех по-разному), не хардкодим раскладку.

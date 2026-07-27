@@ -344,6 +344,81 @@ async def test_setup_shims_env_and_teardown():
             await intercept.close()
 
 
+async def test_setup_all_takes_what_policy_allows():
+    """`--wallet` без имени: набор определяет policy, а не оператор перечислением.
+
+    Проверяем ровно то, что обещано: берутся секреты, разрешённые ЭТОЙ сессии
+    (чужие мимо), команды нескольких секретов объединяются в один набор обёрток,
+    а прокси-секрет в набор не входит — перехват TLS поднимается под один секрет
+    и его надо назвать явно, иначе выбор молча сделали бы за оператора."""
+    tmp = Path(tempfile.mkdtemp(prefix="box_shims_all_"))
+    secrets = tmp / "secrets.toml"
+    _write_secrets(secrets, _SECRETS + (
+        '\n[secrets.deploy]\nvalue="V2"\nenv="DEPLOY"\nsessions=["*"]\n'
+        'commands=["kubectl"]\n'
+        '\n[secrets.api]\nvalue="V3"\nsessions=["*"]\nmode="proxy"\n'
+        'connector="generic-bearer"\n'
+    ))
+    daemon = _FakeDaemon()
+    restore = _patch_daemon(daemon)
+    intercept = None
+    try:
+        intercept = await boxwallet.setup_wallet_all(
+            secrets_path=secrets, session_name=SESSION)
+        shim_dir = Path(intercept.env["PATH"].split(os.pathsep)[0])
+        got = {p.name for p in shim_dir.iterdir()}
+        # gh/git/curl — из hostcred, kubectl — из deploy: наборы объединены.
+        assert got == {"gh", "git", "curl", "kubectl", "wallet"}, got
+        # foreign разрешён только сессиям prod-* — его команды не подцепились.
+        assert "kubectl" in got and "foreign" not in got
+    finally:
+        restore()
+        if intercept is not None:
+            await intercept.close()
+    print("OK --wallet без имени: объединяет секреты сессии, чужие не берёт")
+
+
+async def test_setup_all_refusals():
+    """Набор не собрать — говорим почему, а не поднимаем половину."""
+    tmp = Path(tempfile.mkdtemp(prefix="box_shims_none_"))
+    only_proxy = tmp / "secrets.toml"
+    _write_secrets(only_proxy, (
+        '[secrets.api]\nvalue="V"\nsessions=["*"]\nmode="proxy"\n'
+        'connector="generic-bearer"\n'
+    ))
+    restore = _patch_daemon(_FakeDaemon())
+    try:
+        for path, code, needle in (
+            (only_proxy, 2, "назови нужный"),          # одни прокси-секреты
+            (_secrets_for_other_session(), 2, "нет секретов, разрешённых"),
+        ):
+            try:
+                await boxwallet.setup_wallet_all(
+                    secrets_path=path, session_name=SESSION)
+            except boxwallet.WalletError as e:
+                assert e.code == code and needle in str(e), (e.code, str(e))
+            else:
+                raise AssertionError(f"должен был отказать: {path}")
+        # Под --vm набор не собираем: механика доставки зависит от вида секрета.
+        try:
+            await boxwallet.setup_wallet_all(
+                secrets_path=only_proxy, session_name=SESSION, vm=True)
+        except boxwallet.WalletError as e:
+            assert e.code == 2 and "--wallet <имя>" in str(e), str(e)
+        else:
+            raise AssertionError("под --vm набор должен отвергаться")
+    finally:
+        restore()
+    print("OK --wallet без имени: честные отказы (одни прокси, пусто, --vm)")
+
+
+def _secrets_for_other_session() -> Path:
+    tmp = Path(tempfile.mkdtemp(prefix="box_shims_alien_"))
+    path = tmp / "secrets.toml"
+    _write_secrets(path, '[secrets.foreign]\nsessions=["prod-*"]\ncommands=["gh"]\n')
+    return path
+
+
 async def test_shims_refusals():
     """Честные отказы: нет секрета / не разрешён сессии / нечего заворачивать → 2,
     демон не поднялся → 1."""
@@ -364,7 +439,7 @@ async def test_shims_refusals():
 
     await _expect("nope", 2, "не найден")
     await _expect("foreign", 2, "не разрешён")
-    await _expect("nocmd", 2, "нет ни одной команды")
+    await _expect("nocmd", 2, "нет команды для заворачивания")
     await _expect("hostcred", 1, "демон кошелька не поднят", daemon=_FakeDaemon(fail=True))
     print("OK отказы: нет секрета/не разрешён/нечего заворачивать → 2, сбой демона → 1")
 
@@ -414,7 +489,7 @@ async def test_non_oserror_cleans_up_everything():
         await boxwallet.setup_wallet_intercept(
             "nul", secrets_path=bad, session_name=SESSION)
     except WalletError as e:
-        assert e.code == 2 and "нет ни одной команды" in str(e), (e.code, str(e))
+        assert e.code == 2 and "нет команды для заворачивания" in str(e), (e.code, str(e))
     else:
         raise AssertionError("ожидался честный отказ на имени с NUL")
     finally:
@@ -466,6 +541,8 @@ def main() -> None:
     test_sandbox_path_never_leaks_cwd()
     test_write_shims_permissions()
     asyncio.run(test_setup_shims_env_and_teardown())
+    asyncio.run(test_setup_all_takes_what_policy_allows())
+    asyncio.run(test_setup_all_refusals())
     asyncio.run(test_shims_refusals())
     asyncio.run(test_non_oserror_cleans_up_everything())
     asyncio.run(test_host_is_passed_to_daemon())

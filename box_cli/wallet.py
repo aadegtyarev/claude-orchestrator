@@ -236,7 +236,59 @@ async def setup_wallet_intercept(
             "работают прокси-секрет (connector) и inject-секрет (value+env); "
             "host-passthrough — под --engine bwrap.", code=2)
     return await setup_wallet_shims(
-        secret_name, secret=secret, secrets_path=secrets_path,
+        secrets={secret_name: secret}, secrets_path=secrets_path,
+        session_name=session_name, host=host)
+
+
+async def setup_wallet_all(
+    *, secrets_path: Path, session_name: str = SESSION_NAME,
+    host: VaultHost | None = None, vm: bool = False,
+) -> WalletIntercept:
+    """`--wallet` без имени: поднять всё, что policy разрешает этой сессии.
+
+    Так же работает кошелёк у оркестратора: policy решает, какие секреты видит
+    сессия, а не оператор перечисляет их при каждом запуске. Разница с
+    `--wallet <имя>` только в выборе набора — механика та же.
+
+    Границы (осознанные, чтобы не обещать лишнего):
+      * прокси-секреты сюда НЕ входят: HTTPS_PROXY один на процесс, и «все
+        прокси-секреты разом» означало бы молча выбрать один из них. Если такие
+        секреты доступны, говорим об этом и просим назвать нужный явно;
+      * под --vm набор не собираем: там вид секрета решает механику доставки
+        (inject через --env-file, host-passthrough невозможен), и «всё сразу»
+        превратилось бы в тихий частичный отказ.
+    """
+    if vm:
+        raise WalletError(
+            "под --vm нужно назвать секрет: `--wallet <имя>`. Механика доставки "
+            "там зависит от вида секрета (прокси — через egress-proxy, inject — "
+            "через env-файл, host-passthrough невозможен), поэтому «все разом» "
+            "молча сделало бы половину.", code=2)
+
+    store = SecretStore(secrets_path)
+    available = {
+        name: secret for name, secret in store.load().items()
+        if secret.session_allowed(session_name)
+    }
+    if not available:
+        raise WalletError(
+            f"в {secrets_path} нет секретов, разрешённых «{session_name}»: добавь "
+            f'sessions = ["{session_name}"] (или ["*"]) в нужные записи. '
+            "См. `vault policy`.", code=2)
+
+    proxy_names = sorted(n for n, s in available.items() if s.is_proxy)
+    shim_secrets = {n: s for n, s in available.items() if not s.is_proxy}
+    if proxy_names:
+        sys.stderr.write(
+            "claude-box: прокси-секреты (" + ", ".join(proxy_names) + ") в набор "
+            "не вошли — перехват TLS поднимается под ОДИН секрет. Нужен такой — "
+            f"запусти с `--wallet {proxy_names[0]}`.\n")
+    if not shim_secrets:
+        raise WalletError(
+            "все доступные секреты — прокси-секреты, а их набором не поднять: "
+            f"назови нужный явно, напр. `--wallet {proxy_names[0]}`.", code=2)
+    return await setup_wallet_shims(
+        secrets=shim_secrets, secrets_path=secrets_path,
         session_name=session_name, host=host)
 
 
@@ -479,10 +531,10 @@ def sandbox_path(shim_dir: Path) -> str:
 
 
 async def setup_wallet_shims(
-    secret_name: str, *, secret: Secret, secrets_path: Path, session_name: str,
+    *, secrets: dict[str, Secret], secrets_path: Path, session_name: str,
     host: VaultHost | None = None,
 ) -> WalletIntercept:
-    """host/inject-секрет: поднять standalone-демон и положить в PATH шимы.
+    """host/inject-секреты: поднять standalone-демон и положить в PATH шимы.
 
     Что получает песочница: PATH=<каталог шимов>:<исходный PATH> и WALLET_FILE на
     временный wallet.json (url+token демона). Значение секрета в песочницу не
@@ -490,19 +542,23 @@ async def setup_wallet_shims(
     отредактированный вывод.
 
     Демон здесь ОДИН на процесс claude-box и знает всю policy файла secrets.toml
-    (демон подбирает секрет по команде сам — так же, как у оркестратора). Шимы же
-    ставим только под запрошенный `--wallet <секрет>`: явный запрос оператора, а
-    не «всё, что лежит в secrets.toml».
+    (подбирает секрет по команде сам — так же, как у оркестратора). Шимы ставим
+    под запрошенный набор: один секрет при `--wallet <имя>`, все доступные сессии
+    при `--wallet` без имени (см. setup_wallet_all) — но никогда не «всё, что
+    лежит в secrets.toml» без спроса.
 
-    Секрет приходит УЖЕ загруженным (его достал вызывающий) — повторно парсить
+    Секреты приходят УЖЕ загруженными (их достал вызывающий) — повторно парсить
     secrets.toml незачем: лишний I/O и окно рассинхрона, если файл поменяли между
     двумя чтениями. secrets_path остаётся — он нужен демону (policy целиком) и
     сообщениям об ошибке.
     """
-    tools = tool_names(secret.effective_commands)
+    names = ", ".join(sorted(secrets))
+    tools: set[str] = set()
+    for secret in secrets.values():
+        tools |= tool_names(secret.effective_commands)
     if not tools:
         raise WalletError(
-            f"у секрета «{secret_name}» нет ни одной команды для заворачивания: "
+            f"ни у одного из секретов ({names}) нет команды для заворачивания: "
             "в commands либо пусто, либо только глобы (`*`). Добавь имя "
             'инструмента, напр. commands = ["gh", "git"], — тогда claude-box '
             "положит его обёртку в PATH песочницы. См. `vault policy`.", code=2)
@@ -519,7 +575,7 @@ async def setup_wallet_shims(
     except Exception as e:  # noqa: BLE001 — сбой окружения, честный отказ (код 1)
         await _stop_quietly(daemon)  # частично поднятый демон не оставляем висеть
         raise WalletError(
-            f"демон кошелька не поднят ({e}) — секрет «{secret_name}» недоступен.",
+            f"демон кошелька не поднят ({e}) — секреты ({names}) недоступны.",
             code=1) from e
 
     tmpdir = Path(tempfile.mkdtemp(prefix="claude-box-wallet-"))
@@ -546,7 +602,7 @@ async def setup_wallet_shims(
             raise
         detail = str(e).replace(str(tmpdir), "<временный каталог>") or type(e).__name__
         raise WalletError(
-            f"не удалось подготовить обёртки кошелька для «{secret_name}» ({detail}). "
+            f"не удалось подготовить обёртки кошелька ({names}): {detail}. "
             "Проверь commands в secrets.toml и место на диске.", code=1) from e
 
     env = {
@@ -557,10 +613,10 @@ async def setup_wallet_shims(
     # уедут на хост с реальным кредом).
     git_note = " (git — только сетевые подкоманды)" if "git" in tools else ""
     sys.stderr.write(
-        f"claude-box: --wallet «{secret_name}»: через кошелёк идут "
+        f"claude-box: --wallet ({names}): через кошелёк идут "
         + ", ".join(sorted(tools)) + git_note
         + "; клиент `wallet` в PATH.\n")
     logger.info(
-        "wallet: шимы секрета «%s» в %s, демон %s", secret_name, shim_dir, daemon.url)
+        "wallet: шимы секретов (%s) в %s, демон %s", names, shim_dir, daemon.url)
     return WalletIntercept(
         env=env, extra_rw=[tmpdir], _daemon=daemon, _tmpdir=tmpdir)
