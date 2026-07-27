@@ -79,6 +79,23 @@ if [ -t 0 ] && [ ! -f "$BOX_CONFIG" ] && [ "${1:-}" != "--no-config" ]; then
         box_profile=""
     fi
 
+    # Выбрали microVM — проверим, чем её запускать: нужен НАШ форк agent-vm
+    # (у апстрима нет флагов egress, и кошелёк в госте работать не будет).
+    # Ничего не качаем молча: печатаем, чего не хватает, и куда смотреть.
+    if [ "$box_engine" = "agent-vm" ]; then
+        if ! command -v agent-vm >/dev/null 2>&1; then
+            echo "    ВНИМАНИЕ: agent-vm не найден — microVM не запустится."
+            echo "    Установка форка: docs/BOX.md, раздел «Установка microVM»"
+        elif ! agent-vm claude --help 2>/dev/null | grep -q -- "--egress-proxy"; then
+            echo "    ВНИМАНИЕ: установлен АПСТРИМНЫЙ agent-vm (нет --egress-proxy):"
+            echo "    кошелёк в microVM не заработает. Поставь форк"
+            echo "    github.com/aadegtyarev/agent-vm — см. docs/BOX.md"
+        else
+            echo "    agent-vm: форк на месте ($(agent-vm --version 2>/dev/null))"
+        fi
+        [ -e /dev/kvm ] || echo "    ВНИМАНИЕ: /dev/kvm нет — microVM не поднимется"
+    fi
+
     mkdir -p "$(dirname "$BOX_CONFIG")"
     {
         echo "# Умолчания claude-box (флаг в командной строке всегда сильнее)."

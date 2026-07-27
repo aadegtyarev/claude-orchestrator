@@ -41,8 +41,10 @@ claude-box config               # умолчания: движок, кошелё
 
 **Нужна не песочница, а виртуалка** — тот же CLI, другой движок:
 
+Виртуалку даёт наш форк [aadegtyarev/agent-vm](https://github.com/aadegtyarev/agent-vm)
+— в нём есть флаги, без которых кошелёк не проведёт секрет в гостя:
+
 ```bash
-# наш форк agent-vm: в нём есть флаги, без которых кошелёк не проведёт секрет в гостя
 mkdir -p ~/.local/share/agent-vm && cd ~/.local/share/agent-vm
 gh release download --repo aadegtyarev/agent-vm --pattern 'agent-vm-linux-x64-*.tar.gz'
 tar xzf agent-vm-linux-x64-*.tar.gz
