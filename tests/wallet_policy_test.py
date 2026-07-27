@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from orchestrator.core.app import OrchestratorCore, UserError  # noqa: E402
 from orchestrator.core.texts import get_texts  # noqa: E402
-from orchestrator.modules.wallet.policy import PolicyEditor, PolicyError  # noqa: E402
+from vault.policy import PolicyEditor, PolicyError  # noqa: E402
 
 SRC = '''# Шапка-комментарий не должна пропасть при правке.
 [secrets.host]

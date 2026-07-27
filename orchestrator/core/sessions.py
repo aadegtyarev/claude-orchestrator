@@ -229,11 +229,7 @@ class SessionManager:
             logger.error("Не удалось прочитать %s: %s", state_file, e)
             return
         for item in items:
-            # Миграция старого формата (до мульти-адаптеров): thread_id топика
-            # Telegram становится binding'ом telegram-адаптера.
             bindings = dict(item.get("bindings") or {})
-            if "thread_id" in item and "telegram" not in bindings:
-                bindings["telegram"] = str(item["thread_id"])
             session = Session(
                 name=item["name"],
                 bindings=bindings,
@@ -550,7 +546,7 @@ class SessionManager:
         #   • эти deny/autoMode-правила блокируют попытки достать секрет в обход.
         # Без песочницы модель видит все хостовые креды напрямую — правила были
         # бы театром; без кошелька нет и легитимного доступа, который защищаем.
-        # Config.MODULE_REQUIRES_SANDBOX уже не пускает кошелёк в набор при
+        # Config._wallet_module уже не пускает кошелёк в набор при
         # другой песочнице, но проверку песочницы здесь оставляем осознанно:
         # Config — frozen dataclass без валидации инварианта, а
         # `dataclasses.replace(cfg, sandbox=…)` (так делают тесты) может

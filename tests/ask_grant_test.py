@@ -29,7 +29,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from orchestrator.core.transport import PermissionRequest  # noqa: E402
-from orchestrator.modules.wallet.policy import PolicyEditor, PolicyError  # noqa: E402
+from vault.policy import PolicyEditor, PolicyError  # noqa: E402
 from vault.connectors import GenericBearerConnector  # noqa: E402
 from vault.connectors.contract import HttpReq, ScopeGrant  # noqa: E402
 from vault.host import AskResult, ask_grant  # noqa: E402

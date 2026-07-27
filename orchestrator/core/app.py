@@ -528,7 +528,7 @@ class OrchestratorCore:
         у неё есть команда), а не правки в каждом адаптере.
         """
         return {
-            # Кошелёк подключается только под bwrap (см. MODULE_REQUIRES_SANDBOX).
+            # Кошелёк подключается только под bwrap (см. Config._wallet_module).
             "wallet": "wallet" in self.config.modules,
             # Транскрипт Claude под agent-vm лежит ВНУТРИ гостя — на хосте его
             # не прочитать, статистики не будет никогда.

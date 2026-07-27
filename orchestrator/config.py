@@ -19,16 +19,14 @@ from vault.netloc import host_lan_ip
 
 logger = logging.getLogger(__name__)
 
-# Что сказать оператору, когда модуль пропущен из-за несовпадения песочницы:
-# не просто «выключен», а чем это грозит и что делать.
-_MODULE_SKIP_HINT = {
-    "wallet": (
-        "Секреты кошелька (ssh/scp, токены для curl и любых CLI, inject-секреты) "
-        "в этой сессии НЕДОСТУПНЫ. Под agent-vm креды git/gh и Claude держит его "
-        "собственный прокси (значения модели не выдаются) — этого хватает для "
-        "git/gh; для остальных секретов запускай с SANDBOX=bwrap."
-    ),
-}
+# Что сказать оператору, когда кошелёк пропущен из-за песочницы: не просто
+# «выключен», а чем это грозит и что делать.
+_WALLET_SKIP_HINT = (
+    "Секреты кошелька (ssh/scp, токены для curl и любых CLI, inject-секреты) "
+    "в этой сессии НЕДОСТУПНЫ. Под agent-vm креды git/gh и Claude держит его "
+    "собственный прокси (значения модели не выдаются) — этого хватает для "
+    "git/gh; для остальных секретов запускай с SANDBOX=bwrap."
+)
 
 
 def _auto_orch_token() -> str:
@@ -91,7 +89,8 @@ def env_number(name: str, cast):
 
 @dataclass(frozen=True)
 class Config:
-    # Активные транспорт-адаптеры (ADAPTERS=telegram,web) и модули (MODULES=…).
+    # Активные транспорт-адаптеры (ADAPTERS=telegram,web) и модули ядра
+    # (сейчас только кошелёк, см. _wallet_module).
     adapters: tuple[str, ...]
     modules: tuple[str, ...]
     telegram_bot_token: str
@@ -155,7 +154,7 @@ class Config:
     # (гость его не видит — он по-прежнему доверяет CA перехвата agent-vm).
     agent_vm_egress_proxy: str | None
     agent_vm_egress_ca: Path | None
-    # Кошелёк секретов (MODULES=wallet): файл секретов и политик (0600, вне
+    # Кошелёк секретов (SANDBOX_BWRAP_WALLET): файл секретов и политик (0600, вне
     # allowlist песочницы).
     wallet_secrets_file: Path
     # Guard кошелька: всегда-запрет опасных вызовов (печать токена, git-RCE через
@@ -243,6 +242,16 @@ class Config:
     def from_env(cls) -> "Config":
         load_dotenv()
 
+        # Снятая настройка — ПЕРВОЙ проверкой: иначе оператор с MODULES в .env
+        # получил бы отказ по другой причине (например, про токен бота) и не
+        # понял бы, что его настройка вообще больше не действует.
+        if os.getenv("MODULES") is not None:
+            raise SystemExit(
+                "MODULES больше не поддерживается: кошелёк включается настройкой "
+                "SANDBOX_BWRAP_WALLET (по умолчанию включён при SANDBOX=bwrap). "
+                "Убери MODULES из .env."
+            )
+
         adapters = cls._parse_adapters(os.getenv("ADAPTERS", "telegram"))
         token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         if "telegram" in adapters and not token:
@@ -261,9 +270,7 @@ class Config:
             for k, v in os.environ.items()
             if k.startswith("CLAUDE_ENV_") and k != "CLAUDE_ENV_"
         }
-        modules = cls._default_modules(
-            os.getenv("MODULES"), sandbox, os.getenv("SANDBOX_BWRAP_WALLET")
-        )
+        modules = cls._wallet_module(sandbox, os.getenv("SANDBOX_BWRAP_WALLET"))
         # CLAUDE_ENV_* с адресом на хостовом loopback (типовой случай —
         # ANTHROPIC_BASE_URL локального прокси) под agent-vm переписываем на
         # LAN-адрес хоста: изнутри VM «127.0.0.1» указывал бы на сам гость.
@@ -318,7 +325,9 @@ class Config:
             # 0/не задано = авто: ОС выдаёт свободный localhost-порт на сессию.
             channel_port_start=int(os.getenv("CHANNEL_PORT_START", "0")),
             channel_port_end=int(os.getenv("CHANNEL_PORT_END", "0")),
-            sessions_dir=Path(os.getenv("SESSIONS_DIR", "~/tg-claude-sessions")).expanduser(),
+            sessions_dir=Path(
+                os.getenv("SESSIONS_DIR", "~/claude-orchestrator-sessions")
+            ).expanduser(),
             max_instances=int(os.getenv("MAX_INSTANCES", "5")),
             claude_bin=os.getenv("CLAUDE_BIN", "claude"),
             orch_host=os.getenv("ORCH_HOST", "127.0.0.1"),
@@ -401,28 +410,6 @@ class Config:
             raise SystemExit("ADAPTERS пуст — нужен хотя бы один адаптер (telegram, web)")
         return tuple(dict.fromkeys(names))  # без дублей, порядок сохранён
 
-    # Модуль → песочница, без которой он не работает (None = работает при любой).
-    # Кошелёк подключается к сессии через окружение процесса claude (шимы первыми
-    # в PATH + env-маркеры секретов), а это возможно, только когда claude —
-    # процесс на ХОСТЕ, т.е. под bwrap. Под agent-vm claude живёт в госте: env
-    # туда не течёт (замерено) и домашний каталог сессии не монтируется, так что
-    # включённый кошелёк был бы тихим no-op — демон поднят, а в сессии его нет.
-    # Под sandbox=off кошелёк бессмыслен иначе: модель и так видит хостовые креды
-    # напрямую (см. комментарий про «театр» в core/sessions.py).
-    MODULE_REQUIRES_SANDBOX = {"wallet": "bwrap"}
-
-    @staticmethod
-    def _parse_modules(raw: str) -> tuple[str, ...]:
-        valid = {"wallet"}
-        names = [p.strip().lower() for p in raw.split(",") if p.strip()]
-        bad = [n for n in names if n not in valid]
-        if bad:
-            raise SystemExit(
-                f"MODULES: неизвестные модули {', '.join(bad)} — "
-                f"допустимо: {', '.join(sorted(valid))}"
-            )
-        return tuple(dict.fromkeys(names))
-
     @classmethod
     def _rewrite_env_for_guest(
         cls, claude_env: dict[str, str], ip: str | None = None
@@ -457,55 +444,36 @@ class Config:
         return out, unreachable
 
     @classmethod
-    def _default_modules(
-        cls, raw: str | None, sandbox: str, wallet_raw: str | None = None
+    def _wallet_module(
+        cls, sandbox: str, wallet_raw: str | None = None
     ) -> tuple[str, ...]:
-        """Набор модулей.
+        """Набор модулей ядра: сейчас это только кошелёк секретов.
 
-        Кошелёк включается СВОЕЙ настройкой `SANDBOX_BWRAP_WALLET` (bool) —
-        она же неявно объявляет модуль, писать `MODULES=wallet` не нужно. Имя
-        отражает суть: кошелёк работает только в песочнице bwrap (его провода —
-        окружение процесса claude на хосте), поэтому вне bwrap настройка
-        игнорируется, а не спорит с реальностью.
+        Включается своей настройкой `SANDBOX_BWRAP_WALLET`; не задана — включён
+        при `SANDBOX=bwrap`. Вне bwrap кошелёк не включается ДАЖЕ по явной
+        просьбе: его провода (обёртки первыми в PATH + env-маркеры секретов) —
+        это окружение процесса claude на ХОСТЕ. Под agent-vm claude живёт в
+        госте, env туда не течёт и приватный дом сессии не монтируется, под
+        `off` модель и так читает креды напрямую. «Включён и молча ничего не
+        делает» — худший вариант: оператор считает секреты защищёнными. Отказ
+        громкий, с объяснением последствий.
 
-        `MODULES` остаётся реестром модулей вообще (для будущих). Legacy
-        `MODULES=wallet` продолжает работать; при конфликте с явной
-        `SANDBOX_BWRAP_WALLET` побеждает последняя — с предупреждением, чтобы
-        расхождение не пришлось искать глазами.
-
-        Модуль, которому нужна другая песочница, не включаем даже по явной
-        просьбе (MODULE_REQUIRES_SANDBOX): он всё равно не заработал бы, а
-        «включён и молча ничего не делает» хуже, чем «не включён» — оператор
-        считает, что секреты защищены. Отказ — громкий."""
-        if raw is None:
-            names = ("wallet",) if sandbox == "bwrap" else ()
-        else:
-            names = cls._parse_modules(raw)
-        if wallet_raw is not None:
-            want = cls._parse_bool(wallet_raw)
-            if want and "wallet" not in names:
-                names = (*names, "wallet")
-            elif not want and "wallet" in names:
-                if raw is not None and "wallet" in cls._parse_modules(raw):
-                    logger.warning(
-                        "MODULES содержит 'wallet', но SANDBOX_BWRAP_WALLET=%s — "
-                        "кошелёк ВЫКЛЮЧЕН (явная настройка сильнее). Убери "
-                        "'wallet' из MODULES, чтобы не путать.", wallet_raw,
-                    )
-                names = tuple(n for n in names if n != "wallet")
-        out = []
-        for name in names:
-            need = cls.MODULE_REQUIRES_SANDBOX.get(name)
-            if need is not None and sandbox != need:
-                logger.warning(
-                    "Модуль '%s' НЕ включён: он требует SANDBOX=%s, а сейчас "
-                    "SANDBOX=%s. %s",
-                    name, need, sandbox,
-                    _MODULE_SKIP_HINT.get(name, ""),
-                )
-                continue
-            out.append(name)
-        return tuple(out)
+        Появится второй модуль — здесь же появится его выключатель; общего
+        реестра `MODULES` больше нет (он давал два источника истины для одного
+        кошелька и разъезжался с `SANDBOX_BWRAP_WALLET`)."""
+        want = (
+            cls._parse_bool(wallet_raw) if wallet_raw is not None
+            else sandbox == "bwrap"
+        )
+        if not want:
+            return ()
+        if sandbox != "bwrap":
+            logger.warning(
+                "Кошелёк НЕ включён: он требует SANDBOX=bwrap, а сейчас "
+                "SANDBOX=%s. %s", sandbox, _WALLET_SKIP_HINT,
+            )
+            return ()
+        return ("wallet",)
 
     @staticmethod
     def _parse_sandbox(raw: str) -> str:
