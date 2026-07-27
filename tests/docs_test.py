@@ -114,6 +114,32 @@ def test_box_cli_surface_is_documented():
     print(f"OK docs/BOX.md описывает все {len(flags)} флагов и подкоманды claude-box")
 
 
+def test_vm_boundaries_match_code():
+    """Границы microVM в доке описаны так же, как их реализует код.
+
+    Живой случай: дока (и вслед за ней ответ оператору) утверждала, что под
+    `--vm` кошелёк «не работает механически», хотя код умеет там и прокси-секрет
+    (перехват egress), и свой токен (`--env-file`) — не работает только прокол
+    на хостовые креды. Такое расхождение стоит дороже опечатки: оператор не
+    станет пользоваться тем, что дока объявила нерабочим."""
+    src = _read("box_cli", "wallet.py")
+    doc = _read("docs", "BOX.md")
+    # Код: под vm инъекция значения РАБОТАЕТ (отдельная ветка), а прокол — нет.
+    assert "_setup_inject_env_vm" in src, "ветка inject под vm пропала из кода"
+    assert "host-passthrough (обёртки git/gh/curl), а под" in src
+    # Дока: обязана описывать обе стороны, а не только запрет.
+    assert "работает" in doc and "--env-file" in doc, (
+        "BOX.md не описывает, что под --vm работает (прокси-секрет и свой токен)")
+    assert "прокол на хост" in doc, "BOX.md не называет, что именно НЕ работает"
+    # Ставить нужно НАШ форк: у апстрима нет флагов egress, и кошелёк под VM с
+    # ним не заработает. Ссылка на репозиторий форка обязана быть там же, где
+    # инструкция по установке, — иначе человек поставит апстрим и упрётся.
+    assert "github.com/aadegtyarev/agent-vm" in doc, (
+        "BOX.md не ссылается на форк agent-vm, который нужен для --vm")
+    assert "--egress-proxy" in doc, "BOX.md не объясняет, зачем именно форк"
+    print("OK границы microVM в BOX.md совпадают с кодом, форк назван и со ссылкой")
+
+
 def _markdown_files() -> list[Path]:
     return [ROOT / "README.md", *sorted((ROOT / "docs").glob("*.md")),
             ROOT / "box" / "README.md", ROOT / "vault" / "README.md"]
@@ -147,6 +173,7 @@ def main() -> None:
     test_documented_settings_exist_in_code()
     test_every_command_is_documented()
     test_box_cli_surface_is_documented()
+    test_vm_boundaries_match_code()
     test_relative_links_resolve()
     test_readme_leads_to_every_layer()
     print("ALL DOCS OK")

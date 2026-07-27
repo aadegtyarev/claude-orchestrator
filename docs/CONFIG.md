@@ -93,8 +93,10 @@
 
 ## microVM (`SANDBOX=agent-vm`)
 
-Экспериментальный режим: сессии в микровиртуалках через
-[wirenboard/agent-vm](https://github.com/wirenboard/agent-vm), нужен KVM.
+Экспериментальный режим: сессии в микровиртуалках через наш форк
+[aadegtyarev/agent-vm](https://github.com/aadegtyarev/agent-vm) (форк
+[wirenboard/agent-vm](https://github.com/wirenboard/agent-vm)), нужен KVM.
+Установка — [`BOX.md`](BOX.md#установка-microvm).
 Ресурсы, образ и egress задаются переменными `AGENT_VM_*` — они общие с
 `claude-box`, описаны в [`BOX.md`](BOX.md#переменные-окружения). Ограничения
 режима — [`agent-vm-integration.md`](agent-vm-integration.md).
