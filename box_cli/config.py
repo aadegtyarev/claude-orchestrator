@@ -15,7 +15,8 @@
     engine = "bwrap"     # bwrap | off | agent-vm (он же --vm)
     profile = "work"     # имя профиля; "" — без профиля
     wallet = true        # true — все секреты, доступные claude-box по policy;
-                         # "имя" — конкретный секрет
+                         # "имя" — конкретный секрет; false — выключить
+                         # (под bwrap кошелёк включён и без этой строки)
     secrets = "~/.config/claude-orchestrator/secrets.toml"
 
 Файла нет — поведение ровно как раньше. Неизвестный ключ или мусорное значение —
@@ -56,7 +57,8 @@ class BoxDefaults:
 
     engine: str | None = None
     profile: str | None = None
-    # str — имя секрета; True — «все, что разрешает policy»; None — не задано.
+    # str — имя секрета; True — «все, что разрешает policy»; False — выключить
+    # явно; None — не задано (тогда решает движок: под bwrap кошелёк включён).
     wallet: str | bool | None = None
     secrets: Path | None = None
 
@@ -108,8 +110,6 @@ def load_defaults(path: Path | None = None) -> BoxDefaults:
             f"{p}: wallet — либо true (все доступные секреты), либо имя секрета "
             f"строкой; получено {wallet!r}."
         )
-    if wallet is False:  # явное «выключено» = как будто не задано
-        wallet = None
 
     return BoxDefaults(
         engine=engine,
@@ -132,6 +132,8 @@ def render(defaults: BoxDefaults) -> str:
         lines.append(f'profile = "{defaults.profile}"')
     if defaults.wallet is True:
         lines.append("wallet = true")
+    elif defaults.wallet is False:
+        lines.append("wallet = false")
     elif isinstance(defaults.wallet, str) and defaults.wallet:
         lines.append(f'wallet = "{defaults.wallet}"')
     if defaults.secrets:

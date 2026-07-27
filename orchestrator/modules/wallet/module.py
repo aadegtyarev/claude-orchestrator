@@ -64,7 +64,7 @@ from vault.secret import (
 # Генератор обёрток общий с CLI claude-box (§5.2): один git-шим на обоих
 # потребителей (box_cli не может импортировать orchestrator.*).
 from vault.shims import SHIM_DIRNAME, git_shim, tool_names, write_shims
-from vault.store import DEFAULT_SECRETS_TOML, SecretStore
+from vault.store import ensure_default_secrets, SecretStore
 
 from .host import OrchestratorVaultHost
 from vault.policy import PolicyEditor, PolicyError
@@ -423,22 +423,14 @@ class WalletModule:
 
     def _write_default_secrets(self) -> None:
         """Создать secrets.toml с дефолтным host-passthrough (gh/git/ssh/scp на
-        все сессии), чтобы кошелёк работал «из коробки». Пишем 0600 через
-        O_EXCL (ни мгновения без прав); гонку/недоступный каталог не роняем."""
+        все сессии), чтобы кошелёк работал «из коробки». Сама запись — в
+        vault.store: тот же дефолт создаёт и claude-box, и расходиться им нельзя."""
         path = self.config.wallet_secrets_file
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(DEFAULT_SECRETS_TOML)
+        if ensure_default_secrets(path):
             logger.info(
                 "wallet: создан дефолтный %s — прокол на хост gh/git/ssh/scp для "
                 "всех сессий (правь через /wallet или руками)", path,
             )
-        except FileExistsError:
-            pass  # появился параллельно — просто загрузим существующий
-        except OSError as e:
-            logger.error("wallet: не удалось создать дефолтный %s: %s", path, e)
 
     @staticmethod
     def _discard(seq: list, item) -> None:

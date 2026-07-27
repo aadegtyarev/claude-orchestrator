@@ -241,6 +241,10 @@ class Options:
     # полем, а не «звёздочкой» в wallet: имя секрета и «все секреты» — разные
     # вещи, и склеивать их в одну строку значит однажды перепутать.
     wallet_all: bool = False
+    # Кошелёк включён УМОЛЧАНИЕМ (движок изолирует, явного отказа не было), а не
+    # просьбой оператора. Разница в строгости: попросили и не вышло — честный
+    # отказ; включили сами и секретов нет — молча работаем без кошелька.
+    wallet_auto: bool = False
     secrets: Path | None = None
     profile: str | None = None  # имя профиля (CLAUDE_CONFIG_DIR/HOME-редирект)
     prompt: str | None = None  # -p <промпт>: unattended (None — интерактив)
@@ -383,16 +387,23 @@ def parse_args(argv: Sequence[str], defaults: BoxDefaults | None = None) -> Opti
         profile = defaults.profile
     if profile == "":
         profile = None  # `--profile ""` — «в этот раз без профиля»
+    wallet_auto = False
     if wallet == "":
         # Симметрично `--profile ""`: пустое значение флага — осознанное «в этот
         # раз без кошелька». Без этого умолчание из файла нельзя было отключить,
         # не правя файл, а флаг переставал быть сильнее файла.
         wallet, wallet_all = None, False
-    elif not (wallet or wallet_all) and defaults.wallet is not None:
+    elif not (wallet or wallet_all):
         if isinstance(defaults.wallet, str):
             wallet = defaults.wallet
-        else:
+        elif defaults.wallet is True:
             wallet_all = True
+        elif defaults.wallet is None and engine == "bwrap":
+            # Умолчание: под песочницей кошелёк ВКЛЮЧЁН. Он полезен ровно там,
+            # где есть изоляция (git push и gh работают, значения модель не
+            # видит), а требовать флаг на каждый запуск значит, что им не будут
+            # пользоваться. Выключить: `wallet = false` в файле или `--wallet=`.
+            wallet_all, wallet_auto = True, True
     if secrets is None and defaults.secrets is not None:
         secrets = defaults.secrets
 
@@ -457,7 +468,8 @@ def parse_args(argv: Sequence[str], defaults: BoxDefaults | None = None) -> Opti
     # под --vm), а не парсер, который секрета не видит.
     return Options(
         engine=engine, passthrough=passthrough, wallet=wallet,
-        wallet_all=wallet_all, secrets=secrets, profile=profile, prompt=prompt,
+        wallet_all=wallet_all, wallet_auto=wallet_auto, secrets=secrets,
+        profile=profile, prompt=prompt,
     )
 
 
@@ -838,8 +850,13 @@ async def main_async(argv: Sequence[str]) -> int:
                 arbiter, policy=policy, allow_policy_edit=allow_edit)
         try:
             if opts.wallet_all:
+                # Дефолтную политику создаём только по СВОЕМУ пути. Если оператор
+                # указал файл сам (--secrets или настройка), а файла нет — это его
+                # опечатка или ещё не созданный файл: молча посеять там наш дефолт
+                # значило бы насорить в чужом каталоге.
                 intercept = await setup_wallet_all(
-                    secrets_path=secrets_path, host=host, vm=engine == ENGINE_VM)
+                    secrets_path=secrets_path, host=host, vm=engine == ENGINE_VM,
+                    optional=opts.wallet_auto, may_create=opts.secrets is None)
             else:
                 intercept = await setup_wallet_intercept(
                     opts.wallet, secrets_path=secrets_path, host=host,
@@ -847,21 +864,26 @@ async def main_async(argv: Sequence[str]) -> int:
         except WalletError as e:
             sys.stderr.write(f"claude-box: --wallet: {e}\n")
             return e.code
-        env.update(intercept.env)
-        extra_rw.extend(intercept.extra_rw)
-        # Кошелёк под --vm доставляется НЕ через env (в гостя не течёт), а флагами
-        # форка agent-vm — собрать переопределение для раннера:
-        #   * прокси-секрет → --egress-proxy на наш прокси (LAN-IP) + --egress-ca +
-        #     --allow-egress LAN-IP (public_only гостя иначе режет RFC1918);
-        #   * inject-секрет → --env-file NAME=PATH (значение из файла, не в argv).
-        if intercept.egress_proxy is not None:
-            wallet_vm = {
-                "agent_vm_egress_proxy": intercept.egress_proxy,
-                "agent_vm_egress_ca": intercept.egress_ca,
-                "agent_vm_host_ip": intercept.allow_egress,
-            }
-        elif intercept.env_files:
-            wallet_vm = {"agent_vm_env_files": tuple(intercept.env_files)}
+        # intercept=None бывает только в авто-режиме: кошелёк включён умолчанием,
+        # а поднимать нечего (нет secrets.toml или в нём нет секретов для
+        # claude-box). Это норма, а не сбой, — запускаемся без него.
+        if intercept is not None:
+            env.update(intercept.env)
+            extra_rw.extend(intercept.extra_rw)
+            # Кошелёк под --vm доставляется НЕ через env (в гостя не течёт), а
+            # флагами форка agent-vm — собрать переопределение для раннера:
+            #   * прокси-секрет → --egress-proxy на наш прокси (LAN-IP) +
+            #     --egress-ca + --allow-egress LAN-IP (public_only гостя иначе
+            #     режет RFC1918);
+            #   * inject-секрет → --env-file NAME=PATH (значение из файла, не в argv).
+            if intercept.egress_proxy is not None:
+                wallet_vm = {
+                    "agent_vm_egress_proxy": intercept.egress_proxy,
+                    "agent_vm_egress_ca": intercept.egress_ca,
+                    "agent_vm_host_ip": intercept.allow_egress,
+                }
+            elif intercept.env_files:
+                wallet_vm = {"agent_vm_env_files": tuple(intercept.env_files)}
 
     # try/finally оборачивает ВСЁ после подъёма перехвата (раннер, preflight,
     # build_argv, замер терминала, запуск) — иначе исключение в этом узком окне

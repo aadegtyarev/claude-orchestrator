@@ -16,8 +16,8 @@ except ModuleNotFoundError:  # Python 3.10
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from vault.store import DEFAULT_SECRETS_TOML  # noqa: E402
 from orchestrator.modules.wallet.module import (  # noqa: E402
-    DEFAULT_SECRETS_TOML,
     SecretStore,
     WalletModule,
 )

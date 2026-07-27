@@ -7,7 +7,9 @@
 
 Проверяем контракт:
   • файла нет → поведение ровно прежнее (пустые умолчания, не ошибка);
-  • значения читаются: engine / profile / wallet / secrets;
+  • значения читаются: engine / profile / wallet / secrets, причём
+    `wallet = false` — это «выключить», а не «не задано» (под bwrap кошелёк
+    включён умолчанием);
   • опечатка НЕ применяется молча: неизвестный ключ, кривой тип, битый TOML →
     отказ с объяснением (иначе `engine = "bwarp"` тихо запустил бы не там);
   • флаг сильнее файла всегда, а `--profile ""` — «в этот раз без профиля»
@@ -57,8 +59,9 @@ def test_values_are_read():
     assert d.secrets == Path("~/s.toml").expanduser(), d.secrets
     # wallet может быть именем секрета
     assert load_defaults(_write('wallet = "gh"\n')).wallet == "gh"
-    # ...а false = «не задано» (не хочу кошелёк по умолчанию)
-    assert load_defaults(_write("wallet = false\n")).wallet is None
+    # ...а false — это ЯВНОЕ «выключить», не «не задано»: под bwrap кошелёк
+    # включён умолчанием, и различать эти два состояния обязательно.
+    assert load_defaults(_write("wallet = false\n")).wallet is False
     print("OK читаются engine/profile/wallet/secrets, wallet=false ≡ не задано")
 
 
@@ -103,6 +106,39 @@ def test_file_defaults_apply_when_no_flags():
     assert boxed.wallet_all and boxed.secrets == Path("/tmp/s.toml")
     assert boxed.engine == "bwrap", "движок по умолчанию не изменился"
     print("OK без флагов применяются значения файла")
+
+
+def test_wallet_is_on_by_default_under_sandbox():
+    """Кошелёк включён по умолчанию там, где есть песочница.
+
+    Он полезен ровно в связке с изоляцией (git push и gh работают, значения
+    модель не видит), а требовать флаг на каждый запуск значит, что им не будут
+    пользоваться. Под `off` и microVM не включаем: там он либо не страхует, либо
+    механически не работает."""
+    assert cli.parse_args([], BoxDefaults()).wallet_all, "bwrap → кошелёк включён"
+    assert cli.parse_args([], BoxDefaults()).wallet_auto, "включён умолчанием"
+    for engine in ("off", "agent-vm"):
+        opts = cli.parse_args(["--engine", engine], BoxDefaults())
+        assert not opts.wallet_requested, f"{engine}: кошелёк включаться не должен"
+    # Явное «нет» в файле сильнее умолчания...
+    assert not cli.parse_args([], BoxDefaults(wallet=False)).wallet_requested
+    # ...и разовое «нет» флагом тоже.
+    assert not cli.parse_args(["--wallet="], BoxDefaults()).wallet_requested
+    # Имя секрета в файле остаётся именем, а не «всё подряд».
+    named = cli.parse_args([], BoxDefaults(wallet="gh"))
+    assert named.wallet == "gh" and not named.wallet_all and not named.wallet_auto
+    print("OK кошелёк по умолчанию: bwrap да, off/vm нет, отказ сильнее умолчания")
+
+
+def test_wallet_false_survives_roundtrip():
+    """`wallet = false` обязан пережить запись-чтение: иначе «выключил» молча
+    превращалось бы в «не задано», то есть снова включено."""
+    from box_cli.config import render, save
+    d = Path(tempfile.mkdtemp(prefix="box-config-off-")) / "config.toml"
+    save(BoxDefaults(wallet=False), d)
+    assert "wallet = false" in render(BoxDefaults(wallet=False))
+    assert load_defaults(d).wallet is False, load_defaults(d)
+    print("OK wallet = false переживает запись и чтение")
 
 
 def test_wallet_from_file_needs_isolation():
@@ -195,6 +231,8 @@ def main() -> None:
     test_typos_are_refused_loudly()
     test_flag_beats_file()
     test_file_defaults_apply_when_no_flags()
+    test_wallet_is_on_by_default_under_sandbox()
+    test_wallet_false_survives_roundtrip()
     test_wallet_from_file_needs_isolation()
     test_bad_engine_in_file_names_the_file()
     test_config_command_edits_file()
