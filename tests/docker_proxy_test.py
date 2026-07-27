@@ -4,7 +4,9 @@ run --rm (create→attach-стрим→wait→delete — проверка спл
 отсутствие зависаний), privileged отбит, --device пущен, compose доходит до фильтра.
 
 Жёсткий таймаут на каждую команду: если прокси зависнет — тест УПАДёт, не повиснет.
-Мягкий скип, если докер недоступен.
+Мягкий скип, если докер недоступен. За собой убираем ВСЁ: контейнеры по своему
+имени и сеть своего compose-проекта (брошенные сети съедают пул подсетей докера
+оператора — см. шаг 7).
 
 Запуск: .venv/bin/python tests/docker_proxy_test.py
 """
@@ -113,14 +115,23 @@ async def scenario():
         assert code == 0 and "dev-ok" in out, (code, out, err)
         print("OK live: --device /dev/null → пущен")
 
-        # 7) compose доходит до фильтра: сервис с bind /etc → отказ
+        # 7) compose доходит до фильтра: сервис с bind /etc → отказ.
+        # Имя проекта задаём ЯВНО (-p): иначе compose берёт его из имени
+        # временного каталога, и созданная им сеть `tmpXXXX_default` остаётся
+        # после теста навсегда — за прогоны их накопилось два десятка, пока у
+        # докера не кончились подсети («all predefined address pools have been
+        # fully subnetted»): тогда compose падает на СОЗДАНИИ СЕТИ, до нашего
+        # фильтра, и тест начинает врать. Известное имя = предсказуемая уборка
+        # в finally.
         if _compose_ok():
             (work / "docker-compose.yml").write_text(
                 f"services:\n  bad:\n    image: {IMG}\n    entrypoint: echo hi\n"
                 f"    volumes:\n      - /etc:/x\n"
             )
-            code, out, err = await _docker(["compose", "up", "--abort-on-container-exit"],
-                                           sock, cwd=str(work))
+            code, out, err = await _docker(
+                ["compose", "-p", tag, "up", "--abort-on-container-exit"],
+                sock, cwd=str(work),
+            )
             assert code != 0 and "docker-proxy" in err, (code, err)
             print("OK live: compose с bind /etc → отказ (фильтр видит create от compose)")
         else:
@@ -132,6 +143,11 @@ async def scenario():
         ids = _real(["ps", "-aq", "--filter", f"name={tag}"]).stdout.decode().split()
         if ids:
             _real(["rm", "-f", *ids])
+        # Сеть, созданную compose до отказа фильтра, убираем САМИ: `compose down`
+        # ходил бы через прокси и мог упереться в тот же фильтр, а брошенная сеть
+        # ест подсеть из пула докера оператора. Своё имя проекта — только свои
+        # сети; чужие compose-проекты не трогаем.
+        _real(["network", "rm", f"{tag}_default"])
 
 
 def main():
