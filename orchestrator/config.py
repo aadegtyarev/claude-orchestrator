@@ -136,7 +136,7 @@ class Config:
     # КАЖДОЙ сессии свой тонкий прокси-фильтр над docker.sock (per-session
     # изоляция) — внутрь биндится прокси-сокет на /run/docker.sock, настоящий
     # скрыт. Прокси пускает bind только под папкой проекта ЭТОЙ сессии + устройства,
-    # режет систему/секреты/escape (см. modules/docker, [[docker-in-sandbox]]).
+    # режет систему/секреты/escape (см. modules/docker и docs/CONFIG.md).
     # По аналогии с sandbox_bwrap_wallet — фича именно bwrap-песочницы.
     sandbox_docker: bool
     # Раннер agent-vm (SANDBOX=agent-vm): ресурсы и пин образа гостя.
@@ -269,7 +269,13 @@ class Config:
         # LAN-адрес хоста: изнутри VM «127.0.0.1» указывал бы на сам гость.
         # Раннер к такому адресу добавляет `--allow-egress` (иначе RFC1918
         # запрещён политикой public_only). См. host_lan_ip.
-        agent_vm_host_ip = host_lan_ip() if sandbox == "agent-vm" else None
+        # Адрес хоста «глазами гостя». Обычно определяется сам (src маршрута по
+        # умолчанию), но авто-выбор промахивается при VPN/нескольких интерфейсах,
+        # и тогда оператору нужен ручной путь — иначе сессия в VM молча не
+        # достучится до прокси и оркестратора.
+        agent_vm_host_ip = None
+        if sandbox == "agent-vm":
+            agent_vm_host_ip = os.getenv("AGENT_VM_HOST_IP", "").strip() or host_lan_ip()
         if sandbox == "agent-vm":
             claude_env, unreachable = cls._rewrite_env_for_guest(
                 claude_env, agent_vm_host_ip
