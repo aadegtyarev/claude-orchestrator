@@ -10,6 +10,8 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• <code>/new &lt;имя&gt;</code> — новая сессия; имя можно с пробелами/эмодзи\n"
             "• <code>/new /путь</code> — сессия в директории (создастся, если нет)\n"
             "• <code>/new имя /путь</code> — то же, со своим именем\n"
+            "• <code>--box off</code> к любому <code>/new</code> — сессия без изоляции "
+            "(движки: {boxes})\n"
             "• <code>/list</code> — сессии со статусами и кнопками\n"
             "• <code>/ls [путь]</code> — показать файлы\n"
             "• <code>/bg</code> — фоновые процессы/кроны сессии (в топике)\n"
@@ -49,7 +51,12 @@ MESSAGES: dict[str, dict[str, str]] = {
         "bash_timeout": "⏱ таймаут — процесс мог остаться работать в фоне. /bashin чтобы досыпать ввод.",
         "bash_not_running": "В этом топике нет открытого /bash. Запусти командой /bash &lt;команда&gt;.",
         "bashin_sent": "⌨️ Отправил в терминал: <code>{text}</code>",
-        "new_usage": "Укажи имя или путь:\n/new my-project\n/new /home/user/project",
+        "new_usage": "Укажи имя или путь:\n/new my-project\n/new /home/user/project\n/new my-project --box off — без изоляции",
+        "box_unknown": "❌ Не понял --box {value}. Допустимо: {choices}.",
+        "box_unavailable": "❌ Изоляция «{box}» недоступна: {reason}",
+        "box_created": "\n🔓 Изоляция сессии: {box} (по умолчанию — {default}).",
+        "box_created_no_wallet": "\n⚠️ Кошелёк в этой сессии НЕ работает: без bwrap модель ходит по хосту с твоими правами — видит и файл секретов, и доступы соседних сессий.",
+        "box_mark": " 🔓 {box}",
         "name_exists": "Сессия «{name}» уже существует.",
         "limit_reached": "Достигнут лимит сессий ({limit}).",
         "creating": "🔄 Создаю сессию…",
@@ -297,6 +304,8 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• <code>/new &lt;name&gt;</code> — new session; the name may contain spaces/emoji\n"
             "• <code>/new /path</code> — session in a directory (created if missing)\n"
             "• <code>/new name /path</code> — same, with a custom name\n"
+            "• <code>--box off</code> with any <code>/new</code> — session without "
+            "isolation (engines: {boxes})\n"
             "• <code>/list</code> — sessions with statuses and buttons\n"
             "• <code>/ls [path]</code> — list files\n"
             "• <code>/bg</code> — session background processes/crons (in a topic)\n"
@@ -336,7 +345,12 @@ MESSAGES: dict[str, dict[str, str]] = {
         "bash_timeout": "⏱ timeout — the process may still be running in the background. Use /bashin to send input.",
         "bash_not_running": "No open /bash in this topic. Start one with /bash &lt;command&gt;.",
         "bashin_sent": "⌨️ Sent to terminal: <code>{text}</code>",
-        "new_usage": "Provide a name or a path:\n/new my-project\n/new /home/user/project",
+        "new_usage": "Provide a name or a path:\n/new my-project\n/new /home/user/project\n/new my-project --box off — no isolation",
+        "box_unknown": "❌ Unknown --box {value}. Allowed: {choices}.",
+        "box_unavailable": "❌ Isolation “{box}” is unavailable: {reason}",
+        "box_created": "\n🔓 Session isolation: {box} (default is {default}).",
+        "box_created_no_wallet": "\n⚠️ The wallet does NOT work in this session: without bwrap the model roams the host with your rights — it sees the secrets file and other sessions' access.",
+        "box_mark": " 🔓 {box}",
         "name_exists": "Session “{name}” already exists.",
         "limit_reached": "Session limit reached ({limit}).",
         "creating": "🔄 Creating session…",

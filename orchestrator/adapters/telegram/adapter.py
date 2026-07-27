@@ -502,14 +502,14 @@ class TelegramAdapter:
         if message.message_thread_id is not None:
             await message.reply(self.t("only_main_chat"))
             return
-        title, project_path = self.core.parse_new_args(command.args or "")
+        title, project_path, box = self.core.parse_new_args(command.args or "")
         if not title:
             await message.reply(self.t("new_usage"))
             return
         title = title[:128]  # предел названия топика в Telegram
         status = await message.reply(self.t("creating"))
         try:
-            session = await self.core.create_session(title, project_path)
+            session = await self.core.create_session(title, project_path, box)
         except UserError as e:
             await status.edit_text(self.t("create_fail", error=e))
             return
@@ -517,7 +517,11 @@ class TelegramAdapter:
             logger.exception("Ошибка создания сессии %s", title)
             await status.edit_text(self.t("create_fail", error=e))
             return
-        await status.edit_text(self.t("created", name=session.title))
+        # Без parse_mode: имя сессии задаёт пользователь, «<» в нём сломал бы
+        # HTML-разбор уже СОЗДАННОЙ сессии (тексты про изоляцию — тоже простые).
+        await status.edit_text(
+            self.t("created", name=session.title) + self.core.box_note(session)
+        )
 
     async def cmd_list(self, message: Message) -> None:
         if not self._accept(message):
@@ -537,6 +541,7 @@ class TelegramAdapter:
             line = f"{status} — {s.title}"
             if s.model:
                 line += f" [{s.model}]"
+            line += self.core.box_mark(s)
             if s.running:
                 uptime = self.core.fmt_duration(time.time() - s.started_at)
                 line += ", " + self.t("uptime", uptime=uptime)

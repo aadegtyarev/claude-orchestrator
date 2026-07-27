@@ -171,6 +171,13 @@ class Config:
     # включено. WALLET_POLICY_EDIT=0 — только просмотр, правки лишь host-файлом.
     wallet_policy_edit: bool
 
+    def guest_orch_host_for(self, engine: str) -> str:
+        """То же, что `guest_orch_host`, но для КОНКРЕТНОГО движка сессии.
+
+        Движок теперь выбирается на сессию (`/new … --box`), поэтому адрес
+        оркестратора «глазами сессии» зависит от неё, а не только от SANDBOX."""
+        return AGENT_VM_GUEST_HOST if engine == "agent-vm" else self.orch_host
+
     @property
     def guest_orch_host(self) -> str:
         """Адрес оркестратора С ТОЧКИ ЗРЕНИЯ СЕССИИ (гостя) — для `.mcp.json`
@@ -179,8 +186,50 @@ class Config:
         адресов. Под agent-vm гость VM не видит хостовый loopback → имя
         host-gateway (`AGENT_VM_GUEST_HOST`); под bwrap/off — общий loopback
         `orch_host`. reply-сервер биндится на `orch_host` (host-side) — оно
-        host-resolvable, а guest-facing имя резолвится только внутри гостя."""
-        return AGENT_VM_GUEST_HOST if self.sandbox == "agent-vm" else self.orch_host
+        host-resolvable, а guest-facing имя резолвится только внутри гостя.
+
+        Для сессии с собственным движком берут `guest_orch_host_for(engine)`."""
+        return self.guest_orch_host_for(self.sandbox)
+
+    # ── выбор движка изоляции на сессию (флаг --box у /new) ─────────────
+
+    # Синонимы значений флага. Держим отдельно от _parse_sandbox: тот разбирает
+    # .env и падает SystemExit'ом, а это ввод пользователя в чате.
+    BOX_ALIASES = {
+        "off": "off", "none": "off", "no": "off", "0": "off", "false": "off",
+        "bwrap": "bwrap", "box": "bwrap",
+        "vm": "agent-vm", "agent-vm": "agent-vm", "agentvm": "agent-vm",
+        "microvm": "agent-vm",
+    }
+
+    @classmethod
+    def parse_box(cls, raw: str) -> str | None:
+        """Значение флага `--box` → имя движка (None = не распознано)."""
+        return cls.BOX_ALIASES.get(raw.strip().lower())
+
+    def box_choices(self) -> tuple[str, ...]:
+        """Движки, которые эта сборка оркестратора умеет дать сессии.
+
+        `bwrap`/`off` доступны всегда: им не нужно ничего, что делается ОДИН раз
+        на старте. `agent-vm` — только если он и есть SANDBOX: под него конфиг
+        перестраивается на старте (LAN-адрес хоста в CLAUDE_ENV_*, guest-имя
+        оркестратора, отключённые /stats и кошелёк), и включить его одной сессии
+        задним числом нельзя — она поднялась бы с адресами хоста, недостижимыми
+        из гостя. Порядок: первым — дефолт (SANDBOX)."""
+        rest = [e for e in ("bwrap", "off") if e != self.sandbox]
+        return (self.sandbox, *rest)
+
+    def box_reject_reason(self, engine: str) -> str | None:
+        """Почему этот движок нельзя выбрать сессии (None = можно)."""
+        if engine in self.box_choices():
+            return None
+        if engine == "agent-vm":
+            return (
+                "движок agent-vm настраивается на старте оркестратора "
+                "(LAN-адрес хоста для гостя, guest-адреса, транскрипт внутри VM) "
+                "— включить его одной сессии нельзя: задай SANDBOX=agent-vm."
+            )
+        return f"движок {engine} недоступен"
 
     def docker_sock_path(self, session_name: str) -> Path:
         """Путь unix-сокета per-session docker-прокси. В runtime-каталоге (tmpfs),
@@ -458,6 +507,8 @@ class Config:
         # Синонимы «выключено».
         if mode in ("off", "none", "0", "false", "no"):
             return "off"
+        if mode == "vm":  # тот же синоним, что у флага --box (BOX_ALIASES)
+            return "agent-vm"
         if mode in ("bwrap", "agent-vm"):
             return mode
         raise SystemExit(f"SANDBOX={raw!r} — допустимо: bwrap | agent-vm | off")

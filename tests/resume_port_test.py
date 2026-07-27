@@ -24,6 +24,7 @@ class FakeSession:
         self.claude_session_id = "old"
         self.session_dir = Path("/tmp")
         self.linked_path = None
+        self.sandbox = None  # движок изоляции = дефолт .env (флаг --box не задан)
         self.running = False
         self.watcher = None
         self.started_at = 0.0
