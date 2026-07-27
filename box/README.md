@@ -39,32 +39,12 @@ handle.driver_thread.join(timeout=5)   # дослать буфер PTY и зак
 `box_cli` — тонкий app-слой поверх `box` + Engine (`orchestrator.runners`):
 собирает argv, заворачивает движком, отдаёт терминал. Запуск — `bin/claude-box`.
 
-```
-claude-box [--engine bwrap|off|agent-vm] [--vm] [--profile <имя>]
-           [--wallet <секрет> [--secrets <файл>]] [-p <промпт>] [-- <аргументы claude>]
-  --engine bwrap    файловая песочница bubblewrap (по умолчанию)
-  --engine off      без изоляции
-  --engine agent-vm | --vm   microVM через agent-vm (KVM)
-  --profile <имя>   изолированная идентичность claude: свой CLAUDE_CONFIG_DIR и,
-                    под bwrap, свой $HOME; реальные ~/.claude/~/.ssh скрыты
-  --wallet <секрет> перехват под секрет: прокси-секрет → MITM TLS, host/inject →
-                    PATH-шимы (git/gh/curl уходят на хост через кошелёк)
-  -p <промпт>       unattended: без интерактива, вопросы кошелька → deny+log
-  --               всё после — сквозные аргументы claude
-
-Подкоманды: init <имя> (создать профиль), profile [rm <имя>] (список/удалить).
-Не реализовано (следующий трек): connect (коннекторы Vault — нужен OAuth-флоу).
-```
-
-Границы движков честно проговорены в `--help` (напр. `--profile`/`--wallet` под
-`--vm` отвергаются кодом 2: agent-vm игнорирует `CLAUDE_CONFIG_DIR` и MITM-ит
-egress сам). Профили — `box_cli/profiles.py` (чистый stdlib), кошелёк —
-`box_cli/wallet.py`, арбитр stdin для ASK/confirm в tty — `box_cli/tty.py`.
-
-Окружение: `CLAUDE_BIN` (какой бинарь запускать, дефолт `claude`),
-`CLAUDE_BOX_HOME` (корень профилей, дефолт `~/.local/share/claude-box`),
-`AGENT_VM_*` под `--vm` (ресурсы/образ/egress VM — те же имена, что у
-оркестратора). Все опциональны.
+Флаги, профили, работа с кошельком и границы движков — в руководстве
+[`docs/BOX.md`](../docs/BOX.md); здесь не дублируем, чтобы описание команды не
+разъехалось в двух местах. Устройство: `box_cli/cli.py` (разбор аргументов и
+сборка запуска), `box_cli/profiles.py` (профили, чистый stdlib),
+`box_cli/wallet.py` (перехват под секрет), `box_cli/tty.py` (арбитр stdin —
+единственный владелец fd, через него идут вопросы кошелька в tty).
 
 ## Автономность
 

@@ -12,6 +12,10 @@ if [ "${1:-}" = "--uninstall" ]; then
     systemctl --user disable --now "$SERVICE" 2>/dev/null || true
     rm -f "$UNIT_DIR/$SERVICE.service"
     systemctl --user daemon-reload
+    for cli in claude-box vault wallet; do   # только свои симлинки
+        link="$HOME/.local/bin/$cli"
+        [ -L "$link" ] && [ "$(readlink "$link")" = "$DIR/bin/$cli" ] && rm -f "$link"
+    done
     echo "Готово."
     exit 0
 fi
@@ -30,6 +34,23 @@ if [ ! -f .env ]; then
     cp .env.example .env
     echo "==> Создан .env — заполни TELEGRAM_BOT_TOKEN и ALLOWED_USER_IDS"
 fi
+
+echo "==> CLI в PATH (~/.local/bin): claude-box, vault, wallet"
+# claude-box — базовый слой, им пользуются и без оркестратора; без симлинка
+# человек получает «команда не найдена» и не понимает, что она вообще есть.
+mkdir -p "$HOME/.local/bin"
+for cli in claude-box vault wallet; do
+    link="$HOME/.local/bin/$cli"
+    if [ -e "$link" ] && [ ! -L "$link" ]; then
+        echo "    пропускаю $link — это обычный файл, не трогаю"
+        continue
+    fi
+    ln -sfn "$DIR/bin/$cli" "$link"
+done
+case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *) echo "    ВНИМАНИЕ: $HOME/.local/bin не в PATH — добавь его в ~/.profile" ;;
+esac
 
 echo "==> systemd user-сервис"
 # PATH юнита: каталог с бинарём claude определяем по факту (npm-global,

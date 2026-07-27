@@ -1,18 +1,24 @@
 """Документация не разошлась с кодом (и сама с собой).
 
-Проза не тестируется, но у неё есть проверяемые обещания: справочник настроек
-обязан перечислять ВСЕ параметры `.env`, руководство — все команды бота, а
-ссылки между документами обязаны вести на существующие файлы. Всё это молча
-протухает при первой же правке кода: параметр добавили — в доке его нет, файл
-переименовали — ссылка ведёт в пустоту. Живой случай (2026-07): `.env`-параметр
-`SANDBOX_BWRAP_DOCKER` работал и был описан только в комментариях кода, а
-README обещал `AGENT_VM_HOST_IP`, которого оркестратор не читал вовсе.
+Проза не тестируется, но у неё есть проверяемые обещания: каждый параметр и
+каждая команда должны быть описаны — и ровно в той доке своего слоя, где их
+ищут. Всё это молча протухает при первой же правке кода: параметр добавили — в
+доке его нет, файл переименовали — ссылка ведёт в пустоту. Живые случаи
+(2026-07): `.env`-параметр `SANDBOX_BWRAP_DOCKER` работал и был описан только в
+комментариях кода; README обещал `AGENT_VM_HOST_IP`, которого оркестратор не
+читал вовсе; `claude-box` не был описан нигде, кроме `--help`.
+
+Слои и их доки: `claude-box` → docs/BOX.md, кошелёк → docs/WALLET.md,
+оркестратор → docs/ORCHESTRATOR.md + docs/CONFIG.md.
 
 Проверяем:
-  • каждый os.getenv в orchestrator/config.py упомянут в docs/CONFIG.md;
-  • каждая команда Telegram-адаптера упомянута в docs/GUIDE.md;
-  • относительные ссылки в README и docs/*.md ведут на существующие файлы;
-  • README остаётся входом (ссылается на руководство и на доку разработчика).
+  • каждый параметр .env описан в CONFIG.md или BOX.md (движковые переменные
+    принадлежат нижнему слою) и наоборот — дока не обещает того, чего код не
+    читает;
+  • каждая команда Telegram-адаптера описана в ORCHESTRATOR.md;
+  • каждый флаг и подкоманда claude-box описаны в BOX.md;
+  • относительные ссылки во всех доках ведут на существующие файлы;
+  • README остаётся входом и ведёт в доку каждого слоя.
 
 Запуск: .venv/bin/python tests/docs_test.py
 """
@@ -30,8 +36,12 @@ sys.path.insert(0, str(ROOT))
 _NOT_OUR_SETTINGS = {"XDG_RUNTIME_DIR", "HOME", "PATH", "CLAUDE_ENV_"}
 
 
+def _read(*parts: str) -> str:
+    return ROOT.joinpath(*parts).read_text(encoding="utf-8")
+
+
 def _config_env_names() -> set[str]:
-    src = (ROOT / "orchestrator" / "config.py").read_text(encoding="utf-8")
+    src = _read("orchestrator", "config.py")
     # Читаем оба пути: прямой os.getenv и хелпер env_number (числовые настройки).
     names = set(re.findall(r'os\.getenv\(\s*"([A-Z_][A-Z0-9_]*)"', src))
     names |= set(re.findall(r'env_number\(\s*"([A-Z_][A-Z0-9_]*)"', src))
@@ -39,10 +49,12 @@ def _config_env_names() -> set[str]:
 
 
 def test_every_setting_is_documented():
-    doc = (ROOT / "docs" / "CONFIG.md").read_text(encoding="utf-8")
-    missing = sorted(n for n in _config_env_names() if n not in doc)
-    assert not missing, f"параметры .env без описания в docs/CONFIG.md: {missing}"
-    print(f"OK docs/CONFIG.md описывает все {len(_config_env_names())} параметров .env")
+    """Параметр описан в доке своего слоя: настройки оркестратора — в CONFIG.md,
+    движковые (AGENT_VM_*) — в BOX.md, потому что их читает и claude-box."""
+    docs = _read("docs", "CONFIG.md") + _read("docs", "BOX.md")
+    missing = sorted(n for n in _config_env_names() if n not in docs)
+    assert not missing, f"параметры .env без описания в CONFIG.md/BOX.md: {missing}"
+    print(f"OK описаны все {len(_config_env_names())} параметров .env")
 
 
 def test_documented_settings_exist_in_code():
@@ -50,7 +62,7 @@ def test_documented_settings_exist_in_code():
 
     Именно так README обещал `AGENT_VM_HOST_IP` — параметр выглядел рабочим,
     а оркестратор его игнорировал."""
-    doc = (ROOT / "docs" / "CONFIG.md").read_text(encoding="utf-8")
+    doc = _read("docs", "CONFIG.md")
     # Имена параметров в таблицах справочника — в бэктиках, ЗАГЛАВНЫМИ.
     promised = {
         m for m in re.findall(r"`([A-Z][A-Z0-9_]{3,})`", doc)
@@ -69,21 +81,37 @@ def test_documented_settings_exist_in_code():
 
 
 def test_every_command_is_documented():
-    src = (ROOT / "orchestrator" / "adapters" / "telegram" / "adapter.py").read_text(
-        encoding="utf-8")
+    src = _read("orchestrator", "adapters", "telegram", "adapter.py")
     names: set[str] = set()
     # Именно фильтр Command("new", "list"…), а не BotCommand(...) из меню —
     # последний берёт подписи из текстов и дал бы ключи вида menu_new.
     for group in re.findall(r"(?<![A-Za-z])Command\(([^)]*)\)", src):
         names |= set(re.findall(r'"([a-z_]+)"', group))
-    guide = (ROOT / "docs" / "GUIDE.md").read_text(encoding="utf-8")
-    missing = sorted(n for n in names if f"/{n}" not in guide)
-    assert not missing, f"команды без описания в docs/GUIDE.md: {missing}"
-    print(f"OK docs/GUIDE.md описывает все {len(names)} команд бота")
+    doc = _read("docs", "ORCHESTRATOR.md")
+    missing = sorted(n for n in names if f"/{n}" not in doc)
+    assert not missing, f"команды без описания в docs/ORCHESTRATOR.md: {missing}"
+    print(f"OK docs/ORCHESTRATOR.md описывает все {len(names)} команд бота")
+
+
+def test_box_cli_surface_is_documented():
+    """Флаги и подкоманды `claude-box` — в BOX.md.
+
+    Базовый слой раньше документировался только через --help: человек не знал,
+    что CLI вообще существует, пока не наткнётся на него в исходниках."""
+    flags = set(re.findall(r'"(--[a-z-]{3,})"', _read("box_cli", "cli.py")))
+    doc = _read("docs", "BOX.md")
+    missing = sorted(f for f in flags if f not in doc)
+    assert not missing, f"флаги claude-box без описания в docs/BOX.md: {missing}"
+    for sub in ("init", "profile"):
+        assert f"claude-box {sub}" in doc, f"подкоманда {sub} не описана в BOX.md"
+    for env in ("CLAUDE_BIN", "CLAUDE_BOX_HOME"):
+        assert env in doc, f"переменная {env} не описана в BOX.md"
+    print(f"OK docs/BOX.md описывает все {len(flags)} флагов и подкоманды claude-box")
 
 
 def _markdown_files() -> list[Path]:
-    return [ROOT / "README.md", *sorted((ROOT / "docs").glob("*.md"))]
+    return [ROOT / "README.md", *sorted((ROOT / "docs").glob("*.md")),
+            ROOT / "box" / "README.md", ROOT / "vault" / "README.md"]
 
 
 def test_relative_links_resolve():
@@ -100,21 +128,22 @@ def test_relative_links_resolve():
     print("OK все относительные ссылки в документации ведут на существующие файлы")
 
 
-def test_readme_is_the_entry_point():
-    """README — вход для незнакомого человека: он обязан вести и в руководство
-    пользователя, и в доку разработчика, а не заменять их собой."""
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    for target in ("docs/GUIDE.md", "docs/CONFIG.md", "docs/DEVELOPMENT.md"):
+def test_readme_leads_to_every_layer():
+    """README — вход: ведёт в доку каждого слоя, а не заменяет их собой."""
+    readme = _read("README.md")
+    for target in ("docs/BOX.md", "docs/WALLET.md", "docs/ORCHESTRATOR.md",
+                   "docs/CONFIG.md", "docs/DEVELOPMENT.md"):
         assert target in readme, f"README не ведёт в {target}"
-    print("OK README ведёт в руководство, справочник настроек и доку разработчика")
+    print("OK README ведёт в доку каждого слоя")
 
 
 def main() -> None:
     test_every_setting_is_documented()
     test_documented_settings_exist_in_code()
     test_every_command_is_documented()
+    test_box_cli_surface_is_documented()
     test_relative_links_resolve()
-    test_readme_is_the_entry_point()
+    test_readme_leads_to_every_layer()
     print("ALL DOCS OK")
 
 
