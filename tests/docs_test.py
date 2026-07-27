@@ -104,8 +104,13 @@ def test_box_cli_surface_is_documented():
     assert not missing, f"флаги claude-box без описания в docs/BOX.md: {missing}"
     for sub in ("init", "profile"):
         assert f"claude-box {sub}" in doc, f"подкоманда {sub} не описана в BOX.md"
-    for env in ("CLAUDE_BIN", "CLAUDE_BOX_HOME"):
+    for env in ("CLAUDE_BIN", "CLAUDE_BOX_HOME", "CLAUDE_BOX_CONFIG"):
         assert env in doc, f"переменная {env} не описана в BOX.md"
+    # Файл умолчаний — единственный способ настроить CLI без флагов; если его
+    # перестанут описывать, человек снова окажется без ответа на «как задать
+    # профиль по умолчанию».
+    from box_cli.config import DEFAULT_PATH
+    assert DEFAULT_PATH in doc, "путь файла умолчаний не описан в BOX.md"
     print(f"OK docs/BOX.md описывает все {len(flags)} флагов и подкоманды claude-box")
 
 

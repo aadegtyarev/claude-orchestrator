@@ -70,13 +70,14 @@ def test_parse_wallet_and_secrets():
         assert e.code == 2
     else:
         raise AssertionError("--secrets без --wallet должен упасть")
-    # --wallet без значения → отказ код 2.
-    try:
-        cli.parse_args(["--wallet"])
-    except SystemExit as e:
-        assert e.code == 2
-    else:
-        raise AssertionError("--wallet без значения должен упасть")
+    # --wallet без значения — не отказ, а «все секреты, что разрешает policy»
+    # (как у сессии оркестратора): имя обязательным быть перестало.
+    bare = cli.parse_args(["--wallet"])
+    assert bare.wallet is None and bare.wallet_all, bare
+    assert bare.wallet_requested
+    # ...и следующий флаг при этом не съедается как имя секрета.
+    mixed = cli.parse_args(["--wallet", "--engine", "off"])
+    assert mixed.wallet_all and mixed.engine == "off", mixed
 
 
 def test_parse_bad_engine_rejected():

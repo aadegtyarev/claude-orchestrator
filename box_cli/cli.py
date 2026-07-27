@@ -105,6 +105,7 @@ from box.launch import launch
 from box.pty import TERM_COLS, TERM_ROWS
 from orchestrator.runners import Runner, make_runner
 
+from .config import BoxDefaults
 from .tty import StdinArbiter
 
 
@@ -192,6 +193,10 @@ _USAGE = (
     "                   Граница: из env вырезаются кредлы (*TOKEN/*SECRET/*KEY,\n"
     "                   SSH_AUTH_SOCK), остальное окружение хоста наследуется;\n"
     "                   текущий каталог и установка claude остаются видны\n"
+    "  --wallet         без имени — поднять ВСЕ секреты, которые policy разрешает\n"
+    "                   claude-box (набор решает policy, как у сессии\n"
+    "                   оркестратора); прокси-секреты в набор не входят — их\n"
+    "                   называют явно\n"
     "  --wallet <секрет> дать сессии секрет, не показывая его значение:\n"
     "                   прокси-секрет (connector) → перехват TLS (HTTPS_PROXY+CA),\n"
     "                   host/inject-секрет → обёртки git/gh/curl первыми в PATH\n"
@@ -228,9 +233,18 @@ class Options:
     engine: str
     passthrough: list[str]
     wallet: str | None = None
+    # --wallet без имени: поднять всё, что policy разрешает claude-box. Отдельным
+    # полем, а не «звёздочкой» в wallet: имя секрета и «все секреты» — разные
+    # вещи, и склеивать их в одну строку значит однажды перепутать.
+    wallet_all: bool = False
     secrets: Path | None = None
     profile: str | None = None  # имя профиля (CLAUDE_CONFIG_DIR/HOME-редирект)
     prompt: str | None = None  # -p <промпт>: unattended (None — интерактив)
+
+    @property
+    def wallet_requested(self) -> bool:
+        """Запрошен ли кошелёк вообще (конкретным секретом или целиком)."""
+        return self.wallet is not None or self.wallet_all
 
     @property
     def unattended(self) -> bool:
@@ -257,11 +271,16 @@ def _config_dir_from_env() -> Path | None:
 
 
 # ── Разбор аргументов ────────────────────────────────────────────────────────
-def parse_args(argv: Sequence[str]) -> Options:
+def parse_args(argv: Sequence[str], defaults: BoxDefaults | None = None) -> Options:
     """Разобрать argv → Options. Заглушки/ошибки → CliError.
 
     Всё после первого `--` — сквозные аргументы claude (не парсятся здесь).
+
+    defaults — умолчания из файла настроек (box_cli.config); флаг всегда сильнее
+    файла, а `--profile ""` означает «в этот раз без профиля» (иначе умолчание
+    нельзя было бы отключить, не правя файл).
     """
+    defaults = defaults or BoxDefaults()
     argv = list(argv)
     if "--" in argv:
         cut = argv.index("--")
@@ -280,6 +299,9 @@ def parse_args(argv: Sequence[str]) -> Options:
     engine_flag: str | None = None  # что задано явным --engine (None = не задан)
     vm = False  # был ли --vm (короткая форма --engine agent-vm)
     wallet: str | None = None
+    wallet_all = False
+    wallet_flag_given = False  # просили флагом (а не унаследовали из файла)
+    secrets_flag_given = False
     secrets: Path | None = None
     profile: str | None = None
     prompt: str | None = None
@@ -310,11 +332,23 @@ def parse_args(argv: Sequence[str]) -> Options:
             i += 1
             continue
         if key == "--wallet":
-            wallet, i = _value("--wallet", i, inline)
+            # Имя необязательно: `--wallet` без значения — «всё, что policy
+            # разрешает claude-box» (как у сессии оркестратора), `--wallet gh` —
+            # конкретный секрет. Следующий токен считаем значением, только если
+            # он не похож на флаг: иначе `--wallet --engine off` съел бы движок.
+            nxt = opts[i + 1] if i + 1 < len(opts) else None
+            if inline is not None:
+                wallet, i = inline, i + 1
+            elif nxt is not None and not nxt.startswith("-"):
+                wallet, i = nxt, i + 2
+            else:
+                wallet_all, i = True, i + 1
+            wallet_flag_given = True
             continue
         if key == "--secrets":
             raw, i = _value("--secrets", i, inline)
             secrets = Path(raw).expanduser()
+            secrets_flag_given = True
             continue
         if key == "--profile":
             profile, i = _value("--profile", i, inline)
@@ -334,12 +368,49 @@ def parse_args(argv: Sequence[str]) -> Options:
             f"--vm и --engine {engine_flag} несовместимы: --vm — это короткая форма "
             f"--engine {ENGINE_VM}. Оставь что-то одно."
         )
-    engine = ENGINE_VM if vm else (engine_flag or "bwrap")
+    engine = ENGINE_VM if vm else (engine_flag or defaults.engine or "bwrap")
 
     if engine not in ENGINES:
-        raise CliError(f"--engine={engine!r} — допустимо: {' | '.join(ENGINES)}")
-    if secrets is not None and wallet is None:
-        raise CliError("--secrets имеет смысл только с --wallet <секрет>.")
+        where = "--engine" if (engine_flag or vm) else "engine в файле настроек"
+        raise CliError(f"{where}={engine!r} — допустимо: {' | '.join(ENGINES)}")
+
+    # Умолчания из файла — только там, где оператор не сказал иначе флагом.
+    if profile is None and defaults.profile:
+        profile = defaults.profile
+    if profile == "":
+        profile = None  # `--profile ""` — «в этот раз без профиля»
+    if wallet == "":
+        # Симметрично `--profile ""`: пустое значение флага — осознанное «в этот
+        # раз без кошелька». Без этого умолчание из файла нельзя было отключить,
+        # не правя файл, а флаг переставал быть сильнее файла.
+        wallet, wallet_all = None, False
+    elif not (wallet or wallet_all) and defaults.wallet is not None:
+        if isinstance(defaults.wallet, str):
+            wallet = defaults.wallet
+        else:
+            wallet_all = True
+    if secrets is None and defaults.secrets is not None:
+        secrets = defaults.secrets
+
+    # Кошелёк из ФАЙЛА умолчаний под движком без изоляции не поднимаем: оператор
+    # просил «кошелёк, когда есть песочница», а под `off` он не страхует —
+    # процесс и так идёт с его правами и читает secrets.toml напрямую. Явный
+    # `--wallet` остаётся рабочим (это осознанный выбор: аутентифицированный
+    # канал без изоляции), но main_async печатает про него предупреждение.
+    if engine == "off" and (wallet or wallet_all) and not wallet_flag_given:
+        sys.stderr.write(
+            "claude-box: кошелёк из файла настроек НЕ поднят — движок off не даёт "
+            "изоляции, и секреты в такой сессии читаются напрямую.\n"
+        )
+        wallet, wallet_all = None, False
+
+    # Путь к policy без кошелька бессмыслен, но ругаться на это стоит только
+    # когда путь дал ФЛАГ: в файле умолчаний `secrets` — просто «где лежит моя
+    # политика», и запуск без кошелька (или с погашенным выше) он ломать не должен.
+    if secrets is not None and not (wallet or wallet_all):
+        if secrets_flag_given:
+            raise CliError("--secrets имеет смысл только с --wallet.")
+        secrets = None
 
     # Пустой промпт (`-p ''`, `-p=`) — честный отказ, а не запуск claude с пустой
     # задачей: он бы отработал вхолостую, а оператор решил бы, что задача ушла.
@@ -382,7 +453,7 @@ def parse_args(argv: Sequence[str]) -> Options:
     # под --vm), а не парсер, который секрета не видит.
     return Options(
         engine=engine, passthrough=passthrough, wallet=wallet,
-        secrets=secrets, profile=profile, prompt=prompt,
+        wallet_all=wallet_all, secrets=secrets, profile=profile, prompt=prompt,
     )
 
 
@@ -644,7 +715,12 @@ def _write_all(fd: int, data: bytes) -> bool:
 
 
 async def main_async(argv: Sequence[str]) -> int:
-    opts = parse_args(argv)
+    from .config import ConfigError, load_defaults
+    try:
+        defaults = load_defaults()
+    except ConfigError as e:
+        raise CliError(str(e)) from e
+    opts = parse_args(argv, defaults)
     engine = opts.engine
     root = repo_root()
 
@@ -720,9 +796,11 @@ async def main_async(argv: Sequence[str]) -> int:
     # переводится в raw (см. ниже): claude-box в этом режиме — обычная утилита,
     # которая печатает вывод и завершается.
     arbiter = None if opts.unattended else StdinArbiter(0)
-    if opts.wallet is not None:
+    if opts.wallet_requested:
         from .tty import BoxVaultHost, UnattendedVaultHost
-        from .wallet import WalletError, box_policy_access, setup_wallet_intercept
+        from .wallet import (
+            WalletError, box_policy_access, setup_wallet_all, setup_wallet_intercept,
+        )
         if engine == "off":
             sys.stderr.write(
                 "claude-box: --wallet с --engine off: песочницы НЕТ. Модель и так "
@@ -755,9 +833,13 @@ async def main_async(argv: Sequence[str]) -> int:
             host = BoxVaultHost(
                 arbiter, policy=policy, allow_policy_edit=allow_edit)
         try:
-            intercept = await setup_wallet_intercept(
-                opts.wallet, secrets_path=secrets_path, host=host,
-                vm=engine == ENGINE_VM)
+            if opts.wallet_all:
+                intercept = await setup_wallet_all(
+                    secrets_path=secrets_path, host=host, vm=engine == ENGINE_VM)
+            else:
+                intercept = await setup_wallet_intercept(
+                    opts.wallet, secrets_path=secrets_path, host=host,
+                    vm=engine == ENGINE_VM)
         except WalletError as e:
             sys.stderr.write(f"claude-box: --wallet: {e}\n")
             return e.code
