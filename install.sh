@@ -95,6 +95,10 @@ if [ -t 0 ] && [ ! -f "$BOX_CONFIG" ] && [ "${1:-}" != "--no-config" ]; then
     fi
 fi
 
+if [ -f "$BOX_CONFIG" ]; then
+    echo "==> Умолчания claude-box: $BOX_CONFIG (перенастроить — claude-box config)"
+fi
+
 echo "==> systemd user-сервис"
 # PATH юнита: каталог с бинарём claude определяем по факту (npm-global,
 # ~/.local/bin, nvm — у всех по-разному), не хардкодим раскладку.

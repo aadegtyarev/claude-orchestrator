@@ -119,6 +119,35 @@ def load_defaults(path: Path | None = None) -> BoxDefaults:
     )
 
 
+def render(defaults: BoxDefaults) -> str:
+    """Умолчания → текст файла. Пишем только заданное: пустой ключ в файле
+    ничего не значит, а комментарий-шапка объясняет читателю, откуда файл."""
+    lines = [
+        "# Умолчания claude-box (флаг в командной строке всегда сильнее).",
+        "# Меняется командой `claude-box config`; справочник — docs/BOX.md.",
+    ]
+    if defaults.engine:
+        lines.append(f'engine = "{defaults.engine}"')
+    if defaults.profile:
+        lines.append(f'profile = "{defaults.profile}"')
+    if defaults.wallet is True:
+        lines.append("wallet = true")
+    elif isinstance(defaults.wallet, str) and defaults.wallet:
+        lines.append(f'wallet = "{defaults.wallet}"')
+    if defaults.secrets:
+        lines.append(f'secrets = "{defaults.secrets}"')
+    return "\n".join(lines) + "\n"
+
+
+def save(defaults: BoxDefaults, path: Path | None = None) -> Path:
+    """Записать умолчания. Каталог создаётся — иначе первый же `config` требовал
+    бы от человека вручную делать ~/.config/claude-box."""
+    p = path or config_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(render(defaults), encoding="utf-8")
+    return p
+
+
 def _as_str(data: dict, key: str, path: Path) -> str | None:
     value = data.get(key)
     if value is None or isinstance(value, str):

@@ -102,7 +102,7 @@ def test_box_cli_surface_is_documented():
     doc = _read("docs", "BOX.md")
     missing = sorted(f for f in flags if f not in doc)
     assert not missing, f"флаги claude-box без описания в docs/BOX.md: {missing}"
-    for sub in ("init", "profile"):
+    for sub in ("init", "profile", "config"):
         assert f"claude-box {sub}" in doc, f"подкоманда {sub} не описана в BOX.md"
     for env in ("CLAUDE_BIN", "CLAUDE_BOX_HOME", "CLAUDE_BOX_CONFIG"):
         assert env in doc, f"переменная {env} не описана в BOX.md"

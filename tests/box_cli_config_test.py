@@ -20,6 +20,7 @@
 """
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -127,6 +128,67 @@ def test_bad_engine_in_file_names_the_file():
     print("OK кривой движок из файла → отказ, указывающий на файл")
 
 
+def test_config_command_edits_file():
+    """`claude-box config` — способ ПЕРЕнастроить, а не только настроить.
+
+    Раньше умолчания задавались единственный раз — установщиком, и поменять их
+    можно было только правкой файла руками (а если файла ещё нет, ещё и создав
+    каталог). Команда закрывает это: точечно, без интерактива и в CI."""
+    d = Path(tempfile.mkdtemp(prefix="box-config-cmd-")) / "config.toml"
+    keep = os.environ.get("CLAUDE_BOX_CONFIG")
+    os.environ["CLAUDE_BOX_CONFIG"] = str(d)
+    try:
+        assert cli.cmd_config(["engine=off", "wallet=true", "profile=work"]) == 0
+        got = load_defaults(d)
+        assert (got.engine, got.wallet, got.profile) == ("off", True, "work"), got
+        # Пустое значение убирает ключ — иначе «передумал» требовал бы правки файла.
+        assert cli.cmd_config(["profile=", "wallet="]) == 0
+        got = load_defaults(d)
+        assert got.profile is None and got.wallet is None and got.engine == "off"
+        # vm — тот же синоним, что у флага
+        cli.cmd_config(["engine=vm"])
+        assert load_defaults(d).engine == "agent-vm"
+        # show ничего не меняет
+        cli.cmd_config(["show"])
+        assert load_defaults(d).engine == "agent-vm"
+        for bad in (["engien=off"], ["engine=bwarp"], ["profile=bad name"], ["engine"]):
+            try:
+                cli.cmd_config(bad)
+            except SystemExit as e:
+                assert e.code == 2, (bad, e.code)
+            else:
+                raise AssertionError(f"должен был отказать: {bad}")
+        # ...и после отказов файл остался валидным
+        assert load_defaults(d).engine == "agent-vm"
+    finally:
+        if keep is None:
+            os.environ.pop("CLAUDE_BOX_CONFIG", None)
+        else:
+            os.environ["CLAUDE_BOX_CONFIG"] = keep
+    print("OK config: точечная правка, удаление ключа, show, отказы не портят файл")
+
+
+def test_config_command_repairs_broken_file():
+    """Сломанный файл чинится этой же командой, а не только удалением.
+
+    Иначе человек, у которого config.toml не разбирается, оказывался в тупике:
+    claude-box отказывается запускаться (умолчания читаются до аргументов), а
+    команда правки падала бы на том же разборе."""
+    d = Path(tempfile.mkdtemp(prefix="box-config-broken-")) / "config.toml"
+    d.write_text('engine = "off"\nprofile =\n', encoding="utf-8")
+    keep = os.environ.get("CLAUDE_BOX_CONFIG")
+    os.environ["CLAUDE_BOX_CONFIG"] = str(d)
+    try:
+        assert cli.cmd_config(["engine=bwrap"]) == 0
+        assert load_defaults(d).engine == "bwrap"
+    finally:
+        if keep is None:
+            os.environ.pop("CLAUDE_BOX_CONFIG", None)
+        else:
+            os.environ["CLAUDE_BOX_CONFIG"] = keep
+    print("OK config: чинит сломанный файл поверх, а не требует его удалять")
+
+
 def main() -> None:
     test_missing_file_is_not_an_error()
     test_values_are_read()
@@ -135,6 +197,8 @@ def main() -> None:
     test_file_defaults_apply_when_no_flags()
     test_wallet_from_file_needs_isolation()
     test_bad_engine_in_file_names_the_file()
+    test_config_command_edits_file()
+    test_config_command_repairs_broken_file()
     print("ALL BOX-CONFIG OK")
 
 

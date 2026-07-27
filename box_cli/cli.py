@@ -222,6 +222,10 @@ _USAGE = (
     "\nПодкоманды:\n"
     "  init <имя>       создать профиль (идемпотентно) и напечатать путь\n"
     "  profile          список профилей;  profile rm <имя>  удалить профиль\n"
+    "  config           умолчания запуска (движок, кошелёк, профиль): без\n"
+    "                   аргументов — мастер, `config show` — показать,\n"
+    "                   `config engine=off wallet=true` — точечно; пустое\n"
+    "                   значение убирает ключ\n"
     "\nНе реализовано (следующий трек): connect."
 )
 
@@ -983,6 +987,147 @@ def cmd_profile(args: Sequence[str]) -> int:
         f"неизвестный подарг profile «{args[0]}». Доступно: profile, profile rm <имя>.")
 
 
+def cmd_config(args: Sequence[str]) -> int:
+    """`claude-box config` — посмотреть и изменить умолчания запуска.
+
+    Три формы, потому что у них разные потребители:
+      * без аргументов на терминале — мастер (те же вопросы, что задаёт
+        install.sh, но с текущими значениями): перенастроить можно когда угодно,
+        а не только при первой установке;
+      * `config show` (и любой вызов без терминала — CI, пайп) — печать текущего
+        состояния и пути файла, без интерактива;
+      * `config engine=off wallet=true` — точечная правка без вопросов; пустое
+        значение (`profile=`) убирает ключ.
+    """
+    from .config import BoxDefaults, ConfigError, config_path, load_defaults, save
+
+    path = config_path()
+    try:
+        current = load_defaults(path)
+    except ConfigError as e:
+        # Файл сломан — именно эта команда и должна помочь его починить,
+        # поэтому не падаем, а показываем причину и правим поверх.
+        sys.stderr.write(f"claude-box: {e}\n")
+        current = BoxDefaults()
+
+    if args and args[0] == "show":
+        if args[1:]:
+            raise CliError("`config show` не принимает аргументов.")
+        _print_config(current, path)
+        return 0
+
+    if args:
+        try:
+            updated = _apply_settings(current, args)
+        except ValueError as e:
+            raise CliError(str(e)) from e
+    elif sys.stdin.isatty():
+        updated = _ask_config(current)
+    else:
+        _print_config(current, path)
+        return 0
+
+    _print_config(updated, save(updated, path))
+    return 0
+
+
+def _print_config(defaults, path: Path) -> None:
+    from .config import render
+    suffix = "" if path.exists() else " (файла нет — умолчания встроенные)"
+    sys.stdout.write(f"{path}{suffix}\n")
+    sys.stdout.write(render(defaults) if not defaults.empty else "# ничего не задано\n")
+
+
+def _apply_settings(current, args: Sequence[str]):
+    """`ключ=значение` → новые умолчания. Пустое значение убирает ключ."""
+    from dataclasses import replace as _replace
+
+    out = current
+    for arg in args:
+        key, eq, value = arg.partition("=")
+        if not eq:
+            raise ValueError(
+                f"«{arg}» — ожидалось ключ=значение (engine, profile, wallet, "
+                "secrets). Показать текущее: claude-box config show."
+            )
+        key, value = key.strip(), value.strip()
+        if key == "engine":
+            engine = None
+            if value:
+                engine = ENGINE_VM if value in ("vm", ENGINE_VM) else value
+                if engine not in ENGINES:
+                    raise ValueError(
+                        f"engine={value!r} — допустимо: {' | '.join(ENGINES)} (или vm)")
+            out = _replace(out, engine=engine)
+        elif key == "profile":
+            if value:
+                _validate_profile(value)
+            out = _replace(out, profile=value or None)
+        elif key == "wallet":
+            low = value.lower()
+            if low in ("true", "yes", "on", "1"):
+                wallet: str | bool | None = True
+            elif low in ("", "false", "no", "off", "0"):
+                wallet = None
+            else:
+                wallet = value  # имя конкретного секрета
+            out = _replace(out, wallet=wallet)
+        elif key == "secrets":
+            out = _replace(out, secrets=Path(value).expanduser() if value else None)
+        else:
+            raise ValueError(
+                f"неизвестный ключ «{key}». Допустимо: engine, profile, wallet, secrets."
+            )
+    return out
+
+
+def _validate_profile(name: str) -> None:
+    """Имя профиля идёт и в файл настроек, и в путь каталога — проверяем тем же
+    правилом, что и сам запуск, иначе кривое имя ломало бы каждый следующий вызов."""
+    from .profiles import ProfileError, validate_name
+    try:
+        validate_name(name)
+    except ProfileError as e:
+        raise ValueError(str(e)) from e
+
+
+def _ask_config(current):
+    """Мастер: те же вопросы, что при установке, но с текущими значениями."""
+    from dataclasses import replace as _replace
+
+    engine_now = current.engine or "bwrap"
+    answer = input(f"Изоляция по умолчанию [bwrap/off/vm] ({engine_now}): ").strip()
+    engine = engine_now if not answer else (
+        ENGINE_VM if answer in ("vm", ENGINE_VM) else answer)
+    if engine not in ENGINES:
+        raise CliError(f"engine={answer!r} — допустимо: {' | '.join(ENGINES)} (или vm)")
+
+    wallet_now = "да" if current.wallet else "нет"
+    answer = input(
+        f"Кошелёк, когда изоляция есть? [y/n] ({wallet_now}): ").strip().lower()
+    if not answer:
+        wallet = current.wallet
+    elif answer in ("n", "no", "н", "нет"):
+        wallet = None
+    else:
+        wallet = True
+
+    profile_now = current.profile or "общий ~/.claude"
+    answer = input(
+        f"Профиль claude по умолчанию ({profile_now}; «-» — убрать): ").strip()
+    if not answer:
+        profile = current.profile
+    elif answer == "-":
+        profile = None
+    else:
+        try:
+            _validate_profile(answer)
+        except ValueError as e:
+            raise CliError(str(e)) from e
+        profile = answer
+    return _replace(current, engine=engine, wallet=wallet, profile=profile)
+
+
 def subcommand_result(argv: Sequence[str]) -> int | None:
     """Если argv — подкоманда, выполнить её и вернуть код; иначе None (запуск claude).
 
@@ -996,6 +1141,8 @@ def subcommand_result(argv: Sequence[str]) -> int | None:
         return cmd_init(argv[1:])
     if cmd == "profile":
         return cmd_profile(argv[1:])
+    if cmd == "config":
+        return cmd_config(argv[1:])
     if cmd == "connect":
         # Заглушка: коннекторы Vault — отдельный трек. Честный отказ (код 2).
         raise CliError(
