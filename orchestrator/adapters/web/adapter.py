@@ -332,6 +332,9 @@ class WebAdapter:
             "uptime": (
                 self.core.fmt_duration(time.time() - session.started_at) if running else None
             ),
+            # Пометка «изоляция не как у всех» (пусто = дефолтная): сессия без
+            # песочницы работает с правами оператора и это должно быть видно.
+            "box": self.core.box_mark(session).strip(),
         }
 
     def _sessions_info(self) -> list[dict]:
@@ -365,6 +368,8 @@ class WebAdapter:
                 # выключенная фича не должна оставлять артефактов в UI —
                 # кнопка, ведущая к отказу, это ложное обещание.
                 "features": self.core.features(),
+                # Движки изоляции для формы «новая сессия» (первый — дефолт).
+                "boxes": self.core.box_choices(),
             })
             async for msg in ws:
                 if msg.type in (WSMsgType.ERROR, WSMsgType.CLOSE):
@@ -389,8 +394,12 @@ class WebAdapter:
         path = raw_path.strip() or None if isinstance(raw_path, str) else None
         if not title:
             return self._err("title required")
+        # Движок изоляции (флаг --box у /new; в вебе — поле box). Пустое/None =
+        # дефолт .env; неизвестное значение вернёт UserError ниже.
+        raw_box = data.get("box")
+        box = raw_box.strip() or None if isinstance(raw_box, str) else None
         try:
-            session = await self.core.create_session(title, path)
+            session = await self.core.create_session(title, path, box)
         except UserError as e:
             return self._err(str(e))
         except Exception:

@@ -300,7 +300,38 @@ class OrchestratorCore:
 
     # ── команды: жизненный цикл сессий ──────────────────────────
 
-    async def create_session(self, title: str, project_path: str | None = None) -> Session:
+    def resolve_box(self, raw: str | None) -> str | None:
+        """Значение флага `--box` → движок изоляции сессии (None = дефолт .env).
+
+        Разбор и проверка доступности здесь, а не в адаптерах: /new есть и в
+        Telegram, и в вебе, а сообщение об ошибке должно быть одно и на языке
+        бота. Движок, которого эта сборка дать не может, отвергаем С ПРИЧИНОЙ —
+        молча свалиться в дефолт нельзя: оператор считал бы, что сессия
+        изолирована иначе, чем на самом деле."""
+        if raw is None:
+            return None  # флага не было
+        engine = Config.parse_box(raw)
+        choices = ", ".join(
+            "vm" if e == "agent-vm" else e for e in self.config.box_choices()
+        )
+        if engine is None:
+            # Пустое значение (`--box` без аргумента, `--box=`) — тоже отказ:
+            # флаг набран, но непонятно какой движок; молча взять дефолт значит
+            # соврать оператору о том, как изолирована сессия.
+            raise UserError(
+                self.t("box_unknown", value=raw.strip() or "(пусто)", choices=choices)
+            )
+        reason = self.config.box_reject_reason(engine)
+        if reason is not None:
+            raise UserError(self.t("box_unavailable", box=engine, reason=reason))
+        return engine
+
+    async def create_session(
+        self,
+        title: str,
+        project_path: str | None = None,
+        box: str | None = None,
+    ) -> Session:
         """Создать сессию и привязать её ко всем адаптерам (топик и т.п.).
 
         Если адаптер, которому поверхность обязательна (requires_binding —
@@ -316,8 +347,9 @@ class OrchestratorCore:
             raise UserError(self.t("name_exists", name=slug))
         if self.manager.count() >= self.config.max_instances:
             raise UserError(self.t("limit_reached", limit=self.config.max_instances))
+        sandbox = self.resolve_box(box)
         try:
-            session = await self.manager.create(title, project_path)
+            session = await self.manager.create(title, project_path, sandbox)
         except SessionError as e:
             raise UserError(str(e)) from e
         for tr in self._transports():
@@ -516,9 +548,53 @@ class OrchestratorCore:
             if not self.command_available(cmd)
         ]
         return "\n".join(
-            ln for ln in self.t("help").split("\n")
+            ln for ln in self.t("help", boxes=self.box_choices_label()).split("\n")
             if not any(marker in ln for marker in hidden)
         )
+
+    # ── изоляция сессии (флаг --box у /new) ─────────────────────
+
+    @staticmethod
+    def box_name(engine: str) -> str:
+        """Имя движка ДЛЯ ОПЕРАТОРА: agent-vm пишем коротко «vm» — как в флаге."""
+        return "vm" if engine == "agent-vm" else engine
+
+    def box_choices(self) -> list[str]:
+        """Значения `--box`, которые эта сборка примет (первое — по умолчанию).
+        Единый источник для всех адаптеров: предлагать движок, которого нет,
+        значит обещать отказ."""
+        return [self.box_name(e) for e in self.config.box_choices()]
+
+    def box_choices_label(self) -> str:
+        return ", ".join(self.box_choices())
+
+    def box_note(self, session: Session) -> str:
+        """Приписка о нестандартной изоляции сессии (пусто, если движок дефолтный).
+
+        Прозрачность: сессия без песочницы работает с правами оператора — это
+        должно быть видно и при создании, и в /list, а не только в .sessions.json."""
+        engine = self.manager.engine_of(session)
+        if engine == self.config.sandbox:
+            return ""
+        note = self.t(
+            "box_created",
+            box=self.box_name(engine),
+            default=self.box_name(self.config.sandbox),
+        )
+        # Кошелёк работает только под bwrap. В сессии с другим движком он не
+        # просто «выключен»: модель там ходит по хосту с правами оператора и
+        # читает и сам файл секретов, и токены соседних сессий. Оператор вправе
+        # так решить (для того и флаг), но узнать об этом должен СРАЗУ.
+        if "wallet" in self.config.modules and engine != "bwrap":
+            note += self.t("box_created_no_wallet")
+        return note
+
+    def box_mark(self, session: Session) -> str:
+        """Короткая пометка движка для списка сессий (пусто, если дефолтный)."""
+        engine = self.manager.engine_of(session)
+        if engine == self.config.sandbox:
+            return ""
+        return self.t("box_mark", box=self.box_name(engine))
 
     def wallet_command(self, args_str: str) -> str:
         """`/wallet …` — просмотр/правка policy кошелька. Ядро находит модуль
@@ -1098,7 +1174,7 @@ class OrchestratorCore:
             # а честно называем ограничение режима.
             key = (
                 "stats_no_transcript_vm"
-                if self.config.sandbox == "agent-vm"
+                if self.manager.engine_of(session) == "agent-vm"
                 else "stats_no_transcript"
             )
             return self.t(key, header=header, uptime=uptime)
@@ -1212,30 +1288,66 @@ class OrchestratorCore:
         return "\n".join(lines)
 
     @staticmethod
-    def parse_new_args(raw: str) -> tuple[str, str | None]:
-        """Разобрать аргументы «новой сессии» → (отображаемое имя, путь-или-None).
+    def parse_new_args(raw: str) -> tuple[str, str | None, str | None]:
+        """Аргументы «новой сессии» → (имя, путь-или-None, значение --box-или-None).
 
         Поддерживает: имя с пробелами, обрамляющие кавычки, форму `/path`,
-        форму `имя /path` (путь = токен, начинающийся с / или ~).
+        форму `имя /path` (путь = токен, начинающийся с / или ~), и флаг
+        изоляции `--box off` / `--box=off` в ЛЮБОМ месте строки (он вырезается
+        до разбора имени/пути, поэтому имя с пробелами не ломается).
         """
         raw = raw.strip()
-        if len(raw) >= 2 and raw[0] in "\"'" and raw[-1] == raw[0]:
+        quoted = len(raw) >= 2 and raw[0] in "\"'" and raw[-1] == raw[0]
+        # Кавычки вокруг ВСЕЙ строки — просьба взять её как имя буквально:
+        # «--box» внутри них принадлежит имени, а не нам.
+        box = None
+        if not quoted:
+            raw, box = OrchestratorCore._cut_box_flag(raw)
+            quoted = len(raw) >= 2 and raw[0] in "\"'" and raw[-1] == raw[0]
+        if quoted:
             raw = raw[1:-1].strip()
         if not raw:
-            return "", None
+            return "", None, box
 
         def is_path(tok: str) -> bool:
             return tok.startswith("/") or tok.startswith("~")
 
         if is_path(raw):
-            return Path(raw).name, raw
+            return Path(raw).name, raw, box
         tokens = raw.split()
         path_idx = next((i for i, tok in enumerate(tokens) if is_path(tok)), None)
         if path_idx is not None:
             project_path = " ".join(tokens[path_idx:])
             title = " ".join(tokens[:path_idx]) or Path(project_path).name
-            return title, project_path
-        return raw, None
+            return title, project_path, box
+        return raw, None, box
+
+    @staticmethod
+    def _cut_box_flag(raw: str) -> tuple[str, str | None]:
+        """Вырезать `--box <значение>` / `--box=<значение>` из строки аргументов.
+
+        Возвращает (строка без флага, значение-или-None). Значение НЕ проверяем
+        (это делает resolve_box) — здесь только разбор строки. Флаг без значения
+        даёт пустую строку: resolve_box ответит понятной ошибкой, а не молча
+        возьмёт дефолт."""
+        tokens = raw.split()
+        out: list[str] = []
+        box: str | None = None
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            low = tok.lower()
+            if low == "--box":
+                box = tokens[i + 1] if i + 1 < len(tokens) else ""
+                i += 2
+                continue
+            if low.startswith("--box="):
+                box = tok.split("=", 1)[1]
+                i += 1
+                continue
+            out.append(tok)
+            i += 1
+        return (" ".join(out) if box is not None else raw), box
 
     # ── /bash: постоянный терминал мимо Claude ──────────────────
 
@@ -1275,8 +1387,10 @@ class OrchestratorCore:
             # Баш В СЕССИИ → скоуп сессии: та же файловая песочница, что и claude
             # (видит только папку сессии/проекта). agent-vm отдельный /bash не
             # изолирует (одна VM на cwd) — не деградируем молча, отказываем.
-            if not self.manager.runner.supports_prefix:
-                raise UserError(self.t("bash_no_isolation", sandbox=self.config.sandbox))
+            if not self.manager.runner_for(session).supports_prefix:
+                raise UserError(
+                    self.t("bash_no_isolation", sandbox=self.manager.engine_of(session))
+                )
             wrapper = self.manager.sandbox_prefix(
                 chdir=cwd, extra_rw=[cwd, session.session_dir], session=session
             )

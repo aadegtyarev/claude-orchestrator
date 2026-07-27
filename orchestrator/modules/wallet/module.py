@@ -236,7 +236,7 @@ class WalletModule:
         громко предупреждаем. Маршрутизация нескольких сервисов — следующий срез.
         """
         self._proxy_env.pop(session.name, None)
-        if self.proxies is None:
+        if self.proxies is None or not self.applies_to(session):
             return
         names = sorted(
             s.name for s in self.store.load().values()
@@ -318,6 +318,27 @@ class WalletModule:
         нет. Общий примитив с `_redact` — см. `_redact_text`."""
         return _redact_text(text, [s.value for s in self.store.load().values()])
 
+    def applies_to(self, session) -> bool:
+        """Работает ли кошелёк в ЭТОЙ сессии.
+
+        Провода кошелька — окружение процесса claude на хосте, приватный $HOME
+        сессии (там ~/.wallet.json) и шимы в PATH песочницы; всё это даёт только
+        bwrap. Движок теперь выбирается на сессию (`/new … --box`), поэтому
+        глобального MODULE_REQUIRES_SANDBOX мало: сессия с `--box off` под
+        bwrap-оркестратором получила бы вклад кошелька, который в ней не
+        работает (её $HOME — настоящий дом оператора, а не приватный). «Включён
+        и молча ничего не делает» — ровно то, чего мы избегаем: и оператор, и
+        модель считали бы, что секреты идут через кошелёк.
+
+        Ядро недоступно (модуль сконструирован в тестах через __new__) —
+        поведение как раньше, применяем."""
+        engine_of = getattr(
+            getattr(getattr(self, "core", None), "manager", None), "engine_of", None
+        )
+        if engine_of is None:
+            return True
+        return engine_of(session) == "bwrap"
+
     def session_env(self, session) -> dict[str, str]:
         """env для песочницы сессии — чтобы модель писала привычный `$ENV`:
           * shared  → РЕАЛЬНОЕ значение (модель может видеть/использовать);
@@ -326,7 +347,7 @@ class WalletModule:
           * host-passthrough (нет env) → ничего.
         Плюс маркер пути к файлу `<<wallet:имя:file>>` в `$ENV_FILE` (ssh-ключ,
         сертификат) — для inject-секретов."""
-        out = self._env_for(session.name)
+        out = self._env_for(session.name) if self.applies_to(session) else {}
         # Запоминаем ИМЕНА, доехавшие в процесс: env задаётся один раз при старте,
         # и по ним сторож policy поймёт, что живая сессия отстала (см. _watch_policy).
         # Запись НЕобязательна: тесты и внешние потребители конструируют модуль
@@ -494,6 +515,17 @@ class WalletModule:
         session_home смонтирован КАК $HOME процесса claude — CLI найдёт файл по
         ~/.wallet.json без настройки.
         """
+        if not self.applies_to(session):
+            logger.warning(
+                "wallet: сессия %s поднята с изоляцией «%s» — кошелёк в ней НЕ "
+                "работает (нужен bwrap), провижн пропущен. Без песочницы модель "
+                "этой сессии ходит по хосту с правами оператора: ей доступны и "
+                "%s, и провижн соседних сессий — это осознанный выбор оператора "
+                "(флаг --box), но не защита кошелька",
+                session.name, self.core.manager.engine_of(session),
+                self.config.wallet_secrets_file,
+            )
+            return
         cwd = self.core.manager.effective_cwd(session)
         token = self.daemon.issue_token(session.name, cwd)
         path = self.core.manager.session_home(session) / ".wallet.json"
@@ -518,6 +550,8 @@ class WalletModule:
         именно этот путь и кладём в PATH (хостовый .homes/<имя>/.wallet-bin внутри
         песочницы не существует). Возвращаем всегда: файлы наполняются из
         session_hooks уже после старта, а каталог bind-смонтирован живым."""
+        if not self.applies_to(session):
+            return []  # не bwrap: $HOME сессии не подменён, шимов там нет
         return [str(Path.home() / SHIM_DIRNAME)]
 
     def _session_tools(self, session) -> set[str]:

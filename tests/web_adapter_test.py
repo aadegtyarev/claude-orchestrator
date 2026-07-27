@@ -50,6 +50,13 @@ def make_env(tmp: Path):
         def session_status(self, s):
             return "waiting"
 
+        def box_mark(self, s):
+            # Пометка нестандартной изоляции сессии (`--box`); у фейка её нет.
+            return ""
+
+        def box_choices(self):
+            return ["bwrap", "off"]
+
         def fmt_duration(self, sec):
             return "0 мин"
 

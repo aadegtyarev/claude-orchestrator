@@ -90,6 +90,7 @@ def _write_settings(mgr, tmp: Path, session_name="s1"):
 
     session = SimpleNamespace(
         name=session_name, session_dir=tmp, linked_path=None, port=1234,
+        sandbox=None,  # движок сессии = дефолт .env (флаг --box не задан)
     )
     mgr._write_claude_settings(session)
     return json.loads((tmp / ".claude" / "settings.local.json").read_text())

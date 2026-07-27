@@ -112,7 +112,8 @@ function renderSessions() {
     let meta = s.model ? esc(s.model) : "";
     if (s.uptime) meta += (meta ? " · " : "") + esc(s.uptime);
     li.innerHTML = '<span class="s-icon">' + icon + '</span>' +
-      '<span class="s-title" title="' + esc(s.linked_path || "") + '">' + esc(s.title) + "</span>" +
+      '<span class="s-title" title="' + esc(s.linked_path || "") + '">' + esc(s.title) +
+        (s.box ? " " + esc(s.box) : "") + "</span>" +
       (meta ? '<span class="s-model">' + meta + "</span>" : "");
     li.onclick = () => selectSession(s.name);
     els.list.appendChild(li);
@@ -333,6 +334,7 @@ function handleEvent(ev) {
     case "hello":
       sessions = ev.sessions || [];
       applyFeatures(ev.features);
+      applyBoxes(ev.boxes);
       renderSessions();
       // После реконнекта часть событий потеряна — история и бабл переигрываются.
       if (current) {
@@ -477,6 +479,21 @@ function applyFeatures(features) {
   if (btn) btn.hidden = features.stats === false;
 }
 
+// Движки изоляции для формы «новая сессия»: первый — дефолт из .env (его и
+// подписываем как дефолтный). Список приходит с сервера — предлагать движок,
+// которого эта сборка дать не может, значит обещать отказ.
+function applyBoxes(boxes) {
+  const sel = $("new-box");
+  if (!sel || !boxes || !boxes.length) return;
+  sel.innerHTML = "";
+  boxes.forEach((box, i) => {
+    const opt = document.createElement("option");
+    opt.value = box;
+    opt.textContent = i === 0 ? box + " (по умолчанию)" : box;
+    sel.appendChild(opt);
+  });
+}
+
 $("btn-stats").onclick = async () => {
   if (!current) return;
   try {
@@ -615,7 +632,9 @@ $("new-form").addEventListener("submit", async (e) => {
   const path = $("new-path").value.trim();
   if (!title) return;
   try {
-    const s = await postJson("/api/sessions", { title: title, path: path || null });
+    const box = ($("new-box") && $("new-box").value) || null;
+    const s = await postJson(
+      "/api/sessions", { title: title, path: path || null, box: box });
     await fetchSessions();
     selectSession(s.name);
   } catch (err) {

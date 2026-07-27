@@ -59,8 +59,12 @@ class Runner(Protocol):
         ...
 
 
-def make_runner(config: "Config", root: Path) -> Runner:
-    """Раннер по конфигу (валидацию значения SANDBOX делает config.py)."""
+def make_runner(config: "Config", root: Path, engine: str | None = None) -> Runner:
+    """Раннер по конфигу (валидацию значения SANDBOX делает config.py).
+
+    engine задан — раннер под ЭТОТ движок вместо дефолтного `config.sandbox`:
+    движок выбирается на сессию (`/new … --box`, см. Config.box_choices), а
+    остальной конфиг у них общий."""
     from .agentvm import AgentVmRunner
     from .bwrap import BwrapRunner
     from .direct import DirectRunner
@@ -70,4 +74,4 @@ def make_runner(config: "Config", root: Path) -> Runner:
         "agent-vm": lambda: AgentVmRunner(config, root),
         "off": DirectRunner,
     }
-    return registry[config.sandbox]()
+    return registry[engine or config.sandbox]()

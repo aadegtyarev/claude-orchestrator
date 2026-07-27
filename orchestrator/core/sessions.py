@@ -81,6 +81,12 @@ class SessionError(Exception):
     """Ошибка создания/работы сессией — текст показывается пользователю."""
 
 
+@dataclass
+class _EngineProbe:
+    """Заглушка «сессии» для запроса раннера по имени движка (см. runner_for)."""
+    sandbox: str
+
+
 # _DIALOGS/_DialogAnswerer, _ReadyDeadline/READY_* и ядро PTY-запуска (open_pty/
 # start_driver — openpty+winsize и поток-драйвер) переехали в пакет box/
 # (box.dialog, box.ready, box.pty) — самодостаточные launch-хелперы без
@@ -102,6 +108,10 @@ class Session:
     bindings: dict[str, str] = field(default_factory=dict)
     linked_path: str | None = None
     model: str | None = None  # None = модель Claude Code по умолчанию
+    # Движок изоляции ЭТОЙ сессии (флаг `--box` у /new): "bwrap" | "agent-vm" |
+    # "off". None = как в .env (SANDBOX). Выбирается при создании и живёт с
+    # сессией: resume/clear поднимают её тем же движком, что и первый старт.
+    sandbox: str | None = None
     started_at: float = field(default_factory=time.time)
     last_activity: float = field(default_factory=time.time)
     process: asyncio.subprocess.Process | None = None
@@ -142,6 +152,9 @@ class SessionManager:
         self._inflight_ports: set[int] = set()
         # Базовый CPU-отсчёт дерева процессов для вотчдога (см. is_busy).
         self._cpu: dict[str, int] = {}
+        # Раннеры по имени движка изоляции (сессия выбирает свой — см.
+        # engine_of/runner_for); ленивые, без per-session состояния.
+        self._runners: dict[str, runner_mod.Runner] = {}
         # Общий HTTP-пул к channel-серверам (keep-alive, без сессии на запрос —
         # REVIEW.md E1). Ленивый: создаётся в event loop при первом обращении.
         self._http: aiohttp.ClientSession | None = None
@@ -197,6 +210,7 @@ class SessionManager:
                 "title": s.title,
                 "linked_path": s.linked_path,
                 "model": s.model,
+                "sandbox": s.sandbox,
             }
             for s in self._by_name.values()
         ]
@@ -229,6 +243,9 @@ class SessionManager:
                 title=item.get("title", ""),
                 linked_path=item.get("linked_path"),
                 model=item.get("model"),
+                # Записи, созданные до флага --box, движка не помнят → None =
+                # дефолт из .env (их прежнее поведение).
+                sandbox=item.get("sandbox"),
             )
             self._by_name[session.name] = session
             logger.info("Восстановлена запись сессии %s (остановлена)", session.name)
@@ -259,14 +276,25 @@ class SessionManager:
 
     # ── создание ────────────────────────────────────────────────
 
-    async def create(self, title: str, project_path: str | None = None) -> Session:
+    async def create(
+        self,
+        title: str,
+        project_path: str | None = None,
+        sandbox: str | None = None,
+    ) -> Session:
+        """sandbox — движок изоляции ЭТОЙ сессии (флаг `--box`); None = дефолт
+        .env. Готовность движка проверяем ЗДЕСЬ, до создания папок и старта:
+        на старте оркестратора preflight проходил только дефолтный раннер."""
         slug = slugify(title)
+        if sandbox is not None and sandbox != self.config.sandbox:
+            self._check_engine(sandbox)
         session = Session(
             name=slug,
             port=0,
             session_dir=self.config.sessions_dir / slug,
             claude_session_id=str(uuid.uuid4()),
             title=title,
+            sandbox=sandbox,
         )
         async with session.ops:
             # Проверки и регистрация — под общим локом (два /new подряд
@@ -301,22 +329,56 @@ class SessionManager:
             self.save_state()
             return session
 
+    def _check_engine(self, engine: str) -> None:
+        """Движок доступен этому оркестратору и готов к работе? Иначе SessionError
+        с причиной (нет бинаря bwrap, agent-vm требует настройки на старте…)."""
+        reason = self.config.box_reject_reason(engine)
+        if reason is not None:
+            raise SessionError(f"Изоляция «{engine}» недоступна: {reason}")
+        checked = getattr(self, "_engines_ok", None)
+        if checked is None:
+            checked = set()
+            self._engines_ok = checked
+        if engine in checked:
+            return
+        ok, why = self.runner_for(_EngineProbe(engine)).preflight()
+        if not ok:
+            raise SessionError(f"Изоляция «{engine}» не готова: {why}")
+        checked.add(engine)  # preflight движка — один раз за жизнь процесса
+
+    def _guard_engine(self, session: Session) -> None:
+        """Движок сессии всё ещё доступен? Зовётся на КАЖДОМ старте существующей
+        сессии (resume/clear), а не только при создании: движок сохранён в
+        .sessions.json и может стать недоступен между запусками — оператор
+        сменил SANDBOX, и agent-vm остался без своей стартовой обвязки
+        (LAN-адрес хоста, guest-адреса). Такая сессия должна получить внятный
+        отказ ДО побочных эффектов, а не подняться битой."""
+        if session.sandbox is not None and session.sandbox != self.config.sandbox:
+            self._check_engine(session.sandbox)
+
     def _guard_unique_cwd(self, session: Session) -> None:
         """Раннеры с unique_cwd (agent-vm: имя VM = hash(cwd)) не допускают
-        двух сессий на один рабочий каталог — вторая молча убила бы VM первой."""
-        if not getattr(self.runner, "unique_cwd", False):
+        двух сессий на один рабочий каталог — вторая молча убила бы VM первой.
+
+        Сравниваем с сессиями ТОГО ЖЕ движка: bwrap-сессия на том же каталоге
+        VM не поднимает и мешать не может (движок теперь на сессию, `--box`)."""
+        runner = self.runner_for(session)
+        if not getattr(runner, "unique_cwd", False):
             return
+        engine = self.engine_of(session)
         cwd = self.effective_cwd(session)
         clash = next(
             (
                 s for s in self._by_name.values()
-                if s is not session and self.effective_cwd(s) == cwd
+                if s is not session
+                and self.engine_of(s) == engine
+                and self.effective_cwd(s) == cwd
             ),
             None,
         )
         if clash is not None:
             raise SessionError(
-                f"Раннер «{self.runner.name}» допускает одну сессию на каталог: "
+                f"Раннер «{runner.name}» допускает одну сессию на каталог: "
                 f"{cwd} уже занят сессией «{clash.name}»."
             )
 
@@ -411,11 +473,12 @@ class SessionManager:
                 project_dir, ", ".join(concerns),
             )
 
-    def _guest_python(self) -> str:
+    def _guest_python(self, session: Session) -> str:
         """python для channel_server и хук-диспетчера ВНУТРИ песочницы. Под
         agent-vm — системный `python3` гостя (хостового venv там нет; наш код на
-        stdlib, зависимостей не требует), иначе — `sys.executable` (хостовый venv)."""
-        return "python3" if self.config.sandbox == "agent-vm" else sys.executable
+        stdlib, зависимостей не требует), иначе — `sys.executable` (хостовый venv).
+        Движок берём у САМОЙ сессии (`--box`), а не из .env."""
+        return "python3" if self.engine_of(session) == "agent-vm" else sys.executable
 
     def _write_mcp_json(self, session: Session) -> None:
         """Конфиг, по которому Claude Code сам запустит channel_server.py.
@@ -424,10 +487,11 @@ class SessionManager:
         Путь к channel_server.py монтируется в гостя (раннер биндит корень репо
         тем же путём).
         """
+        engine = self.engine_of(session)
         mcp = {
             "mcpServers": {
                 f"channel-{session.name}": {
-                    "command": self._guest_python(),
+                    "command": self._guest_python(session),
                     "args": [str(PKG_DIR / "channel_server.py")],
                     "env": {
                         "CHANNEL_PORT": str(session.port),
@@ -435,13 +499,12 @@ class SessionManager:
                         # docker-style `--publish` не достаёт loopback гостя; под
                         # bwrap: 127.0.0.1 (общий loopback с хостом).
                         "CHANNEL_HOST": (
-                            "0.0.0.0" if self.config.sandbox == "agent-vm"
-                            else "127.0.0.1"
+                            "0.0.0.0" if engine == "agent-vm" else "127.0.0.1"
                         ),
                         "SESSION_NAME": session.name,
                         # guest-facing: под agent-vm — host-gateway имя (см.
                         # Config.guest_orch_host); под bwrap/off — orch_host.
-                        "ORCH_HOST": self.config.guest_orch_host,
+                        "ORCH_HOST": self.config.guest_orch_host_for(engine),
                         "ORCH_PORT": str(self.config.orch_port),
                         "ORCH_TOKEN": self.config.orch_token,
                     },
@@ -494,7 +557,7 @@ class SessionManager:
         # рассинхронизировать поля. Ошибка была бы тихой в обе стороны — правила
         # либо театр без кошелька, либо отсутствуют при активном. Дёшево.
         wallet_active = (
-            "wallet" in self.config.modules and self.config.sandbox == "bwrap"
+            "wallet" in self.config.modules and self.engine_of(session) == "bwrap"
         )
         if wallet_active:
             # Чтение кред-файлов/keyring — жёсткий deny (работает во ВСЕХ режимах,
@@ -560,7 +623,10 @@ class SessionManager:
             )
         )
         os.chmod(hook_script, 0o600)
-        hook_cmd = {"type": "command", "command": f'"{self._guest_python()}" "{hook_script}"'}
+        hook_cmd = {
+            "type": "command",
+            "command": f'"{self._guest_python(session)}" "{hook_script}"',
+        }
         hooks: dict = {"Stop": [{"hooks": [hook_cmd]}]}  # Stop не поддерживает matcher
         if self.config.show_tool_calls:
             hooks["PreToolUse"] = [{"matcher": "", "hooks": [hook_cmd]}]
@@ -576,7 +642,7 @@ class SessionManager:
         # в деле. Файл настроек в гостя монтируется, а блок `env` читает САМ
         # клиент (проверено живьём), поэтому доставляем их так. Под bwrap/off
         # оставляем env процесса — проверенный путь, не трогаем.
-        if self.config.sandbox == "agent-vm" and self.config.claude_env:
+        if self.engine_of(session) == "agent-vm" and self.config.claude_env:
             settings["env"] = dict(self.config.claude_env)
         settings_file = settings_dir / "settings.local.json"
         # 0600: в env-блоке может лежать токен прокси оператора. От МОДЕЛИ он
@@ -605,7 +671,8 @@ class SessionManager:
         # дёрнуть хостовый GUI (диалоги askpass, скриншоты, ввод). CLI-режиму X не
         # нужен; убираем переменные, чтобы клиенты не знали, куда подключаться.
         # SANDBOX_X11=1 оставляет X (если модели он реально нужен).
-        if self.config.sandbox == "bwrap" and not self.config.sandbox_x11:
+        engine = self.engine_of(session)
+        if engine == "bwrap" and not self.config.sandbox_x11:
             for var in ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY"):
                 env.pop(var, None)
         # Пре-старт ресурсов, чей результат нужен env/PATH ниже (wallet: подъём
@@ -640,7 +707,7 @@ class SessionManager:
         # окружении ребёнка значит держать второй источник истины: наш разбор
         # («0/пусто = не задано, флаг не эмитим») агент-vm бы не увидел и взял
         # значение сам. Один источник — наш.
-        if self.config.sandbox == "agent-vm":
+        if engine == "agent-vm":
             from ..runners.agentvm import strip_own_env
             strip_own_env(env)
         env.update(self.config.claude_env)
@@ -699,7 +766,7 @@ class SessionManager:
             # сессии, поэтому реальный ~/.venv и глобальные инструменты не видны —
             # окружение проекта держи В ПРОЕКТЕ (он смонтирован RW). Персистентный
             # дом (.homes/<имя>) переживает рестарты, если агент ставит в ~.
-            if self.config.sandbox == "bwrap" and session.linked_path:
+            if engine == "bwrap" and session.linked_path:
                 logger.info(
                     "Сессия %s: под bwrap $HOME изолирован (реальный ~/.venv не "
                     "виден) — держи окружение в проекте %s (RW) или в ~ сессии "
@@ -720,7 +787,7 @@ class SessionManager:
             extra_rw = [session.session_dir, Path(cwd)]
             # Per-session docker-прокси (если включён) — сокет биндится в песочницу.
             docker_sock = await self._ensure_docker_proxy(session)
-            argv = self.runner.wrap(
+            argv = self.runner_for(session).wrap(
                 [
                     self.config.claude_bin,
                     *session_arg,
@@ -764,7 +831,8 @@ class SessionManager:
         loop = asyncio.get_running_loop()
         # Запас сверх окна тишины нужен только agent-vm: там первый запуск
         # тянет OCI-образ минутами. Под bwrap/off — как раньше, без запаса.
-        cap = READY_TIMEOUT_MAX if self.config.sandbox == "agent-vm" else READY_SILENCE_SEC
+        vm = self.engine_of(session) == "agent-vm"
+        cap = READY_TIMEOUT_MAX if vm else READY_SILENCE_SEC
         deadline = _ReadyDeadline(started_at=loop.time(), cap=cap)
         log_path = session.session_dir / "claude.log"
         http = self._http_session()
@@ -810,7 +878,7 @@ class SessionManager:
                     else f"не уложился в потолок {READY_TIMEOUT_MAX / 60:.0f} мин"
                 )
                 extra = ""
-                if self.config.sandbox == "agent-vm":
+                if vm:
                     extra = (
                         " Под agent-vm первый запуск ещё и тянет OCI-образ "
                         "(минуты) — прогрей заранее: `agent-vm setup`."
@@ -887,6 +955,7 @@ class SessionManager:
             return await self._resume_locked(session)
 
     async def _resume_locked(self, session: Session) -> bool:
+        self._guard_engine(session)
         # Раннеры с unique_cwd (agent-vm): гвард нужен и на resume/clear, не
         # только на create — иначе восстановленные из .sessions.json две сессии
         # на один cwd убьют VM друг друга при первом сообщении.
@@ -936,6 +1005,7 @@ class SessionManager:
     async def clear(self, session: Session) -> None:
         """Перезапустить Claude с чистым контекстом: та же папка, тот же топик."""
         async with session.ops:
+            self._guard_engine(session)  # до остановки процесса и выдачи порта
             await self._stop_process(session, save=False)
             await self._wait_port_free(session.port)
             session.claude_session_id = str(uuid.uuid4())
@@ -1245,14 +1315,39 @@ class SessionManager:
                 return session.session_dir
         return session.session_dir
 
+    def engine_of(self, session: Session | None) -> str:
+        """Движок изоляции сессии: её собственный (флаг `--box`) или дефолт .env.
+
+        ЕДИНСТВЕННЫЙ источник истины «в чём живёт эта сессия»: всё, что раньше
+        смотрело на `config.sandbox` в контексте конкретной сессии (какой python
+        в госте, куда биндить channel-сервер, есть ли кошелёк/docker, сколько
+        ждать готовности), спрашивает здесь. Без сессии (общий /bash оператора,
+        preflight на старте) — дефолт."""
+        if session is None:
+            return self.config.sandbox
+        return session.sandbox or self.config.sandbox
+
+    def runner_for(self, session: Session | None) -> runner_mod.Runner:
+        """Раннер под движок сессии. Кэш по имени движка: раннеры без
+        per-session состояния (argv-обёртка), поэтому переиспользуемы."""
+        engine = self.engine_of(session)
+        # getattr-фолбэк: часть тестов конструирует менеджер через __new__ (без
+        # __init__) — раньше ленивый `self._runner` это допускал, сохраняем.
+        cache = getattr(self, "_runners", None)
+        if cache is None:
+            cache = {}
+            self._runners = cache
+        r = cache.get(engine)
+        if r is None:
+            r = runner_mod.make_runner(self.config, ROOT, engine)
+            cache[engine] = r
+        return r
+
     @property
     def runner(self) -> runner_mod.Runner:
-        """Раннер процессов (bwrap | direct) — ленивый, см. runner.py."""
-        r = getattr(self, "_runner", None)
-        if r is None:
-            r = runner_mod.make_runner(self.config, ROOT)
-            self._runner = r
-        return r
+        """Раннер процессов по ДЕФОЛТНОМУ движку (.env). Для сессии со своим
+        движком — `runner_for(session)`."""
+        return self.runner_for(None)
 
     def session_home(self, session: Session) -> Path:
         """Персистентный приватный $HOME сессии для песочницы.
@@ -1282,7 +1377,7 @@ class SessionManager:
             if session is not None and session.name in self._docker_proxies
             else None
         )
-        return self.runner.wrap(
+        return self.runner_for(session).wrap(
             [], chdir=chdir, extra_rw=extra_rw, home_dir=home_dir, docker_sock=dsock)
 
     # ── per-session docker-прокси (SANDBOX_BWRAP_DOCKER) ────────────────
@@ -1296,7 +1391,7 @@ class SessionManager:
     async def _ensure_docker_proxy(self, session: Session) -> Path | None:
         """Поднять per-session docker-прокси (идемпотентно). Возвращает путь его
         сокета для бинда в песочницу или None, если docker в песочнице выключен."""
-        if not self.config.sandbox_docker or self.config.sandbox != "bwrap":
+        if not self.config.sandbox_docker or self.engine_of(session) != "bwrap":
             return None
         sock = self.config.docker_sock_path(session.name)
         if session.name not in self._docker_proxies:
