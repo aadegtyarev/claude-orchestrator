@@ -38,7 +38,10 @@ try:
 except ModuleNotFoundError:  # Python 3.10
     import tomli as tomllib
 
-import tomlkit
+try:
+    import tomlkit
+except ModuleNotFoundError:  # см. _require_tomlkit
+    tomlkit = None
 
 # под-команда правки списка → ключ в TOML
 _LIST_FIELDS = {"session": "sessions", "cmd": "commands", "deny": "deny"}
@@ -111,18 +114,33 @@ class PolicyEditor:
     def __init__(self, path: Path):
         self.path = path
 
+    @staticmethod
+    def _require_tomlkit():
+        """Правка policy требует tomlkit (сохраняет комментарии оператора), а
+        ЧТЕНИЕ — нет: его делает SecretStore на stdlib-tomllib. Разводим их,
+        чтобы `claude-box` работал без зависимостей проекта: запустить claude в
+        песочнице с секретом можно системным python, а редактор policy —
+        инструмент хоста, ему venv доступен."""
+        if tomlkit is None:
+            raise PolicyError(
+                "правка policy требует пакет tomlkit (pip install tomlkit); "
+                "просмотр и использование секретов работают без него"
+            )
+        return tomlkit
+
     # ── чтение ──────────────────────────────────────────────────
 
-    def _load_doc(self) -> tomlkit.TOMLDocument:
+    def _load_doc(self) -> "tomlkit.TOMLDocument":
+        tk = self._require_tomlkit()
         try:
-            return tomlkit.parse(self.path.read_text(encoding="utf-8"))
+            return tk.parse(self.path.read_text(encoding="utf-8"))
         except FileNotFoundError:
-            return tomlkit.document()
+            return tk.document()
         except Exception as e:  # noqa: BLE001 — любой сбой чтения → понятный текст
             raise PolicyError(f"не читается {self.path}: {e}") from e
 
     @staticmethod
-    def _secrets(doc: tomlkit.TOMLDocument):
+    def _secrets(doc: "tomlkit.TOMLDocument"):
         sec = doc.get("secrets")
         return sec if sec is not None else {}
 
@@ -254,10 +272,10 @@ class PolicyEditor:
             raise PolicyError("имя секрета: буквы/цифры/дефис/подчёркивание")
         with self._edit() as doc:
             if "secrets" not in doc:
-                doc["secrets"] = tomlkit.table(is_super_table=True)
+                doc["secrets"] = self._require_tomlkit().table(is_super_table=True)
             if name in doc["secrets"]:
                 raise PolicyError(f"секрет «{name}» уже есть")
-            t = tomlkit.table()
+            t = self._require_tomlkit().table()
             t["description"] = "host-passthrough (создан через /wallet)"
             t["sessions"] = []            # deny-by-default: пока никому
             t["commands"] = []            # пусто = дефолт host-команд (gh/git/ssh/scp)
@@ -338,7 +356,7 @@ class PolicyEditor:
         if scope is None:
             if not create:
                 return None
-            scope = tomlkit.table()
+            scope = self._require_tomlkit().table()
             secret["scope"] = scope
         elif not hasattr(scope, "get"):
             raise PolicyError(
@@ -436,13 +454,13 @@ class PolicyEditor:
             yield doc
             self._write(doc)
 
-    def _write(self, doc: tomlkit.TOMLDocument) -> None:
+    def _write(self, doc: "tomlkit.TOMLDocument") -> None:
         """Записать документ атомарно, симлинк-безопасно, правами 0600.
 
         Зовётся ТОЛЬКО из `_edit` (под локом) — отдельная запись без чтения под
         тем же локом снова открыла бы гонку.
         """
-        text = tomlkit.dumps(doc)
+        text = self._require_tomlkit().dumps(doc)
         # Валидация: результат обязан парситься stdlib-парсером (тем же, что у
         # демона) — иначе не заменяем оригинал, чтобы правка не сломала policy.
         try:

@@ -6,8 +6,8 @@
 клиентом через тонкий модуль-адаптер. Фаза 1 редизайна, см.
 `docs/ARCHITECTURE-claude-box.md` §4 и `docs/DECISIONS-claude-box.md`.
 
-Пользовательский гайд (настройка secrets.toml, режимы, примеры) —
-`docs/secrets-wallet.md`. Этот README — про устройство пакета.
+Пользовательский гайд (настройка `secrets.toml`, режимы, примеры) —
+[`docs/WALLET.md`](../docs/WALLET.md). Этот README — про устройство пакета.
 
 ## Как модель получает доступ, не видя секрета (тиры)
 

@@ -391,7 +391,7 @@ WARNING; задавай `AGENT_VM_HOST_IP` вручную.
 2. ✅ **AgentVmRunner** + `SANDBOX=agent-vm` + гвард уникальности cwd +
    конфиг-ключи. Тесты: сборка argv (`tests/runner_agentvm_test.py`), без VM.
 3. **Наблюдаемость и статистика**: транскрипты/stats/usage внутри VM.
-4. **Кошелёк секретов** ([secrets-wallet.md](secrets-wallet.md)): прокси
+4. **Кошелёк секретов** ([WALLET.md](WALLET.md)): прокси
    agent-vm уже решает подмену HTTP-токенов — объединить дизайны (детали ниже).
 5. **Upstream-хотелки** в wirenboard/agent-vm: несколько VM на один cwd
    (`--name`), RO-монтирование (`--mount :ro`), документированный способ

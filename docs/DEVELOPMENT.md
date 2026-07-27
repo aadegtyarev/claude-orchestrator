@@ -1,9 +1,39 @@
 # Для разработчиков: как это устроено и как это менять
 
-Пользовательская документация — [`README.md`](../README.md) (что это и быстрый
-старт), [`docs/GUIDE.md`](GUIDE.md) (руководство) и
-[`docs/CONFIG.md`](CONFIG.md) (справочник `.env`). Здесь — внутреннее
-устройство: кто кого запускает, почему именно так, куда класть новый код.
+Пользовательская документация — [`README.md`](../README.md) (вход),
+[`BOX.md`](BOX.md), [`WALLET.md`](WALLET.md), [`ORCHESTRATOR.md`](ORCHESTRATOR.md),
+[`CONFIG.md`](CONFIG.md). Здесь — внутреннее устройство: кто кого запускает,
+почему именно так, куда класть новый код.
+
+## Слои
+
+```
+Слой 3  ОРКЕСТРАТОР  сессии, Telegram/веб, статус-бабл, продолжение, permission-relay
+                      = клиент слоя 2; про секреты не знает
+        ──────────────────────────────────────────────────────────────
+Слой 2  LAUNCHER     box/ + CLI claude-box: «подними claude в движке X с
+                      профилем и секретом Y в каталоге Z», отдаёт PTY
+        ──────────────────────────────────────────────────────────────
+Слой 1  VAULT        vault/: демон секретов, policy, перехват (шимы + MITM),
+                      коннекторы, аудит
+        ──────────────────────────────────────────────────────────────
+Слой 0  ENGINE       orchestrator/runners/: bwrap | agent-vm | off
+                      (Protocol Runner: preflight/wrap/unique_cwd/supports_prefix)
+```
+
+Ключевой примитив — **лончер отдаёт PTY с claude, и у него два потребителя**:
+человек за терминалом (`bin/claude-box`) и оркестратор (программно, много
+лончеров сразу). Один примитив, два фронтенда — поэтому нижние слои не знают
+ничего про Telegram, а верхний не знает ничего про bubblewrap.
+
+Отсюда правило зависимостей: `vault/` и `box/` не импортируют `orchestrator.*`
+(сторожит `tests/box_autonomy_test.py` и `tests/vault_domain_test.py`),
+`box_cli` тянет только `orchestrator.runners` (слой 0). Обратное направление —
+свободно: оркестратор клиент обоих пакетов через тонкие адаптеры.
+
+Проектные решения по слоям и их обоснования —
+[`ARCHITECTURE-claude-box.md`](ARCHITECTURE-claude-box.md) и
+[`DECISIONS-claude-box.md`](DECISIONS-claude-box.md).
 
 ## Принцип проекта: наблюдаемость
 
@@ -195,14 +225,15 @@ docker, PTY) мягко скипаются, если инструмента не
 
 | Документ | Для кого |
 |----------|----------|
-| [`README.md`](../README.md) | вход: что это, быстрый старт |
-| [`docs/GUIDE.md`](GUIDE.md) | пользователь: подробное руководство |
-| [`docs/CONFIG.md`](CONFIG.md) | пользователь: справочник `.env` |
-| [`docs/secrets-wallet.md`](secrets-wallet.md) | пользователь + разработчик: кошелёк секретов, модель угроз |
-| [`docs/agent-vm-integration.md`](agent-vm-integration.md) | разработчик: сессии в microVM |
-| [`docs/ARCHITECTURE-claude-box.md`](ARCHITECTURE-claude-box.md) | разработчик: архитектура `vault/` + `box/` |
-| [`docs/DECISIONS-claude-box.md`](DECISIONS-claude-box.md) | разработчик: почему сделано именно так |
-| [`docs/messaging-connector.md`](messaging-connector.md) | разработчик: памятка для новых адаптеров |
-| [`docs/FORK-agent-vm-egress-proxy.md`](FORK-agent-vm-egress-proxy.md) | разработчик: форк agent-vm |
-| [`vault/README.md`](../vault/README.md), [`box/README.md`](../box/README.md) | разработчик: контракт автономных пакетов |
-| [`docs/archive/`](archive/) | история: ревью, планы рефакторингов, миграции |
+| [`README.md`](../README.md) | вход: три слоя и быстрый старт каждого |
+| [`BOX.md`](BOX.md) | пользователь: `claude-box` — изоляция, профили, CI |
+| [`WALLET.md`](WALLET.md) | пользователь + разработчик: кошелёк, модель угроз |
+| [`ORCHESTRATOR.md`](ORCHESTRATOR.md) | пользователь: оркестратор |
+| [`CONFIG.md`](CONFIG.md) | пользователь: справочник `.env` оркестратора |
+| [`ARCHITECTURE-claude-box.md`](ARCHITECTURE-claude-box.md) | разработчик: архитектура слоёв |
+| [`DECISIONS-claude-box.md`](DECISIONS-claude-box.md) | разработчик: почему сделано именно так |
+| [`agent-vm-integration.md`](agent-vm-integration.md) | разработчик: сессии в microVM |
+| [`messaging-connector.md`](messaging-connector.md) | разработчик: памятка для новых адаптеров |
+| [`FORK-agent-vm-egress-proxy.md`](FORK-agent-vm-egress-proxy.md) | разработчик: форк agent-vm |
+| [`../vault/README.md`](../vault/README.md), [`../box/README.md`](../box/README.md) | разработчик: контракт автономных пакетов |
+| [`archive/`](archive/) | история: ревью, планы рефакторингов, миграции |

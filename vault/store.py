@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 # scp на все сессии, обёртки в PATH заворачивают их сами. Права строго 0600.
 DEFAULT_SECRETS_TOML = """\
 # Кошелёк секретов claude-orchestrator — создан автоматически при первом запуске.
-# Формат, режимы и policy: docs/secrets-wallet.md. Права строго 0600 (иначе файл
+# Формат, режимы и policy: docs/WALLET.md. Права строго 0600 (иначе файл
 # НЕ загрузится). Правится из бота командой /wallet или руками здесь.
 #
 # Дефолт ниже — «прокол на хост» (host-passthrough) для gh/git/ssh/scp: команды
