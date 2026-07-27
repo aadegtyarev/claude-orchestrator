@@ -33,7 +33,11 @@ import urllib.request
 HTTP_TIMEOUT = 660
 
 # Полная справка (wallet help / -h) — модель может дёрнуть перед работой.
-HELP = """wallet — использовать секреты, не видя их значений.
+HELP = """wallet — КОШЕЛЁК ОРКЕСТРАТОРА: использовать секреты, не видя их значений.
+
+Это кошелёк ОРКЕСТРАТОРА (внешний по отношению к твоему проекту). Если в самом
+проекте есть своё хранилище секретов с похожим названием — это РАЗНЫЕ вещи: сюда
+секреты кладёт оператор, и они приходят тебе как env-переменные и обёртки в PATH.
 
 wallet УЖЕ в PATH — зови `wallet ...` (без полного пути). Команда бежит НА ХОСТЕ
 в папке твоего проекта, поэтому `cd` в шелле на неё НЕ влияет и не нужен. Один
@@ -129,7 +133,7 @@ def call(cfg: dict, method: str, path: str, payload: dict | None = None) -> dict
 def cmd_ls(cfg: dict) -> int:
     secrets = call(cfg, "GET", "/secrets")
     if not secrets:
-        print("Секретов для этой сессии нет (policy в secrets.toml).")
+        print("Секретов для этой сессии нет в кошельке оркестратора (policy в secrets.toml).")
         return 0
     for s in secrets:
         desc = f" — {s['description']}" if s.get("description") else ""
@@ -155,6 +159,16 @@ def cmd_ls(cfg: dict) -> int:
         if mode != "shared":
             for pat in s.get("commands", []):
                 print(f"    разрешено: {pat}")
+    # Тот же расчёт, что у `doctor`: policy может УЖЕ обещать переменную, которой
+    # в этом процессе нет (секрет добавили после старта сессии) или которую затёрли
+    # (`source .env` с пустой строкой). Молча это выглядит как «кошелёк врёт» —
+    # поэтому предупреждаем прямо здесь, в самой частой команде.
+    problems = _env_problems(secrets)
+    if problems:
+        print("\n⚠ Переменные из этого списка НЕ соответствуют твоему окружению:")
+        for env, _mode, _name, state in problems:
+            print(f"    ${env}: {state}")
+        print("  Подробнее: `wallet doctor`.")
     return 0
 
 
@@ -215,6 +229,34 @@ def cmd_env(cfg: dict, argv: list) -> int:
     return 0
 
 
+def _env_problems(secrets: list) -> list:
+    """Список проблем «policy обещает ↔ что реально в окружении».
+
+    Возвращает [(env, mode, name, статус)] только для ПРОБЛЕМНЫХ переменных.
+    Значения секретов не читаются наружу — сравниваем факт наличия и форму.
+    """
+    out = []
+    for s in secrets or []:
+        env = s.get("env")
+        if not env:
+            continue
+        name, mode = s["name"], s.get("mode")
+        got = os.environ.get(env)
+        if got is None:
+            out.append((env, mode, name,
+                        "НЕТ в окружении — секрет добавили в policy ПОСЛЕ старта "
+                        "сессии; попроси оператора переоткрыть её"))
+        elif got == "":
+            out.append((env, mode, name,
+                        "ПУСТО — значение затёрли уже после старта (частая причина: "
+                        f"`source .env`, где есть строка `{env}=`)"))
+        elif mode == "inject" and not got.startswith("<<wallet:"):
+            out.append((env, mode, name,
+                        "НЕ маркер кошелька — значение перезаписано; инъекция на "
+                        "хосте не сработает"))
+    return out
+
+
 def cmd_doctor(cfg: dict) -> int:
     """Сверить, что policy обещает, с тем, что РЕАЛЬНО в твоём окружении.
 
@@ -230,31 +272,19 @@ def cmd_doctor(cfg: dict) -> int:
     if not rows:
         print("Секретов с env-переменными для этой сессии нет — сверять нечего.")
         return 0
-    problems = 0
-    print("Переменные кошелька в твоём окружении:")
+    bad = {env: state for env, _m, _n, state in _env_problems(rows)}
+    print("Переменные кошелька оркестратора в твоём окружении:")
     for s in rows:
-        name, env, mode = s["name"], s["env"], s.get("mode")
-        got = os.environ.get(env)
-        expect_marker = mode == "inject"
-        if got is None:
-            problems += 1
-            state = ("НЕТ в окружении — секрет добавили в policy ПОСЛЕ старта "
-                     "сессии; попроси оператора переоткрыть её")
-        elif got == "":
-            problems += 1
-            state = ("ПУСТО — значение затёрли уже после старта (частая причина: "
-                     f"`source .env`, где есть строка `{env}=`)")
-        elif expect_marker and not got.startswith("<<wallet:"):
-            problems += 1
-            state = ("НЕ маркер кошелька — значение перезаписано; инъекция на "
-                     "хосте не сработает")
-        elif expect_marker:
+        env, mode = s["env"], s.get("mode")
+        if env in bad:
+            state = bad[env]
+        elif mode == "inject":
             state = "ок (маркер; значение подставит хост)"
         else:
-            state = f"ок (значение, {len(got)} симв.)"
-        print(f"  ${env}  [{mode}, секрет «{name}»]: {state}")
-    if problems:
-        print(f"\nПроблемных: {problems}. Значения секретов НЕ печатаются — "
+            state = f"ок (значение, {len(os.environ.get(env, ''))} симв.)"
+        print(f"  ${env}  [{mode}, секрет «{s['name']}»]: {state}")
+    if bad:
+        print(f"\nПроблемных: {len(bad)}. Значения секретов НЕ печатаются — "
               "смотри на статус, а не дампи окружение.")
         return 1
     print("\nВсё на месте.")

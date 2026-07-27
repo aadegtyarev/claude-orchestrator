@@ -171,12 +171,60 @@ def test_doctor_without_env_secrets():
     print("OK doctor: нет секретов с env → честное «сверять нечего», код 0")
 
 
+def _run_cmd(tmp: Path, cmd: str, env_extra: dict[str, str | None]):
+    env = dict(os.environ)
+    env["WALLET_FILE"] = str(tmp / "w.json")
+    for k, v in env_extra.items():
+        if v is None:
+            env.pop(k, None)
+        else:
+            env[k] = v
+    return subprocess.run([sys.executable, str(WALLET), cmd],
+                          capture_output=True, text=True, timeout=60,
+                          env=env, cwd=str(tmp))
+
+
+def test_ls_warns_about_env_mismatch():
+    """`ls` — самая частая команда, поэтому рассинхрон видно уже в ней: иначе
+    список «секрет доступен, env $NAME» выглядит как враньё, когда переменной в
+    процессе нет или её затёрли. При порядке предупреждения быть НЕ должно."""
+    tmp = _tmp_with_secrets()
+
+    def body():
+        # затёрли пустым (случай ikar) → предупреждение + отсылка к doctor
+        r = _run_cmd(tmp, "ls", {"MY_LLM_KEY": "", "DEPLOY_TOKEN": "<<wallet:deploy>>"})
+        assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+        assert "НЕ соответствуют твоему окружению" in r.stdout, r.stdout
+        assert "MY_LLM_KEY" in r.stdout and "wallet doctor" in r.stdout, r.stdout
+        assert _SHARED_VALUE not in r.stdout, "значение секрета в выводе ls!"
+
+        # всё на месте → ls молчит про окружение (ложных тревог нет)
+        ok = _run_cmd(tmp, "ls", {"MY_LLM_KEY": _SHARED_VALUE,
+                                  "DEPLOY_TOKEN": "<<wallet:deploy>>"})
+        assert "НЕ соответствуют" not in ok.stdout, ok.stdout
+    _with_daemon(tmp, body)
+    print("OK ls: предупреждает о рассинхроне env и молчит, когда всё в порядке")
+
+
+def test_help_names_the_orchestrator_wallet():
+    """Самоназвание: у проекта сессии может быть СВОЙ «кошелёк» (живой случай —
+    ikar с секретами в БД), и модель их путала. Справка должна называть себя
+    недвусмысленно."""
+    out = subprocess.run([sys.executable, str(WALLET), "help"],
+                         capture_output=True, text=True, timeout=30).stdout
+    assert "КОШЕЛЁК ОРКЕСТРАТОРА" in out, out[:200]
+    assert "РАЗНЫЕ вещи" in out, "нет разъяснения про чужой кошелёк проекта"
+    print("OK help: кошелёк называет себя оркестраторным (снимает путаницу)")
+
+
 def main() -> None:
     test_doctor_reports_healthy_env()
     test_doctor_detects_clobbered_empty()
     test_doctor_detects_missing_after_policy_change()
     test_doctor_detects_overwritten_marker()
     test_doctor_without_env_secrets()
+    test_ls_warns_about_env_mismatch()
+    test_help_names_the_orchestrator_wallet()
     print("ALL WALLET-DOCTOR OK")
 
 
