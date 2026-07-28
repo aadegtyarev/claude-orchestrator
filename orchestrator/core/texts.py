@@ -58,7 +58,10 @@ MESSAGES: dict[str, dict[str, str]] = {
         "box_created_no_wallet": "\n⚠️ Кошелёк в этой сессии НЕ работает: без bwrap модель ходит по хосту с твоими правами — видит и файл секретов, и доступы соседних сессий.",
         "box_mark": " 🔓 {box}",
         "name_exists": "Сессия «{name}» уже существует.",
-        "limit_reached": "Достигнут лимит сессий ({limit}).",
+        "limit_reached": (
+            "Достигнут лимит одновременно запущенных сессий ({limit}). "
+            "Останови ненужную (/close_session) или подними MAX_INSTANCES в .env."
+        ),
         "creating": "🔄 Создаю сессию…",
         "create_fail": "❌ {error}",
         "bind_fail": "❌ Не удалось создать поверхность сессии в «{adapter}»: {error}. Сессия отменена.",
@@ -352,7 +355,10 @@ MESSAGES: dict[str, dict[str, str]] = {
         "box_created_no_wallet": "\n⚠️ The wallet does NOT work in this session: without bwrap the model roams the host with your rights — it sees the secrets file and other sessions' access.",
         "box_mark": " 🔓 {box}",
         "name_exists": "Session “{name}” already exists.",
-        "limit_reached": "Session limit reached ({limit}).",
+        "limit_reached": (
+            "Running session limit reached ({limit}). Close one "
+            "(/close_session) or raise MAX_INSTANCES in .env."
+        ),
         "creating": "🔄 Creating session…",
         "create_fail": "❌ {error}",
         "bind_fail": "❌ Could not create the session surface in “{adapter}”: {error}. Session cancelled.",

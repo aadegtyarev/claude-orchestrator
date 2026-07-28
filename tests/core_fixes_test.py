@@ -39,6 +39,9 @@ class FakeMgr:
 
     get_by_name = get
 
+    def check_resources(self, sandbox=None):
+        """Ресурсный preflight создания сессии: этим тестам он не мешает."""
+
     async def send_permission(self, session, request_id, behavior):
         self.perm_calls.append((request_id, behavior))
 
