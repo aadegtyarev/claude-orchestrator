@@ -29,6 +29,8 @@ from typing import Awaitable, Callable
 
 import aiohttp
 
+from box import profiles
+
 from .bashshell import BashShellManager, clean as bash_clean
 from .bubble import BubbleManager
 from .errors import UserError
@@ -327,11 +329,38 @@ class OrchestratorCore:
             raise UserError(self.t("box_unavailable", box=engine, reason=reason))
         return engine
 
+    def resolve_profile(self, raw: str | None, engine: str | None) -> str | None:
+        """Значение флага `--profile` → профиль сессии.
+
+        None = флага не было (сессия возьмёт дефолт .env), "" = ЯВНО без
+        профиля (общий CLAUDE_CONFIG_DIR, даже если в .env профиль задан).
+        Имя валидируем здесь, ДО создания сессии: оно идёт в path-join, и
+        правила те же, что у `claude-box` (box.profiles) — профили общие.
+
+        Под agent-vm отказываем честно: гость ИГНОРИРУЕТ хостовый
+        CLAUDE_CONFIG_DIR (креды ему сеет сам agent-vm), поэтому профиль там
+        не работал бы, а молча его проглотить значит соврать оператору о том,
+        под какой учётной записью работает сессия.
+        """
+        if raw is None:
+            return None  # флага не было
+        name = raw.strip()
+        if not name:
+            return ""  # `--profile ""` — осознанный отказ от профиля
+        engine = engine or self.config.sandbox
+        if engine == "agent-vm":
+            raise UserError(self.t("profile_vm"))
+        try:
+            return profiles.validate_name(name)
+        except profiles.ProfileError as e:
+            raise UserError(self.t("profile_bad", error=e)) from e
+
     async def create_session(
         self,
         title: str,
         project_path: str | None = None,
         box: str | None = None,
+        profile: str | None = None,
     ) -> Session:
         """Создать сессию и привязать её ко всем адаптерам (топик и т.п.).
 
@@ -352,12 +381,15 @@ class OrchestratorCore:
         # создания папок/портов. manager.create проверит ещё раз (он же точка
         # входа для не-ботовых вызовов) — двойная проверка тут дешёвая.
         sandbox = self.resolve_box(box)
+        # Профиль — после движка: под agent-vm он невозможен, и знать движок
+        # сессии (её `--box`, а не только дефолт .env) нужно до отказа.
+        prof = self.resolve_profile(profile, sandbox)
         try:
             self.manager.check_resources(sandbox)
         except SessionError as e:
             raise UserError(str(e)) from e
         try:
-            session = await self.manager.create(title, project_path, sandbox)
+            session = await self.manager.create(title, project_path, sandbox, prof)
         except SessionError as e:
             raise UserError(str(e)) from e
         for tr in self._transports():
@@ -596,6 +628,27 @@ class OrchestratorCore:
         if "wallet" in self.config.modules and engine != "bwrap":
             note += self.t("box_created_no_wallet")
         return note
+
+    def profile_note(self, session: Session) -> str:
+        """Приписка об учётке сессии (пусто, если она как в .env).
+
+        Прозрачность та же, что у box_note: под каким профилем работает сессия
+        — видно сразу при создании, а не только в .sessions.json. Явный отказ
+        от профиля (`--profile ""`) при заданном CLAUDE_PROFILE тоже называем:
+        такая сессия ходит под общей учёткой оркестратора."""
+        profile = self.manager.profile_of(session)
+        if profile == self.config.claude_profile:
+            return ""
+        if profile is None:
+            return self.t("profile_created_none")
+        return self.t("profile_created", profile=profile)
+
+    def profile_mark(self, session: Session) -> str:
+        """Короткая пометка профиля для списка сессий (пусто, если дефолтный)."""
+        profile = self.manager.profile_of(session)
+        if profile == self.config.claude_profile or profile is None:
+            return ""
+        return self.t("profile_mark", profile=profile)
 
     def box_mark(self, session: Session) -> str:
         """Короткая пометка движка для списка сессий (пусто, если дефолтный)."""
@@ -1234,9 +1287,16 @@ class OrchestratorCore:
             lines.append(self.t("usage_model", model=name, pct=pct))
         return "\n".join(lines)
 
-    def collect_skills(self) -> list[tuple[str, str]]:
-        """Скиллы профиля Claude Code (глобальные + плагины). Блокирующее I/O."""
-        config_dir = self.config.claude_config_dir or Path.home() / ".claude"
+    def collect_skills(self, session: Session | None = None) -> list[tuple[str, str]]:
+        """Скиллы профиля Claude Code (глобальные + плагины). Блокирующее I/O.
+
+        session задана — берём скиллы ЕЁ учётки: под своим профилем сессия
+        видит другой набор, и показывать ей общий значило бы обещать скиллы,
+        которых у неё нет. Без сессии (главный чат) — учётка по умолчанию.
+        """
+        config_dir = (
+            self.manager.config_dir_of(session) or Path.home() / ".claude"
+        )
         skill_files: list[Path] = []
         skill_files += sorted((config_dir / "skills").glob("*/SKILL.md"))
         plugins = config_dir / "plugins"
@@ -1296,66 +1356,77 @@ class OrchestratorCore:
         return "\n".join(lines)
 
     @staticmethod
-    def parse_new_args(raw: str) -> tuple[str, str | None, str | None]:
-        """Аргументы «новой сессии» → (имя, путь-или-None, значение --box-или-None).
+    def parse_new_args(raw: str) -> tuple[str, str | None, str | None, str | None]:
+        """Аргументы «новой сессии» → (имя, путь, значение --box, значение --profile).
 
         Поддерживает: имя с пробелами, обрамляющие кавычки, форму `/path`,
-        форму `имя /path` (путь = токен, начинающийся с / или ~), и флаг
-        изоляции `--box off` / `--box=off` в ЛЮБОМ месте строки (он вырезается
-        до разбора имени/пути, поэтому имя с пробелами не ломается).
+        форму `имя /path` (путь = токен, начинающийся с / или ~), и флаги
+        `--box off` / `--profile work` (в форме `--флаг=значение` тоже) в ЛЮБОМ
+        месте строки — они вырезаются до разбора имени/пути, поэтому имя с
+        пробелами не ломается. Значения флагов здесь не проверяются: этим
+        занимаются resolve_box/resolve_profile.
         """
         raw = raw.strip()
         quoted = len(raw) >= 2 and raw[0] in "\"'" and raw[-1] == raw[0]
         # Кавычки вокруг ВСЕЙ строки — просьба взять её как имя буквально:
         # «--box» внутри них принадлежит имени, а не нам.
-        box = None
+        box = profile = None
         if not quoted:
-            raw, box = OrchestratorCore._cut_box_flag(raw)
+            raw, box = OrchestratorCore._cut_flag(raw, "box")
+            raw, profile = OrchestratorCore._cut_flag(raw, "profile")
             quoted = len(raw) >= 2 and raw[0] in "\"'" and raw[-1] == raw[0]
         if quoted:
             raw = raw[1:-1].strip()
         if not raw:
-            return "", None, box
+            return "", None, box, profile
 
         def is_path(tok: str) -> bool:
             return tok.startswith("/") or tok.startswith("~")
 
         if is_path(raw):
-            return Path(raw).name, raw, box
+            return Path(raw).name, raw, box, profile
         tokens = raw.split()
         path_idx = next((i for i, tok in enumerate(tokens) if is_path(tok)), None)
         if path_idx is not None:
             project_path = " ".join(tokens[path_idx:])
             title = " ".join(tokens[:path_idx]) or Path(project_path).name
-            return title, project_path, box
-        return raw, None, box
+            return title, project_path, box, profile
+        return raw, None, box, profile
 
     @staticmethod
-    def _cut_box_flag(raw: str) -> tuple[str, str | None]:
-        """Вырезать `--box <значение>` / `--box=<значение>` из строки аргументов.
+    def _cut_flag(raw: str, flag: str) -> tuple[str, str | None]:
+        """Вырезать `--<flag> <значение>` / `--<flag>=<значение>` из аргументов.
 
         Возвращает (строка без флага, значение-или-None). Значение НЕ проверяем
-        (это делает resolve_box) — здесь только разбор строки. Флаг без значения
-        даёт пустую строку: resolve_box ответит понятной ошибкой, а не молча
-        возьмёт дефолт."""
+        (это делают resolve_box/resolve_profile) — здесь только разбор строки.
+        Флаг без значения даёт пустую строку: для `--box` это понятная ошибка от
+        resolve_box, для `--profile` — осмысленное «явно без профиля».
+
+        Кавычки вокруг значения снимаем: `--profile ""` — единственный способ
+        сказать «без профиля», и оператор пишет его именно так.
+        """
+        prefix = f"--{flag}"
         tokens = raw.split()
         out: list[str] = []
-        box: str | None = None
+        value: str | None = None
         i = 0
         while i < len(tokens):
             tok = tokens[i]
             low = tok.lower()
-            if low == "--box":
-                box = tokens[i + 1] if i + 1 < len(tokens) else ""
+            if low == prefix:
+                value = tokens[i + 1] if i + 1 < len(tokens) else ""
                 i += 2
                 continue
-            if low.startswith("--box="):
-                box = tok.split("=", 1)[1]
+            if low.startswith(f"{prefix}="):
+                value = tok.split("=", 1)[1]
                 i += 1
                 continue
             out.append(tok)
             i += 1
-        return (" ".join(out) if box is not None else raw), box
+        if value is not None and len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0]:
+            value = value[1:-1]
+        return (" ".join(out) if value is not None else raw), value
+
 
     # ── /bash: постоянный терминал мимо Claude ──────────────────
 
@@ -1547,7 +1618,10 @@ class OrchestratorCore:
 
     async def notify_startup(self, restored: int) -> None:
         """Сообщить во все адаптеры, что оркестратор онлайн."""
-        config_dir = self.config.claude_config_dir or Path.home() / ".claude"
+        # Учётка ПО УМОЛЧАНИЮ (config_dir_of(None) учитывает CLAUDE_PROFILE):
+        # сообщение общее для всех сессий, а своя учётка сессии называется при
+        # её создании и помечена в /list.
+        config_dir = self.manager.config_dir_of(None) or Path.home() / ".claude"
         base_url = self.config.claude_env.get("ANTHROPIC_BASE_URL") or self.t("url_default")
         await self._each_transport(
             lambda tr: tr.notify(

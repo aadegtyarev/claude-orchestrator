@@ -117,6 +117,13 @@ class Config:
     delete_bubble: bool
     show_command_menu: bool
     claude_config_dir: Path | None
+    # Профиль Claude Code по умолчанию для новых сессий (CLAUDE_PROFILE):
+    # изолированная учётка — свои токены, скиллы, транскрипты. Каталоги общие с
+    # `claude-box` (${CLAUDE_BOX_HOME:-~/.local/share/claude-box}/profiles/<имя>),
+    # так что профиль виден обоим. None = профиля нет, сессия живёт в
+    # CLAUDE_CONFIG_DIR (или ~/.claude) — прежнее поведение. Сессия может
+    # переопределить своим `--profile` при создании.
+    claude_profile: str | None
     incoming_dir: str
     permission_mode: str
     bot_lang: str
@@ -348,6 +355,7 @@ class Config:
             claude_config_dir=(
                 Path(raw).expanduser() if (raw := os.getenv("CLAUDE_CONFIG_DIR", "").strip()) else None
             ),
+            claude_profile=cls._parse_profile(os.getenv("CLAUDE_PROFILE", "")),
             incoming_dir=os.getenv("INCOMING_DIR", "incoming").strip() or "incoming",
             permission_mode=cls._parse_permission_mode(os.getenv("PERMISSION_MODE", "auto")),
             bot_lang=(os.getenv("BOT_LANG", "ru").strip().lower() or "ru"),
@@ -540,6 +548,24 @@ class Config:
                 f"PERMISSION_MODE={mode!r} — допустимые значения: {', '.join(sorted(valid))}"
             )
         return mode
+
+    @staticmethod
+    def _parse_profile(raw: str) -> str | None:
+        """CLAUDE_PROFILE → имя профиля или None (не задан).
+
+        Валидируем ЗДЕСЬ, на старте: имя идёт в path-join, и «плохое» значение
+        должно останавливать оркестратор с внятным текстом, а не всплывать
+        отказом при каждом /new. Правила общие с `claude-box` (box.profiles) —
+        один источник истины, расходиться на одних и тех же именах нельзя.
+        """
+        name = raw.strip()
+        if not name:
+            return None
+        from box.profiles import ProfileError, validate_name
+        try:
+            return validate_name(name)
+        except ProfileError as e:
+            raise SystemExit(f"CLAUDE_PROFILE={name!r}: {e}") from None
 
     @staticmethod
     def _parse_bool(raw: str) -> bool:

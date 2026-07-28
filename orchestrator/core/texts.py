@@ -12,6 +12,8 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• <code>/new имя /путь</code> — то же, со своим именем\n"
             "• <code>--box off</code> к любому <code>/new</code> — сессия без изоляции "
             "(движки: {boxes})\n"
+            "• <code>--profile &lt;имя&gt;</code> к <code>/new</code> — своя учётка "
+            "Claude у сессии (<code>--profile \"\"</code> — без профиля)\n"
             "• <code>/list</code> — сессии со статусами и кнопками\n"
             "• <code>/ls [путь]</code> — показать файлы\n"
             "• <code>/bg</code> — фоновые процессы/кроны сессии (в топике)\n"
@@ -51,12 +53,25 @@ MESSAGES: dict[str, dict[str, str]] = {
         "bash_timeout": "⏱ таймаут — процесс мог остаться работать в фоне. /bashin чтобы досыпать ввод.",
         "bash_not_running": "В этом топике нет открытого /bash. Запусти командой /bash &lt;команда&gt;.",
         "bashin_sent": "⌨️ Отправил в терминал: <code>{text}</code>",
-        "new_usage": "Укажи имя или путь:\n/new my-project\n/new /home/user/project\n/new my-project --box off — без изоляции",
+        "new_usage": (
+            "Укажи имя или путь:\n/new my-project\n/new /home/user/project\n"
+            "/new my-project --box off — без изоляции\n"
+            "/new my-project --profile work — своя учётка Claude"
+        ),
         "box_unknown": "❌ Не понял --box {value}. Допустимо: {choices}.",
         "box_unavailable": "❌ Изоляция «{box}» недоступна: {reason}",
         "box_created": "\n🔓 Изоляция сессии: {box} (по умолчанию — {default}).",
         "box_created_no_wallet": "\n⚠️ Кошелёк в этой сессии НЕ работает: без bwrap модель ходит по хосту с твоими правами — видит и файл секретов, и доступы соседних сессий.",
         "box_mark": " 🔓 {box}",
+        "profile_bad": "❌ Профиль: {error}",
+        "profile_vm": (
+            "❌ Профиль под agent-vm не работает: гость держит учётку у себя и "
+            "хостовый CLAUDE_CONFIG_DIR игнорирует. Нужна отдельная учётка — "
+            "создай сессию с «--box bwrap»."
+        ),
+        "profile_created": "\n👤 Профиль Claude: {profile}.",
+        "profile_created_none": "\n👤 Без профиля Claude: общая учётка оркестратора.",
+        "profile_mark": " 👤 {profile}",
         "name_exists": "Сессия «{name}» уже существует.",
         "limit_reached": (
             "Достигнут лимит одновременно запущенных сессий ({limit}). "
@@ -309,6 +324,8 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• <code>/new name /path</code> — same, with a custom name\n"
             "• <code>--box off</code> with any <code>/new</code> — session without "
             "isolation (engines: {boxes})\n"
+            "• <code>--profile &lt;name&gt;</code> with <code>/new</code> — the session's "
+            "own Claude account (<code>--profile \"\"</code> — no profile)\n"
             "• <code>/list</code> — sessions with statuses and buttons\n"
             "• <code>/ls [path]</code> — list files\n"
             "• <code>/bg</code> — session background processes/crons (in a topic)\n"
@@ -348,12 +365,25 @@ MESSAGES: dict[str, dict[str, str]] = {
         "bash_timeout": "⏱ timeout — the process may still be running in the background. Use /bashin to send input.",
         "bash_not_running": "No open /bash in this topic. Start one with /bash &lt;command&gt;.",
         "bashin_sent": "⌨️ Sent to terminal: <code>{text}</code>",
-        "new_usage": "Provide a name or a path:\n/new my-project\n/new /home/user/project\n/new my-project --box off — no isolation",
+        "new_usage": (
+            "Provide a name or a path:\n/new my-project\n/new /home/user/project\n"
+            "/new my-project --box off — no isolation\n"
+            "/new my-project --profile work — its own Claude account"
+        ),
         "box_unknown": "❌ Unknown --box {value}. Allowed: {choices}.",
         "box_unavailable": "❌ Isolation “{box}” is unavailable: {reason}",
         "box_created": "\n🔓 Session isolation: {box} (default is {default}).",
         "box_created_no_wallet": "\n⚠️ The wallet does NOT work in this session: without bwrap the model roams the host with your rights — it sees the secrets file and other sessions' access.",
         "box_mark": " 🔓 {box}",
+        "profile_bad": "❌ Profile: {error}",
+        "profile_vm": (
+            "❌ Profiles do not work under agent-vm: the guest keeps its own "
+            "account and ignores the host CLAUDE_CONFIG_DIR. If you need a "
+            "separate account, create the session with “--box bwrap”."
+        ),
+        "profile_created": "\n👤 Claude profile: {profile}.",
+        "profile_created_none": "\n👤 No Claude profile: the orchestrator's shared account.",
+        "profile_mark": " 👤 {profile}",
         "name_exists": "Session “{name}” already exists.",
         "limit_reached": (
             "Running session limit reached ({limit}). Close one "

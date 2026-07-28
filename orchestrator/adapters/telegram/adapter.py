@@ -502,14 +502,14 @@ class TelegramAdapter:
         if message.message_thread_id is not None:
             await message.reply(self.t("only_main_chat"))
             return
-        title, project_path, box = self.core.parse_new_args(command.args or "")
+        title, project_path, box, profile = self.core.parse_new_args(command.args or "")
         if not title:
             await message.reply(self.t("new_usage"))
             return
         title = title[:128]  # предел названия топика в Telegram
         status = await message.reply(self.t("creating"))
         try:
-            session = await self.core.create_session(title, project_path, box)
+            session = await self.core.create_session(title, project_path, box, profile)
         except UserError as e:
             await status.edit_text(self.t("create_fail", error=e))
             return
@@ -520,7 +520,9 @@ class TelegramAdapter:
         # Без parse_mode: имя сессии задаёт пользователь, «<» в нём сломал бы
         # HTML-разбор уже СОЗДАННОЙ сессии (тексты про изоляцию — тоже простые).
         await status.edit_text(
-            self.t("created", name=session.title) + self.core.box_note(session)
+            self.t("created", name=session.title)
+            + self.core.box_note(session)
+            + self.core.profile_note(session)
         )
 
     async def cmd_list(self, message: Message) -> None:
@@ -541,7 +543,7 @@ class TelegramAdapter:
             line = f"{status} — {s.title}"
             if s.model:
                 line += f" [{s.model}]"
-            line += self.core.box_mark(s)
+            line += self.core.box_mark(s) + self.core.profile_mark(s)
             if s.running:
                 uptime = self.core.fmt_duration(time.time() - s.started_at)
                 line += ", " + self.t("uptime", uptime=uptime)
@@ -617,7 +619,9 @@ class TelegramAdapter:
     async def cmd_skills(self, message: Message) -> None:
         if not self._accept(message):
             return
-        skills = await asyncio.to_thread(self.core.collect_skills)
+        # В топике — скиллы учётки ЭТОЙ сессии (у неё может быть свой профиль).
+        skills = await asyncio.to_thread(
+            self.core.collect_skills, self._topic_session(message))
         if not skills:
             await message.reply(self.t("skills_none"))
             return

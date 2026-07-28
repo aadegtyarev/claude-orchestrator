@@ -25,5 +25,8 @@ class DirectRunner:
         home_dir: Path | None = None,
         publish_ports: Sequence[int] = (),
         docker_sock: Path | None = None,
+        config_dir: Path | None = None,
     ) -> list[str]:
+        # config_dir не нужен: без изоляции биндить нечего, а сам
+        # CLAUDE_CONFIG_DIR процессу задаёт SessionManager через env.
         return list(argv)

@@ -188,7 +188,7 @@ async def test_create_rollback_on_bind_fail():
         def count(self):
             return 0
 
-        async def create(self, title, project_path=None, sandbox=None):
+        async def create(self, title, project_path=None, sandbox=None, profile=None):
             created["n"] += 1
             return SimpleNamespace(name="x", title=title, bindings={})
 

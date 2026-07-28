@@ -38,10 +38,16 @@ class BwrapRunner:
         home_dir: Path | None = None,
         publish_ports: Sequence[int] = (),
         docker_sock: Path | None = None,
+        config_dir: Path | None = None,
     ) -> list[str]:
         # publish_ports не нужен: сеть у bwrap общая с хостом.
         home = Path.home()
-        config_dir = self.config.claude_config_dir
+        # config_dir — каталог учётки ЭТОЙ сессии (её профиль `--profile` либо
+        # общий CLAUDE_CONFIG_DIR). Его обязательно RW-биндить: иначе claude
+        # внутри песочницы не увидит собственный профиль. None от вызывающего =
+        # спросить конфиг (общий путь, прежнее поведение и standalone-вызовы).
+        if config_dir is None:
+            config_dir = self.config.claude_config_dir
         rw = [
             *extra_rw,
             config_dir or (home / ".claude"),

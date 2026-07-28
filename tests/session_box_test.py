@@ -65,28 +65,42 @@ def _session(name: str = "s", box: str | None = None) -> Session:
 def test_parse_flag_anywhere():
     """Флаг вырезается до разбора имени/пути — имя с пробелами не ломается."""
     p = OrchestratorCore.parse_new_args
-    assert p("my project --box off") == ("my project", None, "off")
-    assert p("--box off my project") == ("my project", None, "off")
-    assert p("проект /home/u/p --box=vm") == ("проект", "/home/u/p", "vm")
-    assert p("--box off /home/u/p") == ("p", "/home/u/p", "off")
+    assert p("my project --box off") == ("my project", None, "off", None)
+    assert p("--box off my project") == ("my project", None, "off", None)
+    assert p("проект /home/u/p --box=vm") == ("проект", "/home/u/p", "vm", None)
+    assert p("--box off /home/u/p") == ("p", "/home/u/p", "off", None)
     print("OK --box разбирается в любом месте строки, имя и путь целы")
 
 
 def test_parse_without_flag_unchanged():
-    """Без флага — ровно прежний разбор (третий элемент None)."""
+    """Без флагов — ровно прежний разбор (значения флагов None)."""
     p = OrchestratorCore.parse_new_args
-    assert p("my project") == ("my project", None, None)
-    assert p("'имя в кавычках'") == ("имя в кавычках", None, None)
-    assert p("/home/u/proj") == ("proj", "/home/u/proj", None)
-    assert p("имя ~/proj") == ("имя", "~/proj", None)
-    assert p("") == ("", None, None)
+    assert p("my project") == ("my project", None, None, None)
+    assert p("'имя в кавычках'") == ("имя в кавычках", None, None, None)
+    assert p("/home/u/proj") == ("proj", "/home/u/proj", None, None)
+    assert p("имя ~/proj") == ("имя", "~/proj", None, None)
+    assert p("") == ("", None, None, None)
     print("OK без --box разбор /new не изменился")
 
 
 def test_parse_flag_without_value():
     """`--box` без значения → пустая строка, а не молчаливый дефолт."""
-    assert OrchestratorCore.parse_new_args("имя --box") == ("имя", None, "")
+    assert OrchestratorCore.parse_new_args("имя --box") == ("имя", None, "", None)
     print("OK --box без значения не проглатывается как дефолт")
+
+
+def test_parse_profile_flag():
+    """`--profile` разбирается так же, как --box, и уживается с ним."""
+    p = OrchestratorCore.parse_new_args
+    assert p("имя --profile work") == ("имя", None, None, "work")
+    assert p("--profile=work имя /home/u/p") == ("имя", "/home/u/p", None, "work")
+    assert p("имя --box off --profile work") == ("имя", None, "off", "work")
+    # Кавычки вокруг значения снимаются: `--profile ""` — «явно без профиля».
+    assert p('имя --profile ""') == ("имя", None, None, "")
+    assert p("имя --profile ''") == ("имя", None, None, "")
+    assert p("имя --profile=") == ("имя", None, None, "")
+    assert p("имя --profile") == ("имя", None, None, "")
+    print("OK --profile разбирается в любом месте и уживается с --box")
 
 
 # ── проверка значения ───────────────────────────────────────────────
@@ -129,9 +143,12 @@ def test_quoted_name_keeps_flag_literal():
     Иначе кавычки, которыми пользователь как раз защищает содержимое, молча
     съедали бы кусок имени."""
     got = OrchestratorCore.parse_new_args('"weird --box off name"')
-    assert got == ("weird --box off name", None, None), got
+    assert got == ("weird --box off name", None, None, None), got
+    # То же и для --profile: внутри кавычек он часть имени.
+    got = OrchestratorCore.parse_new_args('"имя --profile work"')
+    assert got == ("имя --profile work", None, None, None), got
     # А снаружи кавычек флаг работает как обычно.
-    assert OrchestratorCore.parse_new_args('"имя" --box off') == ("имя", None, "off")
+    assert OrchestratorCore.parse_new_args('"имя" --box off') == ("имя", None, "off", None)
     print("OK кавычки вокруг всего имени защищают «--box» внутри")
 
 

@@ -202,6 +202,7 @@ class AgentVmRunner:
         home_dir: Path | None = None,
         publish_ports: Sequence[int] = (),
         docker_sock: Path | None = None,
+        config_dir: Path | None = None,
     ) -> list[str]:
         """agent-vm <cmd> [--опции] -- <аргументы cmd>.
 
@@ -210,6 +211,11 @@ class AgentVmRunner:
         гостя; в standalone CLI он не нужен и не монтируется). home_dir
         не пробрасывается: у гостя свой $HOME (Debian-образ), персистентность
         дома решается state-каталогом agent-vm, не нами.
+
+        config_dir тоже не пробрасывается: гость ИГНОРИРУЕТ хостовый
+        CLAUDE_CONFIG_DIR (замер F4) — креды ему сеет сам agent-vm из $HOME
+        своего процесса. Поэтому профиль под VM оркестратор не предлагает
+        (SessionManager отказывает явно), а не делает вид, что он работает.
         """
         if not argv:
             # Префикс-режим (sandbox_prefix для /bash): в VM интерактивный

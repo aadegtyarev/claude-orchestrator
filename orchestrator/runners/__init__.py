@@ -50,12 +50,16 @@ class Runner(Protocol):
         home_dir: Path | None = None,
         publish_ports: Sequence[int] = (),
         docker_sock: Path | None = None,
+        config_dir: Path | None = None,
     ) -> list[str]:
         """Завернуть команду. chdir — рабочий каталог процесса; extra_rw —
         рабочие пути этой сессии (папка сессии/проекта), доступные на запись;
         home_dir — персистентный приватный $HOME сессии (None = эфемерный);
         publish_ports — localhost-порты процесса, которые должны быть доступны
-        оркестратору снаружи изоляции (channel-сервер; важно для agent-vm)."""
+        оркестратору снаружи изоляции (channel-сервер; важно для agent-vm);
+        config_dir — каталог учётки Claude Code ЭТОЙ сессии (её профиль
+        `--profile` либо общий CLAUDE_CONFIG_DIR): его нужно дать процессу на
+        запись, иначе claude не увидит свой профиль. None = взять из конфига."""
         ...
 
 
