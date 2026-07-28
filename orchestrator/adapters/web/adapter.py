@@ -335,6 +335,8 @@ class WebAdapter:
             # Пометка «изоляция не как у всех» (пусто = дефолтная): сессия без
             # песочницы работает с правами оператора и это должно быть видно.
             "box": self.core.box_mark(session).strip(),
+            # Учётка сессии, если она не дефолтная (пусто = как в .env).
+            "profile": self.core.profile_mark(session).strip(),
         }
 
     def _sessions_info(self) -> list[dict]:
@@ -398,8 +400,13 @@ class WebAdapter:
         # дефолт .env; неизвестное значение вернёт UserError ниже.
         raw_box = data.get("box")
         box = raw_box.strip() or None if isinstance(raw_box, str) else None
+        # Профиль Claude (флаг --profile у /new; в вебе — поле profile).
+        # Отличаем «поля не было» (None → дефолт .env) от пустой строки
+        # (ЯВНО без профиля) — поэтому strip() без `or None`.
+        raw_profile = data.get("profile")
+        profile = raw_profile.strip() if isinstance(raw_profile, str) else None
         try:
-            session = await self.core.create_session(title, path, box)
+            session = await self.core.create_session(title, path, box, profile)
         except UserError as e:
             return self._err(str(e))
         except Exception:
@@ -683,7 +690,10 @@ class WebAdapter:
         })
 
     async def h_skills(self, request: web.Request) -> web.Response:
-        skills = await asyncio.to_thread(self.core.collect_skills)
+        # ?session=<имя> — скиллы учётки этой сессии (у неё может быть свой
+        # профиль). Без параметра — учётка по умолчанию, как в главном чате.
+        session = self.manager.get(request.query.get("session", ""))
+        skills = await asyncio.to_thread(self.core.collect_skills, session)
         return web.json_response(
             [{"name": name, "description": desc} for name, desc in skills]
         )

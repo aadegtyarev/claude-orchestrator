@@ -113,7 +113,8 @@ function renderSessions() {
     if (s.uptime) meta += (meta ? " · " : "") + esc(s.uptime);
     li.innerHTML = '<span class="s-icon">' + icon + '</span>' +
       '<span class="s-title" title="' + esc(s.linked_path || "") + '">' + esc(s.title) +
-        (s.box ? " " + esc(s.box) : "") + "</span>" +
+        (s.box ? " " + esc(s.box) : "") +
+        (s.profile ? " " + esc(s.profile) : "") + "</span>" +
       (meta ? '<span class="s-model">' + meta + "</span>" : "");
     li.onclick = () => selectSession(s.name);
     els.list.appendChild(li);
@@ -633,8 +634,12 @@ $("new-form").addEventListener("submit", async (e) => {
   if (!title) return;
   try {
     const box = ($("new-box") && $("new-box").value) || null;
-    const s = await postJson(
-      "/api/sessions", { title: title, path: path || null, box: box });
+    // Профиль Claude. Пустое поле — «как в .env» (поле не шлём вовсе), «-» —
+    // ЯВНО без профиля (шлём пустую строку, это аналог `--profile ""`).
+    const profRaw = ($("new-profile") && $("new-profile").value.trim()) || "";
+    const body = { title: title, path: path || null, box: box };
+    if (profRaw) body.profile = profRaw === "-" ? "" : profRaw;
+    const s = await postJson("/api/sessions", body);
     await fetchSessions();
     selectSession(s.name);
   } catch (err) {

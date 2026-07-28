@@ -54,6 +54,10 @@ def make_env(tmp: Path):
             # Пометка нестандартной изоляции сессии (`--box`); у фейка её нет.
             return ""
 
+        def profile_mark(self, s):
+            # Пометка нестандартной учётки (`--profile`); у фейка её нет.
+            return ""
+
         def box_choices(self):
             return ["bwrap", "off"]
 

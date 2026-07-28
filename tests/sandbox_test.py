@@ -85,6 +85,7 @@ def _mgr(mode: str) -> SessionManager:
         sandbox_dbus=True,
         sandbox_docker=False,
         claude_config_dir=Path("/home/tester/.claude-proxy"),
+        claude_profile=None,  # профиля нет → config_dir_of отдаст путь выше
     )
     m = SessionManager.__new__(SessionManager)
     m.config = cfg

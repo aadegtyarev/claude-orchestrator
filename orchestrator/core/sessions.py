@@ -45,6 +45,7 @@ from ..modules.docker.proxy import DockerProxy
 # docs/ARCHITECTURE-claude-box.md §5/§11). Реэкспорт для обратной
 # совместимости: код/тесты ссылаются на sessions._DIALOGS/_DialogAnswerer/
 # _ReadyDeadline/READY_* как раньше. Ноль изменений поведения.
+from box import profiles
 from box import transcript_path as box_transcript
 from box.dialog import _DialogAnswerer, _DIALOGS  # noqa: F401
 from box.launch import launch as box_launch
@@ -113,6 +114,12 @@ class Session:
     # "off". None = как в .env (SANDBOX). Выбирается при создании и живёт с
     # сессией: resume/clear поднимают её тем же движком, что и первый старт.
     sandbox: str | None = None
+    # Профиль Claude Code ЭТОЙ сессии (флаг `--profile` у /new): изолированная
+    # учётка — свои токены, скиллы, транскрипты. None = как в .env
+    # (CLAUDE_PROFILE), "" = ЯВНО без профиля (общий CLAUDE_CONFIG_DIR/~/.claude,
+    # даже если в .env профиль задан). Как и движок, выбирается при создании и
+    # живёт с сессией: resume/clear поднимают её тем же профилем.
+    profile: str | None = None
     started_at: float = field(default_factory=time.time)
     last_activity: float = field(default_factory=time.time)
     process: asyncio.subprocess.Process | None = None
@@ -220,6 +227,7 @@ class SessionManager:
                 "linked_path": s.linked_path,
                 "model": s.model,
                 "sandbox": s.sandbox,
+                "profile": s.profile,
             }
             for s in self._by_name.values()
         ]
@@ -249,8 +257,9 @@ class SessionManager:
                 linked_path=item.get("linked_path"),
                 model=item.get("model"),
                 # Записи, созданные до флага --box, движка не помнят → None =
-                # дефолт из .env (их прежнее поведение).
+                # дефолт из .env (их прежнее поведение). То же и с профилем.
                 sandbox=item.get("sandbox"),
+                profile=item.get("profile"),
             )
             self._by_name[session.name] = session
             logger.info("Восстановлена запись сессии %s (остановлена)", session.name)
@@ -299,10 +308,14 @@ class SessionManager:
         title: str,
         project_path: str | None = None,
         sandbox: str | None = None,
+        profile: str | None = None,
     ) -> Session:
         """sandbox — движок изоляции ЭТОЙ сессии (флаг `--box`); None = дефолт
         .env. Готовность движка проверяем ЗДЕСЬ, до создания папок и старта:
-        на старте оркестратора preflight проходил только дефолтный раннер."""
+        на старте оркестратора preflight проходил только дефолтный раннер.
+
+        profile — учётка Claude Code этой сессии (флаг `--profile`): None =
+        дефолт .env (CLAUDE_PROFILE), "" = явно без профиля."""
         slug = slugify(title)
         if sandbox is not None and sandbox != self.config.sandbox:
             self._check_engine(sandbox)
@@ -314,6 +327,7 @@ class SessionManager:
             claude_session_id=str(uuid.uuid4()),
             title=title,
             sandbox=sandbox,
+            profile=profile,
         )
         async with session.ops:
             # Проверки и регистрация — под общим локом (два /new подряд
@@ -796,8 +810,12 @@ class SessionManager:
             except Exception:
                 logger.exception("path_hook для сессии %s", session.name)
         env["PATH"] = ":".join([*prepend, env.get("PATH", "")])
-        if self.config.claude_config_dir is not None:
-            env["CLAUDE_CONFIG_DIR"] = str(self.config.claude_config_dir)
+        # Профиль сессии (`--profile`) или общий CLAUDE_CONFIG_DIR из .env.
+        # $HOME под bwrap у сессии и так свой (session_home), поэтому профиль
+        # здесь меняет ровно учётку claude — токены, скиллы, транскрипты.
+        config_dir = self.config_dir_of(session)
+        if config_dir is not None:
+            env["CLAUDE_CONFIG_DIR"] = str(config_dir)
         # Явные переменные для Claude Code (CLAUDE_ENV_ANTHROPIC_BASE_URL=…
         # и т.п.). Сами CLAUDE_ENV_* в дочерний процесс не тащим.
         for key in [k for k in env if k.startswith("CLAUDE_ENV_")]:
@@ -900,6 +918,7 @@ class SessionManager:
                 home_dir=self.session_home(session),
                 publish_ports=[session.port],
                 docker_sock=docker_sock,
+                config_dir=config_dir,
             )
             # Спавн процесса под PTY + запуск драйвера (дренаж вывода + авто-ответы
             # на стартовые диалоги) собран в box.launch: он открывает PTY нужного
@@ -1481,6 +1500,42 @@ class SessionManager:
             return self.config.sandbox
         return session.sandbox or self.config.sandbox
 
+    def profile_of(self, session: Session | None) -> str | None:
+        """Профиль Claude Code сессии: её собственный или дефолт .env.
+
+        None = профиля нет (сессия живёт в CLAUDE_CONFIG_DIR или ~/.claude).
+        Пустая строка в session.profile — ЯВНЫЙ отказ от профиля (`--profile ""`),
+        он должен побеждать дефолт .env, поэтому проверяем `is None`, а не `or`.
+
+        Под agent-vm профиля НЕТ ни у кого: гость держит креды у себя и хостовый
+        CLAUDE_CONFIG_DIR игнорирует (замер F4). Явный `--profile` там отвергает
+        ядро, но дефолт из .env до этой проверки не доходит — и без отсечки
+        здесь мы бы создали каталог профиля и выставили процессу переменную,
+        которая ни на что не влияет: оператор считал бы, что VM-сессия работает
+        под отдельной учёткой, хотя она под общей. «Выключено = не существует».
+        """
+        if self.engine_of(session) == "agent-vm":
+            return None
+        if session is None or session.profile is None:
+            return self.config.claude_profile
+        return session.profile or None
+
+    def config_dir_of(self, session: Session | None) -> Path | None:
+        """CLAUDE_CONFIG_DIR этой сессии: каталог её профиля или общий из .env.
+
+        ЕДИНСТВЕННЫЙ источник истины «где живёт учётка/транскрипты сессии»: и
+        запуск процесса, и чтение транскрипта (/stats), и RW-бинд в песочницу
+        обязаны смотреть в ОДИН каталог — иначе claude пишет в профиль, а
+        статистика читается из чужого места.
+
+        Каталог профиля создаётся здесь же (ensure_profile идемпотентен): он
+        нужен существующим и раннеру (bind), и claude.
+        """
+        name = self.profile_of(session)
+        if name is None:
+            return self.config.claude_config_dir
+        return profiles.ensure_profile(name) / ".claude"
+
     def runner_for(self, session: Session | None) -> runner_mod.Runner:
         """Раннер под движок сессии. Кэш по имени движка: раннеры без
         per-session состояния (argv-обёртка), поэтому переиспользуемы."""
@@ -1532,7 +1587,10 @@ class SessionManager:
             else None
         )
         return self.runner_for(session).wrap(
-            [], chdir=chdir, extra_rw=extra_rw, home_dir=home_dir, docker_sock=dsock)
+            [], chdir=chdir, extra_rw=extra_rw, home_dir=home_dir, docker_sock=dsock,
+            # /bash сессии должен видеть ТУ ЖЕ учётку, что и её claude (напр.
+            # `claude -p` из шелла под профилем сессии, а не под чужим).
+            config_dir=self.config_dir_of(session))
 
     # ── per-session docker-прокси (SANDBOX_BWRAP_DOCKER) ────────────────
     def _docker_roots(self, session: Session) -> list[Path]:
@@ -1568,7 +1626,7 @@ class SessionManager:
 
     def transcript_path(self, session: Session) -> Path:
         """Транскрипт сессии в профиле Claude Code (client-config → box)."""
-        config_dir = box_transcript.resolve_config_dir(self.config.claude_config_dir)
+        config_dir = box_transcript.resolve_config_dir(self.config_dir_of(session))
         return box_transcript.transcript_path(
             config_dir, self.effective_cwd(session), session.claude_session_id
         )
