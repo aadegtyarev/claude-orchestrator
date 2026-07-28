@@ -130,6 +130,7 @@ class OrchestratorCore:
         # Хуки «сессия создана» — модули дописывают свою обвязку в папку сессии.
         self.session_hooks: list[Callable[[Session], Awaitable[None]]] = []
         manager.on_dead = self.notify_session_dead
+        manager.on_docker_launch = self.notify_docker_launch
 
     def t(self, key: str, **kwargs) -> str:
         return self._texts[key].format(**kwargs)
@@ -1529,6 +1530,11 @@ class OrchestratorCore:
         if tail:
             text += "\n\n" + self.t("session_died_tail", tail=tail[:1500])
         await self.notice(session, text)
+
+    async def notify_docker_launch(self, name: str, summary: str) -> None:
+        """Колбэк docker-прокси: модель запустила контейнер — подсветить в бабле."""
+        await self.bubbles.append_background(
+            name, f"🐳 docker <code>{html.escape(summary)}</code>", tool="docker")
 
     async def notify_idle_closed(self, sessions: list[Session]) -> None:
         """Колбэк sweeper: сессии остановлены по простою."""

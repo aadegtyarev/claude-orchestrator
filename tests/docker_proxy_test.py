@@ -66,7 +66,12 @@ async def scenario():
     tag = f"pxtest-{uuid.uuid4().hex[:8]}"
     work = Path(tempfile.mkdtemp())   # «проект сессии» = единственный корень allowlist
     sock = Path(tempfile.mkdtemp()) / "docker.sock"
-    proxy = DockerProxy(sock, roots_provider=lambda: [work])
+    launched: list[str] = []
+
+    async def _notify(summary: str) -> None:
+        launched.append(summary)
+
+    proxy = DockerProxy(sock, roots_provider=lambda: [work], notify=_notify)
     await proxy.start()
     try:
         # 1) чужой bind (/etc) → отказ с нашим объяснением
@@ -93,7 +98,8 @@ async def scenario():
             ["run", "--rm", "--name", f"{tag}-ok", "-v", f"{work}:/x",
              "--entrypoint", "echo", IMG, "hi"], sock)
         assert code == 0 and "hi" in out, (code, out, err)
-        print("OK live: свой bind → run --rm прошёл end-to-end (сплайс не завис)")
+        assert launched and IMG in launched[-1], launched  # подсветка запуска сработала
+        print("OK live: свой bind → run --rm прошёл; подсветка запуска сработала")
 
         # 4) две команды подряд — соединения не путаются (Connection: close)
         for i in (1, 2):
