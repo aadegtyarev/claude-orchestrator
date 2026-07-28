@@ -32,6 +32,7 @@ from typing import IO, Awaitable, Callable
 import aiohttp
 
 from . import hookscript
+from . import resources
 from . import transcript
 from .ansi import strip_ansi
 from .proctree import proc_tree_signals
@@ -150,6 +151,12 @@ class SessionManager:
         # Порты, выданные стартующим сессиям, но ещё не занятые их channel-
         # сервером (окно гонки при фиксированном пуле) — см. _find_free_port.
         self._inflight_ports: set[int] = set()
+        # Имена сессий, которым слот уже выдан, но процесс ещё поднимается: от
+        # проверки лимита до появления session.process живых сессий по count()
+        # меньше, чем реально стартует, и два параллельных подъёма (create и/или
+        # resume разных сессий) прошли бы лимит оба. Резерв снимается, когда
+        # процесс поднялся или старт провалился — см. _guard_limit/_release_slot.
+        self._starting: set[str] = set()
         # Базовый CPU-отсчёт дерева процессов для вотчдога (см. is_busy).
         self._cpu: dict[str, int] = {}
         # Раннеры по имени движка изоляции (сессия выбирает свой — см.
@@ -258,6 +265,19 @@ class SessionManager:
         return list(self._by_name.values())
 
     def count(self) -> int:
+        """Сколько сессий РЕАЛЬНО запущено (лимит MAX_INSTANCES — про них).
+
+        Записи остановленных сессий живут в _by_name (топик на месте, resume
+        возможен), но ресурсов не занимают: процесса нет. Раньше лимит считал
+        все записи, и после рестарта оркестратора, где восстанавливаются ВСЕ
+        записи с диска сразу как остановленные, /new упирался в лимит при нуле
+        живых процессов. Имена по-прежнему уникальны среди всех записей
+        (has_name), так что «слот» занят только процессом, а не именем.
+        """
+        return sum(1 for s in self._by_name.values() if s.running)
+
+    def total(self) -> int:
+        """Сколько записей существует всего — с остановленными."""
         return len(self._by_name)
 
     def has_name(self, name: str) -> bool:
@@ -284,6 +304,7 @@ class SessionManager:
         slug = slugify(title)
         if sandbox is not None and sandbox != self.config.sandbox:
             self._check_engine(sandbox)
+        self.check_resources(sandbox)
         session = Session(
             name=slug,
             port=0,
@@ -298,32 +319,113 @@ class SessionManager:
             async with self._lock:
                 if self.has_name(slug):
                     raise SessionError(f"Сессия «{slug}» уже существует.")
-                if len(self._by_name) >= self.config.max_instances:
-                    raise SessionError(
-                        f"Достигнут лимит сессий ({self.config.max_instances})."
-                    )
+                # count(), не len(_by_name): лимит — про ЖИВЫЕ процессы.
+                # Остановленные записи (после /close_session, авто-останова по
+                # простою, рестарта оркестратора) слот не держат.
+                self._guard_limit(slug)
                 self._allocate_port(session)
                 self._by_name[slug] = session
 
+            # finally, а не только except: при отмене задачи (CancelledError —
+            # не Exception) слот иначе остался бы занятым до перезапуска
+            # оркестратора. Освобождение идемпотентно (discard).
             try:
-                session.session_dir.mkdir(parents=True, exist_ok=True)
-                if project_path:
-                    session.linked_path = self._link_project(project_path)
-                self._guard_unique_cwd(session)
-                self._write_configs(session)
-                await self._start_claude(session)
-                await self._wait_ready(session)
-            except Exception:
-                await self._terminate(session)
-                self._inflight_ports.discard(session.port)
-                async with self._lock:
-                    self._by_name.pop(slug, None)
-                self.save_state()
-                raise
+                try:
+                    session.session_dir.mkdir(parents=True, exist_ok=True)
+                    if project_path:
+                        session.linked_path = self._link_project(project_path)
+                    self._guard_unique_cwd(session)
+                    self._write_configs(session)
+                    await self._start_claude(session)
+                    await self._wait_ready(session)
+                except Exception:
+                    await self._terminate(session)
+                    self._inflight_ports.discard(session.port)
+                    async with self._lock:
+                        self._by_name.pop(slug, None)
+                    self.save_state()
+                    raise
+            finally:
+                # Успех — сессию дальше считает count(); провал или отмена —
+                # слот обязан вернуться, иначе он утечёт до перезапуска.
+                self._release_slot(slug)
 
             self._start_watcher(session)
             self.save_state()
             return session
+
+    def _guard_limit(self, name: str | None = None) -> None:
+        """Занять слот под запуск ещё одной сессии. Нет места — SessionError.
+
+        Считаем живые процессы ПЛЮС те, что прямо сейчас поднимаются: между
+        проверкой и появлением session.process проходит несколько секунд
+        (старт claude, ожидание готовности), и без учёта стартующих два
+        параллельных подъёма — /new и resume в соседнем топике — прошли бы
+        лимит оба.
+
+        Вызывать под self._lock. Слот освобождает _release_slot: его обязан
+        позвать и успешный старт, и любой провал, иначе имя останется
+        «вечно стартующим» и съест слот до перезапуска оркестратора.
+
+        Слот уже за этим именем (перезапуск живой сессии — см. _reserve_slot):
+        проверять нечего, иначе перезапуск отказывал бы сам себе.
+        """
+        if name is not None and name in self._starting:
+            return
+        if self.count() + len(self._starting) >= self.config.max_instances:
+            raise SessionError(
+                f"Достигнут лимит одновременно запущенных сессий "
+                f"({self.config.max_instances}). Останови ненужную "
+                f"(/close_session) или подними MAX_INSTANCES в .env."
+            )
+        if name is not None:
+            self._starting.add(name)
+
+    def _reserve_slot(self, name: str) -> None:
+        """Придержать слот, который сессии УЖЕ принадлежит, — без проверки.
+
+        Случай — /clear и смена модели на живой сессии: процесс гасится и
+        поднимается снова, и в паузе между stop и start count() показывает на
+        единицу меньше. Без резерва конкурентный /new успел бы занять
+        освободившееся на секунду место, и после рестарта живых стало бы
+        больше лимита. Проверять лимит тут НЕЛЬЗЯ: слот и так её, отказ
+        означал бы «сессию нельзя перезапустить, потому что она запущена».
+        """
+        self._starting.add(name)
+
+    def _release_slot(self, name: str) -> None:
+        """Снять резерв слота: процесс поднялся (учтётся в count()) или упал.
+
+        БЕЗ self._lock, намеренно: discard не делает await, а event loop у нас
+        один — влезть между чтением и записью некому. Зато вызов безопасен из
+        finally при отмене задачи, где взятие лока само бросило бы
+        CancelledError и слот утёк бы навсегда, срезав лимит до перезапуска.
+        """
+        self._starting.discard(name)
+
+    def check_resources(self, sandbox: str | None) -> None:
+        """Хватит ли машине памяти на ещё одну сессию? Иначе SessionError.
+
+        Зовётся перед КАЖДЫМ подъёмом процесса (create и resume/revive), а не
+        только при создании: остановленная сессия ресурсов не занимала, и её
+        возобновление для машины — такой же новый процесс, как /new.
+
+        Проверка выключена (MIN_FREE_RAM_MB=0) или память неизвестна — молча
+        пропускаем: см. resources.check_memory.
+        """
+        engine = sandbox if sandbox is not None else self.config.sandbox
+        needed = resources.session_cost_mb(engine, self.config.agent_vm_memory_gib)
+        verdict = resources.check_memory(
+            resources.available_ram_mb(),
+            needed,
+            self.config.min_free_ram_mb,
+        )
+        if not verdict.allowed:
+            raise SessionError(
+                f"Недостаточно свободной памяти: {verdict.reason}. "
+                f"Останови ненужную сессию (/close_session) или снизь "
+                f"порог MIN_FREE_RAM_MB в .env."
+            )
 
     def _check_engine(self, engine: str) -> None:
         """Движок доступен этому оркестратору и готов к работе? Иначе SessionError
@@ -947,11 +1049,34 @@ class SessionManager:
                 logger.info(
                     "Сессия %s: канал мёртв при живом процессе — переподнимаю",
                     session.name)
+                # Слот её; придерживаем на паузу между stop и start, иначе
+                # конкурентный /new займёт освободившееся на секунду место.
+                self._reserve_slot(session.name)
                 await self._stop_process(session)
             return await self._resume_locked(session)
 
     async def _resume_locked(self, session: Session) -> bool:
+        """Поднять процесс остановленной сессии. Слот держим весь подъём.
+
+        Слот занимает _resume_started (под локом) и отпускает finally ниже —
+        на успехе, на исключении и при отмене задачи. Иначе провалившийся
+        resume навсегда занял бы место в лимите.
+        """
         self._guard_engine(session)
+        # Возобновление поднимает НОВЫЙ процесс — для машины это такая же
+        # нагрузка, как /new, и лимит с ресурсами тут обязаны сработать.
+        # Иначе через resume остановленных сессий оба ограничения обходятся.
+        self.check_resources(session.sandbox)
+        try:
+            return await self._resume_started(session)
+        finally:
+            self._release_slot(session.name)
+
+    async def _resume_started(self, session: Session) -> bool:
+        async with self._lock:
+            # Сама сессия ещё не запущена — в count() не входит, сравнение
+            # прямое: столько уже живёт/стартует, влезет ли ещё одна.
+            self._guard_limit(session.name)
         # Раннеры с unique_cwd (agent-vm): гвард нужен и на resume/clear, не
         # только на create — иначе восстановленные из .sessions.json две сессии
         # на один cwd убьют VM друг друга при первом сообщении.
@@ -1002,22 +1127,42 @@ class SessionManager:
         """Перезапустить Claude с чистым контекстом: та же папка, тот же топик."""
         async with session.ops:
             self._guard_engine(session)  # до остановки процесса и выдачи порта
-            await self._stop_process(session, save=False)
-            await self._wait_port_free(session.port)
-            session.claude_session_id = str(uuid.uuid4())
-            async with self._lock:
-                self._allocate_port(session)
-            self._write_configs(session)
+            # На ЖИВОЙ сессии /clear — это stop+start: слот уже её, лимит по
+            # нулям. А вот на ОСТАНОВЛЕННОЙ он поднимает процесс с нуля, ровно
+            # как resume, — без этих проверок через /clear обходились бы и
+            # лимит, и запас памяти.
+            if session.running:
+                # Слот уже её — не проверяем, а придерживаем на время
+                # stop+start, иначе конкурентный /new займёт место, которое
+                # освободилось на секунду.
+                self._reserve_slot(session.name)
+            else:
+                self.check_resources(session.sandbox)
+                async with self._lock:
+                    self._guard_limit(session.name)
             try:
-                await self._start_claude(session)
-                await self._wait_ready(session)
-            except Exception:
-                await self._stop_process(session, save=False)
-                self.save_state()
-                raise
-            session.started_at = time.time()
-            self._start_watcher(session)
+                await self._clear_locked(session)
+            finally:
+                self._release_slot(session.name)
+
+    async def _clear_locked(self, session: Session) -> None:
+        """Тело /clear. Зовётся под session.ops (см. clear)."""
+        await self._stop_process(session, save=False)
+        await self._wait_port_free(session.port)
+        session.claude_session_id = str(uuid.uuid4())
+        async with self._lock:
+            self._allocate_port(session)
+        self._write_configs(session)
+        try:
+            await self._start_claude(session)
+            await self._wait_ready(session)
+        except Exception:
+            await self._stop_process(session, save=False)
             self.save_state()
+            raise
+        session.started_at = time.time()
+        self._start_watcher(session)
+        self.save_state()
 
     async def set_model(self, session: Session, model: str) -> bool:
         """Сменить модель: перезапуск с --model, контекст — через resume.
@@ -1030,6 +1175,9 @@ class SessionManager:
             async with session.ops:
                 session.model = model or None
                 if session.running:
+                    # Перезапуск живой сессии: слот её, придерживаем на паузу
+                    # между stop и start (_resume_locked снимет резерв сам).
+                    self._reserve_slot(session.name)
                     await self._stop_process(session, save=False)
                 return await self._resume_locked(session)
         except Exception:

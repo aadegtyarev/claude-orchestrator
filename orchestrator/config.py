@@ -101,7 +101,10 @@ class Config:
     channel_port_start: int
     channel_port_end: int
     sessions_dir: Path
-    max_instances: int
+    max_instances: int  # лимит ОДНОВРЕМЕННО ЗАПУЩЕННЫХ (остановленные не в счёт)
+    # Сколько МБ памяти обязано остаться машине после старта сессии. 0 —
+    # проверку не делать (лимит тогда только по штукам, как раньше).
+    min_free_ram_mb: int
     claude_bin: str
     orch_host: str
     orch_port: int
@@ -329,6 +332,7 @@ class Config:
                 os.getenv("SESSIONS_DIR", "~/claude-orchestrator-sessions")
             ).expanduser(),
             max_instances=int(os.getenv("MAX_INSTANCES", "5")),
+            min_free_ram_mb=int(os.getenv("MIN_FREE_RAM_MB", "1024")),
             claude_bin=os.getenv("CLAUDE_BIN", "claude"),
             orch_host=os.getenv("ORCH_HOST", "127.0.0.1"),
             orch_port=int(os.getenv("ORCH_PORT", "18080")),

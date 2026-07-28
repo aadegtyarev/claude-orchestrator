@@ -46,9 +46,19 @@ async def run():
     try:
         port = _free_port()
         m = SessionManager.__new__(SessionManager)
-        m.config = SimpleNamespace(channel_port_start=port, channel_port_end=port)
+        m.config = SimpleNamespace(
+            channel_port_start=port,
+            channel_port_end=port,
+            # resume проверяет лимит живых сессий и запас памяти; здесь тест про
+            # порты — лимит заведомо не мешает, ресурсный чек выключен (0).
+            max_instances=10,
+            min_free_ram_mb=0,
+            sandbox="bwrap",
+            agent_vm_memory_gib=None,
+        )
         m._by_name = {}
         m._inflight_ports = set()
+        m._starting = set()  # резерв слота на время подъёма (см. _guard_limit)
         m._lock = asyncio.Lock()
 
         session = FakeSession(port)

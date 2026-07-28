@@ -347,7 +347,14 @@ class OrchestratorCore:
             raise UserError(self.t("name_exists", name=slug))
         if self.manager.count() >= self.config.max_instances:
             raise UserError(self.t("limit_reached", limit=self.config.max_instances))
+        # Ресурсный пре-чек здесь же, рядом с лимитом: отказ на языке бота и ДО
+        # создания папок/портов. manager.create проверит ещё раз (он же точка
+        # входа для не-ботовых вызовов) — двойная проверка тут дешёвая.
         sandbox = self.resolve_box(box)
+        try:
+            self.manager.check_resources(sandbox)
+        except SessionError as e:
+            raise UserError(str(e)) from e
         try:
             session = await self.manager.create(title, project_path, sandbox)
         except SessionError as e:

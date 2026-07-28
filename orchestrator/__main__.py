@@ -73,7 +73,9 @@ async def main() -> None:
 
     manager = SessionManager(config)
     manager.load_state()  # сессии с прошлого запуска: возобновятся по сообщению
-    restored = manager.count()
+    # Именно total(): сразу после load_state все записи числятся остановленными
+    # (процессов ещё нет), а count() считает только живые и дал бы здесь 0.
+    restored = manager.total()
 
     core = OrchestratorCore(config, manager)
     for adapter in make_adapters(config, core):
