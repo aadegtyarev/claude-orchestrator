@@ -218,6 +218,26 @@ def test_restart_of_running_session_is_not_denied_by_its_own_slot():
     mgr._guard_limit("живая")  # не бросает: слот уже её
 
 
+async def test_clear_releases_slot_when_stop_fails(tmp_path: Path):
+    """Упавший stop при перезапуске живой сессии не должен красть слот.
+
+    Резерв берётся ДО остановки процесса, поэтому исключение из неё обязано
+    пройти через тот же finally.
+    """
+    mgr = make_manager(max_instances=1, sessions_dir=tmp_path)
+    mgr._lock = asyncio.Lock()
+    mgr._guard_engine = lambda s: None
+    session = add(mgr, "живая", running=True)
+
+    async def boom(sess, save=True):
+        raise SessionError("процесс не гасится")
+
+    mgr._stop_process = boom
+    with pytest.raises(SessionError, match="не гасится"):
+        await mgr.clear(session)
+    assert mgr._starting == set()
+
+
 async def test_create_denies_when_limit_of_running_reached():
     mgr = make_manager(max_instances=1)
     add(mgr, "живая", running=True)

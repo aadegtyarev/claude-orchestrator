@@ -1045,15 +1045,20 @@ class SessionManager:
         Возвращает True, если контекст удалось продолжить (как resume).
         """
         async with session.ops:
-            if session.running:
-                logger.info(
-                    "Сессия %s: канал мёртв при живом процессе — переподнимаю",
-                    session.name)
-                # Слот её; придерживаем на паузу между stop и start, иначе
-                # конкурентный /new займёт освободившееся на секунду место.
-                self._reserve_slot(session.name)
+            if not session.running:
+                return await self._resume_locked(session)
+            logger.info(
+                "Сессия %s: канал мёртв при живом процессе — переподнимаю",
+                session.name)
+            # Слот её; придерживаем на паузу между stop и start, иначе
+            # конкурентный /new займёт освободившееся на секунду место.
+            # try с самого резерва: упади _stop_process — слот утёк бы.
+            self._reserve_slot(session.name)
+            try:
                 await self._stop_process(session)
-            return await self._resume_locked(session)
+                return await self._resume_locked(session)
+            finally:
+                self._release_slot(session.name)
 
     async def _resume_locked(self, session: Session) -> bool:
         """Поднять процесс остановленной сессии. Слот держим весь подъём.
@@ -1127,19 +1132,17 @@ class SessionManager:
         """Перезапустить Claude с чистым контекстом: та же папка, тот же топик."""
         async with session.ops:
             self._guard_engine(session)  # до остановки процесса и выдачи порта
-            # На ЖИВОЙ сессии /clear — это stop+start: слот уже её, лимит по
-            # нулям. А вот на ОСТАНОВЛЕННОЙ он поднимает процесс с нуля, ровно
-            # как resume, — без этих проверок через /clear обходились бы и
-            # лимит, и запас памяти.
-            if session.running:
+            if not session.running:
+                # Поднимаем процесс с нуля, ровно как resume: без этих
+                # проверок через /clear обходились бы и лимит, и запас памяти.
+                self.check_resources(session.sandbox)
+                async with self._lock:
+                    self._guard_limit(session.name)
+            else:
                 # Слот уже её — не проверяем, а придерживаем на время
                 # stop+start, иначе конкурентный /new займёт место, которое
                 # освободилось на секунду.
                 self._reserve_slot(session.name)
-            else:
-                self.check_resources(session.sandbox)
-                async with self._lock:
-                    self._guard_limit(session.name)
             try:
                 await self._clear_locked(session)
             finally:
@@ -1174,12 +1177,17 @@ class SessionManager:
         try:
             async with session.ops:
                 session.model = model or None
-                if session.running:
-                    # Перезапуск живой сессии: слот её, придерживаем на паузу
-                    # между stop и start (_resume_locked снимет резерв сам).
-                    self._reserve_slot(session.name)
+                if not session.running:
+                    return await self._resume_locked(session)
+                # Перезапуск живой сессии: слот её, придерживаем на паузу
+                # между stop и start. finally с самого резерва: упади
+                # _stop_process — слот утёк бы.
+                self._reserve_slot(session.name)
+                try:
                     await self._stop_process(session, save=False)
-                return await self._resume_locked(session)
+                    return await self._resume_locked(session)
+                finally:
+                    self._release_slot(session.name)
         except Exception:
             session.model = old_model
             self.save_state()
