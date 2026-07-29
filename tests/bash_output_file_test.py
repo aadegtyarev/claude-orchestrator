@@ -21,6 +21,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from orchestrator.core.app import BASH_OUTPUT_LIMIT, OrchestratorCore  # noqa: E402
+from orchestrator.core.bashshell import OutputCapture  # noqa: E402
 from orchestrator.core.sessions import Session  # noqa: E402
 from orchestrator.core.texts import get_texts  # noqa: E402
 
@@ -91,62 +92,68 @@ def test_timeout_output_truncated():
     assert truncated
 
 
-# ── _save_bash_output: файл и его содержимое ─────────────────────
+# ── путь файла и запись через OutputCapture ──────────────────────
+#
+# Раньше вывод сохранялся отдельным проходом (_save_bash_output) уже ПОСЛЕ
+# команды — из кольцевого буфера PTY, который к тому моменту мог потерять
+# начало. Теперь пишет OutputCapture по ходу выполнения, поэтому проверяем
+# путь (куда) и запись (что именно легло).
 
 
-def test_save_with_session_creates_file_in_workspace(tmp_path: Path):
-    """С сессией файл пишется в .bash_outputs/ внутри session_dir."""
+def capture_to(path: Path, payload: bytes, tail_cap: int = 100):
+    """Прогнать вывод через перехват и вернуть его же (файл уже закрыт)."""
+    cap = OutputCapture(path, "__B__", "__D__", tail_cap=tail_cap)
+    cap.feed(b"__B__\n" + payload + b"__D__ 0\n")
+    cap.close()
+    return cap
+
+
+def test_path_with_session_is_inside_workspace(tmp_path: Path):
+    """С сессией файл лежит в .bash_outputs/ её папки — веб отдаёт из jail."""
     core = _make_core()
     session = _make_session(tmp_path)
-    out = b"line1\nline2\nline3\n"
-    path_str = core._save_bash_output("ls -la", out, session)
-    path = Path(path_str)
-    assert path.exists()
-    assert path.is_file()
-    # Проверяем, что лежит внутри session_dir
-    assert str(session.session_dir) in path_str
-    assert ".bash_outputs" in path_str
-    # Содержимое — полный вывод, а не обрезок.
-    content = path.read_text(encoding="utf-8")
-    assert content == "line1\nline2\nline3\n"
-    # Имя осмысленное: команда + время + .txt
-    assert path.name.startswith("bash_")
-    assert path.name.endswith(".txt")
+    path = core.bash_output_path("ls -la", session)
+    assert path.parent == session.session_dir / ".bash_outputs"
+    assert path.name.startswith("bash_") and path.name.endswith(".txt")
 
 
-def test_save_without_session_creates_temp_file():
-    """Без сессии (main-chat) файл создаётся во временном каталоге ОС."""
+def test_path_without_session_is_in_tempdir():
+    """Без сессии (главный чат) — временный каталог ОС."""
     core = _make_core()
-    out = b"host output\n"
-    path_str = core._save_bash_output("hostname", out, None)
-    path = Path(path_str)
-    assert path.exists()
-    assert path.is_file()
-    # Временный каталог (обычно /tmp или /var/tmp).
-    tmp_root = Path(tempfile.gettempdir())
-    assert path.is_relative_to(tmp_root)
-    content = path.read_text(encoding="utf-8")
-    assert content == "host output\n"
-    # Убираем за собой — файл не должен течь.
-    path.unlink()
+    path = core.bash_output_path("hostname", None)
+    assert path.is_relative_to(Path(tempfile.gettempdir()))
 
 
 def test_full_output_not_trimmed_in_file(tmp_path: Path):
-    """Файл содержит ПОЛНЫЙ вывод, даже когда он сильно длиннее лимита."""
-    core = _make_core()
-    session = _make_session(tmp_path)
-    # Генерим вывод втрое длиннее лимита — каждая строка уникальна.
+    """В файле ПОЛНЫЙ вывод, включая начало, которое не влезло в хвост."""
     lines = [f"line_{i:06d}" for i in range(BASH_OUTPUT_LIMIT // 5)]
-    full = "\n".join(lines)
-    assert len(full) > BASH_OUTPUT_LIMIT * 2
-    path_str = core._save_bash_output("big_cmd", full.encode(), session)
-    content = Path(path_str).read_text(encoding="utf-8")
-    # Первая строка на месте (рендер её обрезал бы).
-    assert content.startswith("line_000000")
-    # Последняя строка на месте.
-    assert content.rstrip().endswith(lines[-1])
-    # Общее число строк совпадает.
-    assert content.count("\n") == len(lines) - 1
+    payload = ("\n".join(lines) + "\n").encode()
+    cap = capture_to(tmp_path / "out.txt", payload)
+    content = cap.path.read_text(encoding="utf-8")
+    assert content.startswith("line_000000")     # начало на месте
+    assert content.rstrip().endswith(lines[-1])  # и конец тоже
+    assert content.strip().count("\n") == len(lines) - 1  # все строки на месте
+
+
+def test_no_file_for_short_output(tmp_path: Path):
+    """Короткий вывод файла не заводит — не сорим на каждом `ls`."""
+    cap = capture_to(tmp_path / "out.txt", "коротко\n".encode(), tail_cap=10_000)
+    assert not cap.overflowed
+    assert not cap.path.exists()
+
+
+def test_symlinked_folder_is_refused(tmp_path: Path):
+    """Папку вывода модель видит на запись: симлинк наружу — отказ.
+
+    Иначе и запись, и чистка ушли бы по ссылке и удаляли чужие bash_*.txt.
+    """
+    victim = tmp_path / "чужое"
+    victim.mkdir()
+    link = tmp_path / ".bash_outputs"
+    link.symlink_to(victim)
+    cap = capture_to(link / "out.txt", b"x" * 5000)
+    assert not cap.path.exists()          # ничего не записали
+    assert list(victim.iterdir()) == []    # и чужую папку не тронули
 
 
 # ── Невалидный UTF-8 ─────────────────────────────────────────────
@@ -163,32 +170,27 @@ def test_invalid_utf8_in_bash_render():
     assert "�" in html or "before" in html
 
 
-def test_invalid_utf8_in_save_bash_output(tmp_path: Path):
-    """Мусорные байты не роняют сохранение файла."""
-    core = _make_core()
-    session = _make_session(tmp_path)
-    bad = b"valid start \xff\xfe garbage \x00 end"
-    path_str = core._save_bash_output("broken_cmd", bad, session)
-    content = Path(path_str).read_text(encoding="utf-8")
-    # Валидная часть на месте.
-    assert "valid start" in content
-    assert "end" in content
-    # Мусор заменён на replacement character.
-    assert "�" in content
+def test_invalid_utf8_written_to_file(tmp_path: Path):
+    """Мусорные байты не роняют запись — в файл едут как есть, а показ
+    декодируется с заменой (см. bash_render)."""
+    bad = b"valid start \xff\xfe garbage \x00 end\n"
+    cap = capture_to(tmp_path / "out.txt", bad + b"x" * 5000)
+    content = cap.path.read_bytes()
+    assert b"valid start" in content and b"end" in content
 
 
 # ── Очистка и граничные случаи ───────────────────────────────────
 
 
-def test_file_can_be_cleaned_up(tmp_path: Path):
-    """Сохранённый файл — обычный файл: можно удалить, ОС не держит."""
-    core = _make_core()
-    session = _make_session(tmp_path)
-    path_str = core._save_bash_output("cleanup_test", b"data", session)
-    path = Path(path_str)
-    assert path.exists()
-    path.unlink()
-    assert not path.exists()
+def test_old_files_are_trimmed(tmp_path: Path):
+    """Файлы вывода не копятся: держим только последние (BASH_OUTPUTS_KEEP)."""
+    import os
+    for i in range(5):
+        f = tmp_path / f"bash_2026010{i}_00000{i}_cmd.txt"
+        f.write_text("данные", encoding="utf-8")
+        os.utime(f, (1000 + i, 1000 + i))
+    OrchestratorCore._trim_bash_outputs(tmp_path, keep=2)
+    assert len(list(tmp_path.glob("bash_*.txt"))) == 2
 
 
 def test_empty_output_not_truncated():
