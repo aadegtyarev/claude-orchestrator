@@ -1765,7 +1765,7 @@ class OrchestratorCore:
             path.write_text(text, encoding="utf-8")
             self._trim_bash_outputs(d)
         else:
-            fd, path_str = tempfile.mkstemp(suffix=".txt", prefix=f"bash_output_")
+            fd, path_str = tempfile.mkstemp(suffix=".txt", prefix="bash_output_")
             os.close(fd)
             Path(path_str).write_text(text, encoding="utf-8")
             return path_str

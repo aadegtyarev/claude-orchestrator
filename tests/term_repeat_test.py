@@ -145,49 +145,36 @@ def test_history_is_per_terminal_key():
 # ── правка сообщения = перезапуск ────────────────────────────────────
 
 
-def test_message_map_edit_reruns():
-    """Правка сообщения из карты _term_msgs вызывает перезапуск.
+def evict(term_msgs: dict, limit: int) -> None:
+    """Копия правила вытеснения из адаптера (TelegramAdapter._run_bash_cmd).
 
-    Проверяем логику на уровне адаптера без бота: если edited_message
-    приходит на id из _term_msgs — команда переисполняется; посторонний
-    id — игнорируется.
+    Именно `min`, а не «первый ключ dict»: id сообщений Telegram монотонно
+    растут, поэтому наименьший — самый старый. Порядок вставки в dict — деталь
+    реализации CPython, полагаться на неё в инварианте нельзя.
     """
-    from orchestrator.adapters.telegram.cbdata import termrepeat_cb  # noqa: E402
-
-    # Имитируем карту _term_msgs адаптера руками.
-    term_msgs: dict[int, tuple[int, str, str | None]] = {
-        100: (200, "s:proj:tg1", "ls -la"),
-        101: (201, "s:proj:tg1", "pytest"),
-    }
-
-    # Сообщение, которым запускалась команда — есть в карте.
-    assert 100 in term_msgs
-    status_id, key, last_cmd = term_msgs[100]
-    assert status_id == 200
-    assert key == "s:proj:tg1"
-    assert last_cmd == "ls -la"
-
-    # Постороннее сообщение — нет в карте.
-    assert 999 not in term_msgs
+    while len(term_msgs) > limit:
+        del term_msgs[min(term_msgs)]
 
 
-def test_message_map_size_limited():
-    """Карта _term_msgs не растёт бесконечно — старые записи вытесняются."""
-    term_msgs: dict[int, tuple[int, str, str | None]] = {}
-    limit = 10
+def test_message_map_evicts_oldest_by_id():
+    """Вытесняем самые старые сообщения, а не случайные."""
+    term_msgs = {}
+    for msg_id in (500, 100, 300, 200, 400):  # намеренно не по порядку
+        term_msgs[msg_id] = (msg_id + 1000, "s:proj:tg1", f"cmd{msg_id}")
+        evict(term_msgs, limit=3)
+    assert sorted(term_msgs) == [300, 400, 500]
 
-    for i in range(limit + 5):
-        term_msgs[i] = (i + 1000, f"key:{i}", f"cmd{i}")
-        while len(term_msgs) > limit:
-            oldest = next(iter(term_msgs))
-            del term_msgs[oldest]
 
-    assert len(term_msgs) <= limit
-    # Самые старые (0..4) вытеснены.
-    assert 0 not in term_msgs
-    assert 4 not in term_msgs
-    # Свежие на месте.
-    assert (limit + 4) in term_msgs
+def test_message_map_eviction_is_not_insertion_order():
+    """Порядок ВСТАВКИ не должен решать, кого вытеснить.
+
+    Регресс на случай, если кто-то вернёт `next(iter(dict))`: там первым
+    удалился бы 900 (вставлен раньше), хотя он самый свежий по id.
+    """
+    term_msgs = {900: ("x",), 100: ("y",), 200: ("z",)}
+    evict(term_msgs, limit=2)
+    assert 100 not in term_msgs  # самый старый по id
+    assert sorted(term_msgs) == [200, 900]
 
 
 # ── кнопка Прервать ──────────────────────────────────────────────────
