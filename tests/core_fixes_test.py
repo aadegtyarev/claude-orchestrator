@@ -22,6 +22,8 @@ from orchestrator.core.app import OrchestratorCore  # noqa: E402
 from orchestrator.core.history import HistoryLog  # noqa: E402
 from orchestrator.core.permission import PermissionRelay  # noqa: E402
 from orchestrator.core.subagentnaming import SubagentNaming  # noqa: E402
+from orchestrator.core.termhistory import TermHistory  # noqa: E402
+from orchestrator.core.termmode import TerminalMode  # noqa: E402
 from orchestrator.core.toolactivity import ToolActivity  # noqa: E402
 from orchestrator.core.bubble import BubbleManager  # noqa: E402
 from orchestrator.core.texts import get_texts  # noqa: E402
@@ -54,6 +56,8 @@ def make_core():
     core.journal = HistoryLog(Path("unused-in-tests.json"))
     core.tools = ToolActivity()
     core.naming = SubagentNaming()
+    core.term = TerminalMode()
+    core.termhist = TermHistory()
     core.adapters = {}
     core.perms = PermissionRelay(
         core.manager, core.t, core._each_transport, core._record

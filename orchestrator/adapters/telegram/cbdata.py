@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+import hashlib
+
 
 def _parse_thread(data: str) -> int | None:
     """Разбор компактного формата `<префикс>:<thread_id>` → thread_id или None.
@@ -101,4 +103,59 @@ def parse_perm(data: str) -> tuple[int, str, str] | None:
         _, thread_raw, request_id = prefix.split(":", 2)
         return int(thread_raw), request_id, behavior
     except ValueError:
+        return None
+
+
+# ── кнопки под выводом команды терминала ─────────────────────────
+
+
+def termint_cb(thread_id: int) -> str:
+    """⏹ Прервать — послать Ctrl-C в bash-терминал топика."""
+    return f"termint:{thread_id}"
+
+
+def parse_termint(data: str) -> int | None:
+    return _parse_thread(data)
+
+
+def termrepeat_cb(thread_id: int) -> str:
+    """↻ Повторить — выполнить последнюю команду снова."""
+    return f"termrepeat:{thread_id}"
+
+
+def parse_termrepeat(data: str) -> int | None:
+    return _parse_thread(data)
+
+
+def termhist_cb(thread_id: int) -> str:
+    """🕘 История — показать меню последних команд (0 — страница)."""
+    return f"termhist:{thread_id}"
+
+
+def parse_termhist(data: str) -> int | None:
+    return _parse_thread(data)
+
+
+def cmd_digest(cmd: str) -> str:
+    """Короткий отпечаток команды для callback_data.
+
+    Адресоваться по ПОЗИЦИИ в истории нельзя: повтор поднимает команду
+    наверх, список перенумеровывается, а кнопки в уже отправленном меню
+    остаются старыми — и кнопка с подписью «rm -rf build» запускала бы
+    совсем другое. Отпечаток привязывает кнопку к самой команде.
+    """
+    return hashlib.sha256(cmd.encode()).hexdigest()[:16]
+
+
+def termhistrun_cb(thread_id: int, cmd: str) -> str:
+    """Выполнить команду из истории — адресуемся отпечатком, не позицией."""
+    return f"termhistrun:{thread_id}:{cmd_digest(cmd)}"
+
+
+def parse_termhistrun(data: str) -> tuple[int, str] | None:
+    """(thread_id, отпечаток команды) либо None."""
+    try:
+        _, thread_raw, digest = data.split(":", 2)
+        return int(thread_raw), digest
+    except (IndexError, ValueError):
         return None

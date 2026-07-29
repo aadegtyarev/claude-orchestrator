@@ -35,6 +35,8 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• <code>/close_session</code> — остановить; продолжение — сообщением\n"
             "• <code>/delete_session</code> — удалить сессию вместе с топиком\n"
             "• <code>/bash &lt;cmd&gt;</code> / <code>/bashin</code> — терминал в песочнице сессии\n"
+            "• <code>/term [on|off]</code> — липкий режим: обычные сообщения → шелл, "
+            "<code>&gt;</code> → claude\n"
             "• другие <code>/команды</code> — уходят в терминал Claude Code\n\n"
             "Пока Claude работает, в топике живёт статус-бабл: вызовы\n"
             "инструментов, сабагенты и промежуточные ответы, кнопки 📋 Отчёт / ⛔ Прервать.\n"
@@ -45,14 +47,41 @@ MESSAGES: dict[str, dict[str, str]] = {
         "only_topic": "Команда работает в топике сессии.",
         "bash_usage": "Использование: /bash &lt;команда&gt;",
         "bash_no_isolation": "❌ /bash недоступен под SANDBOX={sandbox}: отдельный терминал в этом режиме не изолировать (одна VM на каталог). Используй SANDBOX=bwrap для /bash.",
-        "bash_busy": "⏳ В этом топике уже выполняется команда — дождись завершения (можно /bashin, если она ждёт ввод).",
+        "bash_busy": "⏳ В этом топике уже выполняется команда — дождись завершения. Если она ждёт ответа, включи /term on и просто напиши ответ сообщением.",
         "bash_running": "⚡ Выполняю: <code>{cmd}</code>…",
         "bash_no_output": "(нет вывода)",
         "bash_wait": "⏳ выполняется…",
         "bash_done": "✅ код возврата: {code}",
-        "bash_timeout": "⏱ таймаут — процесс мог остаться работать в фоне. /bashin чтобы досыпать ввод.",
+        "bash_timeout": "⏱ таймаут — процесс мог остаться работать в фоне. Ответить ему: /term on и обычным сообщением.",
         "bash_not_running": "В этом топике нет открытого /bash. Запусти командой /bash &lt;команда&gt;.",
+        "bash_output_truncated": "📄 Вывод не влез в сообщение — прикрепил файлом ({lines} строк, {size}).",
         "bashin_sent": "⌨️ Отправил в терминал: <code>{text}</code>",
+        "term_on": (
+            "🖥 Режим терминала включён. Обычные сообщения уходят в шелл.\n"
+            "Рабочий каталог: <code>{cwd}</code>\n"
+            "<code>&gt;</code> перед сообщением — отправить claude, "
+            "<code>&gt;&gt;</code> — экранировать сам <code>&gt;</code> (уйдёт в шелл)."
+        ),
+        "term_off": "🖥 Режим терминала выключен. Сообщения снова уходят claude.",
+        "term_status_on": (
+            "🖥 Режим терминала: <b>включён</b>\n"
+            "Каталог: <code>{cwd}</code>\n"
+            "Занят командой: {busy}\n"
+            "<code>&gt;</code> → claude, <code>&gt;&gt;</code> → экранировать <code>&gt;</code>"
+        ),
+        "term_status_off": "🖥 Режим терминала: <b>выключен</b>",
+        "term_no_main_chat": (
+            "❌ Режим терминала включается только в топике сессии — не в основном чате.\n\n"
+            "В основном чате /bash выполняет команды на ХОСТЕ с правами оператора "
+            "без песочницы. Включить здесь липкий режим значило бы, что любое "
+            "случайно отправленное сообщение выполнилось бы на хосте. Это осознанный "
+            "запрет, а не «пока не реализовано».\n\n"
+            "Создай сессию (/new) и включи /term в её топике."
+        ),
+        "term_unknown_arg": (
+            "❌ Неизвестный аргумент: <code>{arg}</code>. Допустимо: "
+            "<code>on</code>, <code>off</code>."
+        ),
         "new_usage": (
             "Укажи имя или путь:\n/new my-project\n/new /home/user/project\n"
             "/new my-project --box off — без изоляции\n"
@@ -297,7 +326,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "menu_delete": "Удалить сессию и топик",
         "menu_help": "Справка",
         "menu_bash": "Выполнить bash-команду (мимо Claude)",
-        "menu_bashin": "Досыл ввода в открытый /bash (y/n и т.п.)",
+        "menu_term": "Липкий режим терминала: сообщения → шелл",
         "menu_chat_id": "ID чата (для TELEGRAM_CHAT_ID)",
         "chat_id_bound_now": (
             "✅ Чат привязан к боту.\n"
@@ -314,6 +343,14 @@ MESSAGES: dict[str, dict[str, str]] = {
             "⚠️ Бот привязан к другому чату (<code>{bound}</code>) — "
             "чтобы работать здесь, поменяй TELEGRAM_CHAT_ID в .env и перезапусти."
         ),
+        # Кнопки под выводом команды терминала.
+        "term_btn_interrupt": "⏹ Прервать",
+        "term_btn_repeat": "↻ Повторить",
+        "term_btn_history": "🕘 История",
+        "term_interrupted": "⏹ Прервано (Ctrl-C).",
+        "term_history_title": "🕘 Последние команды:",
+        "term_history_empty": "История команд пуста.",
+        "term_history_gone": "Команда уже недоступна — сессия или история изменились.",
     },
     "en": {
         "help": (
@@ -347,6 +384,8 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• <code>/close_session</code> — stop; continue by sending a message\n"
             "• <code>/delete_session</code> — delete the session and its topic\n"
             "• <code>/bash &lt;cmd&gt;</code> / <code>/bashin</code> — terminal in the session sandbox\n"
+            "• <code>/term [on|off]</code> — sticky mode: plain messages → shell, "
+            "<code>&gt;</code> → claude\n"
             "• other <code>/commands</code> — typed into the Claude Code terminal\n\n"
             "While Claude works, a status bubble lives in the topic: tool calls,\n"
             "subagents, intermediate replies, and 📋 Report / ⛔ Interrupt buttons.\n"
@@ -357,14 +396,41 @@ MESSAGES: dict[str, dict[str, str]] = {
         "only_topic": "This command works in a session topic.",
         "bash_usage": "Usage: /bash &lt;command&gt;",
         "bash_no_isolation": "❌ /bash unavailable under SANDBOX={sandbox}: a separate terminal can't be isolated in this mode (one VM per dir). Use SANDBOX=bwrap for /bash.",
-        "bash_busy": "⏳ A command is already running in this topic — wait for it to finish (or /bashin if it's waiting for input).",
+        "bash_busy": "⏳ A command is already running in this topic — wait for it to finish. If it is waiting for an answer, turn on /term on and just send the answer as a message.",
         "bash_running": "⚡ Running: <code>{cmd}</code>…",
         "bash_no_output": "(no output)",
         "bash_wait": "⏳ running…",
         "bash_done": "✅ exit code: {code}",
-        "bash_timeout": "⏱ timeout — the process may still be running in the background. Use /bashin to send input.",
+        "bash_timeout": "⏱ timeout — the process may still be running in the background. To answer it: /term on, then a plain message.",
         "bash_not_running": "No open /bash in this topic. Start one with /bash &lt;command&gt;.",
+        "bash_output_truncated": "📄 Output didn't fit in the message — attached as file ({lines} lines, {size}).",
         "bashin_sent": "⌨️ Sent to terminal: <code>{text}</code>",
+        "term_on": (
+            "🖥 Terminal mode ON. Plain messages go to the shell.\n"
+            "Working directory: <code>{cwd}</code>\n"
+            "<code>&gt;</code> prefix — send to claude, "
+            "<code>&gt;&gt;</code> — escape the <code>&gt;</code> itself (goes to shell)."
+        ),
+        "term_off": "🖥 Terminal mode OFF. Messages go to claude again.",
+        "term_status_on": (
+            "🖥 Terminal mode: <b>ON</b>\n"
+            "Directory: <code>{cwd}</code>\n"
+            "Busy: {busy}\n"
+            "<code>&gt;</code> → claude, <code>&gt;&gt;</code> → escape <code>&gt;</code>"
+        ),
+        "term_status_off": "🖥 Terminal mode: <b>OFF</b>",
+        "term_no_main_chat": (
+            "❌ Terminal mode can only be turned on in a session topic — not in the main chat.\n\n"
+            "In the main chat, /bash runs commands on the HOST with operator privileges "
+            "and no sandbox. Turning on sticky mode here would mean any accidentally "
+            "sent message executes on the host. This is an intentional restriction, "
+            "not a \"not yet implemented\".\n\n"
+            "Create a session (/new) and enable /term in its topic."
+        ),
+        "term_unknown_arg": (
+            "❌ Unknown argument: <code>{arg}</code>. Allowed: "
+            "<code>on</code>, <code>off</code>."
+        ),
         "new_usage": (
             "Provide a name or a path:\n/new my-project\n/new /home/user/project\n"
             "/new my-project --box off — no isolation\n"
@@ -602,7 +668,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "menu_delete": "Delete session and topic",
         "menu_help": "Help",
         "menu_bash": "Run a bash command (bypasses Claude)",
-        "menu_bashin": "Send input to an open /bash (y/n, etc.)",
+        "menu_term": "Sticky terminal mode: messages → shell",
         "menu_chat_id": "Chat ID (for TELEGRAM_CHAT_ID)",
         "chat_id_bound_now": (
             "✅ Chat bound to the bot.\n"
@@ -619,6 +685,14 @@ MESSAGES: dict[str, dict[str, str]] = {
             "⚠️ The bot is bound to another chat (<code>{bound}</code>) — "
             "to use it here, change TELEGRAM_CHAT_ID in .env and restart."
         ),
+        # Inline buttons under terminal command output.
+        "term_btn_interrupt": "⏹ Interrupt",
+        "term_btn_repeat": "↻ Repeat",
+        "term_btn_history": "🕘 History",
+        "term_interrupted": "⏹ Interrupted (Ctrl-C).",
+        "term_history_title": "🕘 Recent commands:",
+        "term_history_empty": "Command history is empty.",
+        "term_history_gone": "That command is no longer available — the session or history changed.",
     },
 }
 
