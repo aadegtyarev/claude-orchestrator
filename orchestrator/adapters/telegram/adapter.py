@@ -42,6 +42,8 @@ logger = logging.getLogger(__name__)
 
 # Лимит файла Telegram Bot API.
 FILE_LIMIT = 50 * 1024 * 1024
+# Сколько привязок «сообщение → статус терминала» помним ради правок команд.
+TERM_MSGS_LIMIT = 500
 
 
 class TelegramAdapter:
@@ -61,6 +63,10 @@ class TelegramAdapter:
         # погасить permission-кнопки, когда вердикт дан (в т.ч. из другого
         # адаптера).
         self._perm_msgs: dict[tuple[str, str], tuple[int, str]] = {}
+        # Карта «id сообщения пользователя → id статус-сообщения терминала» —
+        # чтобы правка сообщения переисполнила команду и обновила тот же ответ.
+        # Значение: (status_msg_id, bash_key, последняя_выполненная_команда).
+        self._term_msgs: dict[int, tuple[int, str, str | None]] = {}
         self._register_handlers()
 
     # ── Transport: жизненный цикл ───────────────────────────────
@@ -95,7 +101,11 @@ class TelegramAdapter:
             BotCommand(command="close_session", description=self.t("menu_close")),
             BotCommand(command="delete_session", description=self.t("menu_delete")),
             BotCommand(command="bash", description=self.t("menu_bash")),
-            BotCommand(command="bashin", description=self.t("menu_bashin")),
+            # /bashin из меню убран: в липком режиме (/term on) ответ команде
+            # уходит обычным сообщением, вспоминать отдельную команду больше не
+            # нужно. Сама команда работает — она осталась для случая «терминал
+            # занят, а режим выключен», просто не мозолит глаза в списке.
+            BotCommand(command="term", description=self.t("menu_term")),
             BotCommand(command="chat_id", description=self.t("menu_chat_id")),
             BotCommand(command="help", description=self.t("menu_help")),
         ]
@@ -425,6 +435,7 @@ class TelegramAdapter:
         dp.message.register(self.cmd_chat_id, Command("chat_id"))
         dp.message.register(self.cmd_bash, Command("bash"))
         dp.message.register(self.cmd_bashin, Command("bashin"))
+        dp.message.register(self.cmd_term, Command("term"))
         dp.message.register(self.on_text, F.text & ~F.text.startswith("/"))
         dp.message.register(self.on_file, F.photo | F.document)
         # Последним: неизвестные /команды уходят в терминал Claude.
@@ -436,6 +447,15 @@ class TelegramAdapter:
         dp.callback_query.register(self.on_session_button, F.data.startswith("sess:"))
         dp.callback_query.register(self.on_perm_button, F.data.startswith("perm:"))
         dp.callback_query.register(self.on_delete_button, F.data.startswith("del:"))
+        dp.callback_query.register(
+            self.on_termint_button, F.data.startswith("termint:"))
+        dp.callback_query.register(
+            self.on_termrepeat_button, F.data.startswith("termrepeat:"))
+        dp.callback_query.register(
+            self.on_termhist_button, F.data.startswith("termhist:"))
+        dp.callback_query.register(
+            self.on_termhistrun_button, F.data.startswith("termhistrun:"))
+        dp.edited_message.register(self.on_edited_message)
 
     def _accept(self, message: Message) -> bool:
         """Доступ строго по ALLOWED_USER_IDS + привязка к одной группе.
@@ -454,6 +474,19 @@ class TelegramAdapter:
                 message.chat.id, message.chat.id,
             )
         return message.chat.id == self.chat_id
+
+    def _accept_callback(self, callback: CallbackQuery) -> bool:
+        """Гейт для кнопок, которые ИСПОЛНЯЮТ команды в терминале.
+
+        Кроме белого списка пользователей сверяем и чат: у обычных кнопок
+        (отчёт, модель) хватает _user_allowed, но здесь нажатие запускает
+        shell-команду, и брать message_thread_id из сообщения чужого чата —
+        значит позволить адресоваться к сессии в обход привязки группы.
+        """
+        if not self._user_allowed(callback.from_user):
+            return False
+        msg = callback.message
+        return msg is not None and msg.chat.id == self.chat_id
 
     def _user_allowed(self, user) -> bool:
         if user is None or user.id not in self.config.allowed_user_ids:
@@ -647,28 +680,152 @@ class TelegramAdapter:
             return
         session = self._topic_session(message)
         key = self.core.bash_key(session, f"tg{message.message_thread_id or 0}")
-        # Статус-сообщение постим ТОЛЬКО после проверки занятости: иначе при
-        # busy рядом с «терминал занят» навсегда висело бы «⏳ Выполняю <cmd>»,
-        # выглядящее как незавершённая вторая команда.
+        await self._run_bash_cmd(message, session, key, cmd)
+
+    async def _run_bash_cmd(
+        self, message: Message, session: Session | None, key: str, cmd: str,
+        *, edit_status_id: int | None = None,
+    ) -> None:
+        """Выполнить команду в bash-терминале топика со стримингом вывода.
+
+        Общая часть для /bash и липкого режима терминала (/term on): статус-
+        сообщение, стриминг рендера, финальный код возврата. Занятость оболочки
+        проверяется здесь же — до поста статуса (иначе «терминал занят» висел бы
+        рядом с «⏳ Выполняю <cmd>» вечно).
+
+        edit_status_id — если задан, ОБНОВЛЯЕМ существующее сообщение вместо
+        создания нового (правка сообщения пользователя → перезапуск команды).
+        """
         if self.core.bash_busy(key):
             await message.reply(self.t("bash_busy"))
             return
-        status = await message.reply(self.t("bash_running", cmd=cmd))
-        last_edit = ""
 
-        async def on_update(shown: str, done: bool) -> None:
-            nonlocal last_edit
+        # Создаём или переиспользуем статус-сообщение.
+        if edit_status_id is not None:
+            # Обновляем существующее — правка сообщения переисполняет команду.
+            status_msg = await self.bot.edit_message_text(
+                chat_id=self.chat_id,
+                message_id=edit_status_id,
+                text=self.t("bash_running", cmd=cmd),
+                parse_mode="HTML",
+            )
+            # edit_message_text возвращает Message | True; нам нужен message_id.
+            if isinstance(status_msg, bool):
+                status_id = edit_status_id
+            else:
+                status_id = status_msg.message_id
+        else:
+            # Новая команда — создаём статус-сообщение.
+            status = await message.reply(self.t("bash_running", cmd=cmd))
+            status_id = status.message_id
+
+        last_edit = ""
+        output_file: str | None = None
+        # Сохраняем привязку «сообщение пользователя → статус-сообщение» для
+        # правки сообщения (edited_message → перезапуск команды).
+        self._term_msgs[message.message_id] = (status_id, key, cmd)
+        # Карта не должна расти вечно — вытесняем самые старые сообщения.
+        # id сообщений Telegram монотонно растут в пределах чата, поэтому
+        # «самое маленькое id» и есть самое старое: не полагаемся на порядок
+        # вставки в dict (он деталь реализации, а не гарантия семантики).
+        while len(self._term_msgs) > TERM_MSGS_LIMIT:
+            del self._term_msgs[min(self._term_msgs)]
+
+        # Собираем inline-клавиатуру с кнопками управления терминалом.
+        thread_id = message.message_thread_id or 0
+        markup = self._term_keyboard(thread_id)
+
+        async def on_update(shown: str, done: bool, file_path: str | None = None) -> None:
+            nonlocal last_edit, output_file
             if shown != last_edit:
                 try:
-                    await status.edit_text(shown, parse_mode="HTML")
+                    await self.bot.edit_message_text(
+                        chat_id=self.chat_id,
+                        message_id=status_id,
+                        text=shown,
+                        parse_mode="HTML",
+                        reply_markup=markup,
+                    )
                     last_edit = shown
                 except Exception:
                     pass  # «текст не изменился» и т.п. — не критично
+            # Сохраняем путь к файлу — отправим документом после финального
+            # обновления статуса, чтобы бабл не перекрывал файл.
+            if done and file_path:
+                output_file = file_path
 
         try:
             await self.core.run_bash(key, session, cmd, on_update)
         except UserError as e:
-            await status.edit_text(str(e))
+            await self.bot.edit_message_text(
+                chat_id=self.chat_id,
+                message_id=status_id,
+                text=str(e),
+                reply_markup=self._term_keyboard(thread_id, running=False),
+            )
+
+        # Команда закончилась — «Прервать» убираем, «Повторить» и «История»
+        # остаются (см. _term_keyboard: running=False).
+        try:
+            await self.bot.edit_message_reply_markup(
+                chat_id=self.chat_id,
+                message_id=status_id,
+                reply_markup=self._term_keyboard(thread_id, running=False),
+            )
+        except Exception:
+            pass
+
+        # Отправляем полный вывод документом, если он не влез в сообщение.
+        # Удаляем после отправки: для workspace-файлов (.bash_outputs/) это
+        # предотвращает накопление; для временных (main-chat) — обязательно,
+        # чтобы не забивать /tmp.
+        if output_file:
+            out_path = Path(output_file)
+            try:
+                # caption — краткая справка; текст уже в бабле, не дублируем.
+                lines = out_path.read_text(encoding="utf-8").count("\n") + 1
+                size_kb = out_path.stat().st_size / 1024
+                caption = self.t("bash_output_truncated", lines=lines, size=f"{size_kb:.0f} KB")
+                await self.bot.send_document(
+                    chat_id=self.chat_id,
+                    document=FSInputFile(out_path),
+                    caption=caption[:1024],
+                    message_thread_id=message.message_thread_id or None,
+                )
+            except Exception as e:
+                logger.error("Не удалось отправить файл вывода bash %s: %s", out_path, e)
+            finally:
+                # Удаляем в любом случае: отправка удалась — файл у пользователя,
+                # не удалась — бесполезный артефакт. Ошибку удаления глушим.
+                try:
+                    out_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def _term_keyboard(self, thread_id: int, *, running: bool = True) -> InlineKeyboardMarkup:
+        """Inline-клавиатура под выводом команды терминала.
+
+        running=False — команда уже завершилась, и «Прервать» убираем: живая
+        кнопка, которой нечего прерывать, либо молча ничего не делает, либо
+        (хуже) шлёт Ctrl-C в оболочку под следующую команду.
+        """
+        row = []
+        if running:
+            row.append(InlineKeyboardButton(
+                text=self.t("term_btn_interrupt"),
+                callback_data=cbdata.termint_cb(thread_id),
+            ))
+        row += [
+            InlineKeyboardButton(
+                text=self.t("term_btn_repeat"),
+                callback_data=cbdata.termrepeat_cb(thread_id),
+            ),
+            InlineKeyboardButton(
+                text=self.t("term_btn_history"),
+                callback_data=cbdata.termhist_cb(thread_id),
+            ),
+        ]
+        return InlineKeyboardMarkup(inline_keyboard=[row])
 
     async def cmd_bashin(self, message: Message, command: CommandObject) -> None:
         """Досыл сырого ввода в уже открытый /bash-терминал (ответ на y/n)."""
@@ -681,6 +838,23 @@ class TelegramAdapter:
             await message.reply(self.t("bash_not_running"))
             return
         await message.reply(self.t("bashin_sent", text=html.escape(text) or "⏎"))
+
+    async def cmd_term(self, message: Message, command: CommandObject) -> None:
+        """/term [on|off]: липкий режим терминала — обычные сообщения уходят в шелл.
+
+        Без аргументов — краткий статус. Включение только в топике сессии:
+        в основном чате шелл на хосте с правами оператора, и случайное
+        сообщение там выполнилось бы без песочницы.
+        """
+        if not self._accept(message):
+            return
+        session = self._topic_session(message)
+        key = self.core.bash_key(session, f"tg{message.message_thread_id or 0}")
+        try:
+            text = self.core.term_command(session, key, command.args or "")
+        except UserError as e:
+            text = str(e)
+        await message.reply(text, parse_mode="HTML")
 
     async def cmd_close(self, message: Message) -> None:
         """Остановить сессию; топик и запись остаются, resume по сообщению."""
@@ -917,6 +1091,36 @@ class TelegramAdapter:
         session = self._topic_session(message)
         if session is None or not message.text:
             return
+
+        # Липкий режим терминала: обычные сообщения → шелл, `>` → claude.
+        # Ключ ровно тот же, что у оболочки (bash_key) — см. termmode.
+        key = self.core.bash_key(session, f"tg{message.message_thread_id or 0}")
+        if self.core.term.is_on(key):
+            where, text = self.core.term.split_escape(message.text)
+            if where == "claude":
+                # Сообщение начинается с `>` — уходит claude как обычно.
+                if not await self._ensure_running(session, message):
+                    return
+                await self._forward(session, message, text)
+                return
+            # Команда ещё крутится — значит она чего-то ждёт (y/n, пароль,
+            # ответ на промпт): отправляем текст ЕЙ НА ВХОД, а не отвечаем
+            # «терминал занят». Ради этого и нужен липкий режим: вспоминать
+            # про отдельный /bashin посреди диалога с командой — абсурд.
+            # Одним вызовом, а не «спросить busy → записать»: между двумя
+            # обращениями команда успевает завершиться, и ответ ей («y»,
+            # пароль) достался бы свободной оболочке уже как КОМАНДА.
+            if self.core.bash_input_if_busy(key, text):
+                # Реакцией, а не сообщением: диалог с командой из пяти
+                # «y» не должен рождать пять ответов бота. Эмодзи — из
+                # разрешённого Telegram набора (произвольные он отвергает).
+                await self._react(message, "✍")
+                return
+            # Обычный текст — выполняем в шелле (тот же путь, что /bash).
+            await self._run_bash_cmd(message, session, key, text)
+            return
+
+        # Без липкого режима — поведение как раньше.
         if not await self._ensure_running(session, message):
             return
         await self._forward(session, message, self._with_quote(message))
@@ -1124,6 +1328,178 @@ class TelegramAdapter:
         except Exception as e:
             logger.error("Сессия %s: не удалось отправить в фон: %s", session.name, e)
             await callback.answer(self.t("stop_fail"))
+
+    # ── кнопки управления терминалом ─────────────────────────────
+
+    async def on_edited_message(self, message: Message) -> None:
+        """Правка сообщения пользователя = перезапуск команды терминала.
+
+        Если оператор ошибся в команде и поправил своё сообщение — выполняем
+        новый текст и обновляем ТОТ ЖЕ ответ. Правка постороннего сообщения
+        (не того, которым запускалась команда терминала) — игнорируем молча.
+        """
+        if not self._accept(message):
+            return
+        if not message.text:
+            return
+        info = self._term_msgs.get(message.message_id)
+        if info is None:
+            return  # не наше сообщение — молча
+        status_id, key, _ = info
+        # Удаляем старую запись — сейчас создадим новую внутри _run_bash_cmd.
+        # Статус-сообщение переиспользуем (edit_status_id).
+        session = self._topic_session(message)
+        # Ключ в карте — от момента запуска, а сессия резолвится заново: если
+        # они разошлись (сессию удалили, топик переиспользовали под новую),
+        # команда выполнилась бы в оболочке ОДНОЙ сессии с песочницей ДРУГОЙ.
+        # Такую правку не исполняем: запись протухла.
+        if key != self.core.bash_key(session, f"tg{message.message_thread_id or 0}"):
+            del self._term_msgs[message.message_id]
+            return
+        new_cmd = message.text.strip()
+        if not new_cmd:
+            return
+        # Если включён липкий режим — текст может уходить в шелл как есть;
+        # иначе это был /bash — выполняем текст буквально.
+        if self.core.term.is_on(key):
+            where, text = self.core.term.split_escape(new_cmd)
+            if where == "claude":
+                return  # правка «> сообщение» — игнорируем, это не команда шелла
+            new_cmd = text
+        # Переисполняем с обновлением того же статус-сообщения.
+        del self._term_msgs[message.message_id]
+        await self._run_bash_cmd(message, session, key, new_cmd, edit_status_id=status_id)
+
+    async def on_termint_button(self, callback: CallbackQuery) -> None:
+        """⏹ Прервать бегущую команду терминала (Ctrl-C)."""
+        if not self._accept_callback(callback):
+            await callback.answer()
+            return
+        thread_id = cbdata.parse_termint(callback.data or "")
+        if thread_id is None:
+            await callback.answer()
+            return
+        session = self._topic_by_thread(thread_id)
+        if session is None:
+            # Нет сессии — main-ключ дал бы терминал на ХОСТЕ без песочницы.
+            # Кнопка под выводом сессии не должна открывать такой путь.
+            await callback.answer(self.t("term_history_gone"))
+            return
+        key = self.core.bash_key(session, f"tg{thread_id}")
+        if self.core.interrupt_bash(key):
+            await callback.answer(self.t("term_interrupted"))
+        else:
+            await callback.answer()
+
+    async def on_termrepeat_button(self, callback: CallbackQuery) -> None:
+        """↻ Повторить последнюю команду терминала."""
+        if not self._accept_callback(callback):
+            await callback.answer()
+            return
+        thread_id = cbdata.parse_termrepeat(callback.data or "")
+        if thread_id is None:
+            await callback.answer()
+            return
+        session = self._topic_by_thread(thread_id)
+        if session is None:
+            # Нет сессии — main-ключ дал бы терминал на ХОСТЕ без песочницы.
+            # Кнопка под выводом сессии не должна открывать такой путь.
+            await callback.answer(self.t("term_history_gone"))
+            return
+        key = self.core.bash_key(session, f"tg{thread_id}")
+        cmds = self.core.term_last_commands(key, 1)
+        if not cmds:
+            await callback.answer(self.t("term_history_empty"))
+            return
+        await callback.answer()
+        # Запускаем ту же команду заново. Сообщения-триггера нет (callback, не
+        # message) — создаём фиктивное сообщение чтобы пройти через _run_bash_cmd.
+        # Используем callback.message и reply.
+        if isinstance(callback.message, Message):
+            await self._run_bash_cmd(callback.message, session, key, cmds[0])
+
+    async def on_termhist_button(self, callback: CallbackQuery) -> None:
+        """🕘 Показать меню последних команд терминала."""
+        if not self._accept_callback(callback):
+            await callback.answer()
+            return
+        thread_id = cbdata.parse_termhist(callback.data or "")
+        if thread_id is None:
+            await callback.answer()
+            return
+        session = self._topic_by_thread(thread_id)
+        if session is None:
+            # Нет сессии — main-ключ дал бы терминал на ХОСТЕ без песочницы.
+            # Кнопка под выводом сессии не должна открывать такой путь.
+            await callback.answer(self.t("term_history_gone"))
+            return
+        key = self.core.bash_key(session, f"tg{thread_id}")
+        cmds = self.core.term_last_commands(key)
+        await callback.answer()
+        if not cmds:
+            # Без кнопки «Назад»: она вела на «повторить команду», то есть
+            # подпись обещала одно, а нажатие делало другое.
+            if isinstance(callback.message, Message):
+                try:
+                    await callback.message.edit_text(self.t("term_history_empty"))
+                except Exception:
+                    pass
+            return
+        # Формируем меню: каждая команда — кнопка, тап по ней выполняет.
+        rows: list[list[InlineKeyboardButton]] = []
+        for cmd in cmds:
+            label = cmd[:50] + ("…" if len(cmd) > 50 else "")
+            rows.append([InlineKeyboardButton(
+                text=label,
+                callback_data=cbdata.termhistrun_cb(thread_id, cmd),
+            )])
+        if isinstance(callback.message, Message):
+            text = self.t("term_history_title") + "\n" + "\n".join(
+                f"<code>{html.escape(cmd[:80])}</code>" for cmd in cmds
+            )
+            try:
+                await callback.message.edit_text(
+                    text,
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+                )
+            except Exception:
+                pass
+
+    async def on_termhistrun_button(self, callback: CallbackQuery) -> None:
+        """Выполнить выбранную из истории команду."""
+        if not self._accept_callback(callback):
+            await callback.answer()
+            return
+        parsed = cbdata.parse_termhistrun(callback.data or "")
+        if parsed is None:
+            await callback.answer()
+            return
+        thread_id, digest = parsed
+        session = self._topic_by_thread(thread_id)
+        if session is None:
+            # Сессии нет (топик удалён/переиспользован) — молча уехать на
+            # main-ключ значит выполнить команду на ХОСТЕ без песочницы.
+            await callback.answer(self.t("term_history_gone"))
+            return
+        key = self.core.bash_key(session, f"tg{thread_id}")
+        # Ищем по отпечатку, а не по позиции: история могла перестроиться,
+        # и кнопка обязана запустить ровно ту команду, что на ней написана.
+        cmd = next(
+            (c for c in self.core.term_last_commands(key, 50)
+             if cbdata.cmd_digest(c) == digest),
+            None,
+        )
+        if cmd is None:
+            await callback.answer(self.t("term_history_gone"))
+            return
+        await callback.answer()
+        if isinstance(callback.message, Message):
+            await self._run_bash_cmd(callback.message, session, key, cmd)
+
+    def _topic_by_thread(self, thread_id: int) -> Session | None:
+        """Найти сессию по thread_id (0 = главный чат → None)."""
+        return self._session_by_thread(thread_id) if thread_id else None
 
     # ── отправка ────────────────────────────────────────────────
 

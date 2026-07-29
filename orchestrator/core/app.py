@@ -21,7 +21,9 @@ import asyncio
 import html
 import json
 import logging
+import os
 import re
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -33,6 +35,8 @@ from box import profiles
 
 from .bashshell import BashShellManager, clean as bash_clean
 from .bubble import BubbleManager
+from .termhistory import TermHistory
+from .termmode import TerminalMode
 from .errors import UserError
 from .history import HistoryLog
 from .permission import PermissionRelay
@@ -55,6 +59,8 @@ logger = logging.getLogger(__name__)
 BASH_POLL_INTERVAL = 1.5
 BASH_TIMEOUT = 600.0
 BASH_OUTPUT_LIMIT = 3500
+# Сколько файлов с полным выводом держим в папке сессии (см. _trim_bash_outputs).
+BASH_OUTPUTS_KEEP = 20
 
 # Окно контекста для процента в /stats. Захардкожено грубо: у моделей с
 # 1M-окном цифра будет занижать реальный запас — это ориентир, не факт.
@@ -114,6 +120,15 @@ class OrchestratorCore:
         )
         # Постоянные bash-терминалы (мимо Claude Code): ключ — см. bash_key.
         self.bash = BashShellManager()
+        # Топики, работающие как терминал (/term on): обычные сообщения там
+        # уходят в шелл, а не claude. Только в памяти — см. termmode.
+        self.term = TerminalMode()
+        # Маркер конца текущей команды на терминал — нужен кнопке ⏹, чтобы
+        # дописать его руками после Ctrl-C (см. interrupt_bash).
+        self._done_markers: dict[str, str] = {}
+        # История команд терминала — то, что в настоящем шелле даёт «стрелка вверх».
+        # Хранение в памяти на время жизни оболочки — см. termhistory.
+        self.termhist = TermHistory()
         # Мелкие фоновые задачи ядра без иного владельца — держим ссылку
         # (asyncio хранит только слабую), иначе GC мог бы собрать на лету.
         self._bg_tasks: set[asyncio.Task] = set()
@@ -455,6 +470,11 @@ class OrchestratorCore:
         self.naming.forget(session.name)
         if close_bash:
             await asyncio.to_thread(self.bash.close_for_session, session.name)
+            # Оболочек больше нет — липкий режим её топиков тоже снимаем,
+            # иначе сессия-тёзка унаследовала бы чужое состояние.
+            self.term.forget_session(session.name)
+            # Историю команд — тоже: оболочки закрыты, список без них бесполезен.
+            self.termhist.forget_session(session.name)
         await self.bubbles.close(session.name)
 
     async def _notify_state_changed(self, session: Session | None = None) -> None:
@@ -1448,12 +1468,46 @@ class OrchestratorCore:
             return self.manager.effective_cwd(session)
         return Path.home()
 
+    def term_command(self, session: Session | None, key: str, args: str) -> str:
+        """Обработка /term [on|off]: включить/выключить липкий режим терминала.
+
+        Без аргументов — краткий статус топика: включён ли режим, рабочий
+        каталог, занята ли оболочка командой.
+
+        Включить режим можно только в топике сессии (session is not None):
+        в главном чате /bash идёт на ХОСТЕ с правами оператора без песочницы,
+        и случайно отправленное сообщение выполнилось бы на нём. Это осознанный
+        запрет — не «пока не реализовано», а постоянное правило безопасности.
+        """
+        action = (args or "").strip().lower()
+
+        if action == "on":
+            if session is None:
+                raise UserError(self.t("term_no_main_chat"))
+            self.term.turn_on(key)
+            return self.t("term_on", cwd=str(self.bash_cwd(session)))
+
+        if action == "off":
+            self.term.turn_off(key)
+            return self.t("term_off")
+
+        if action == "":
+            # Статус: включён/выключен, каталог, занятость оболочки.
+            if self.term.is_on(key):
+                cwd = str(self.bash_cwd(session)) if session is not None else str(Path.home())
+                busy = "да" if self.bash_busy(key) else "нет"
+                return self.t("term_status_on", cwd=cwd, busy=busy)
+            return self.t("term_status_off")
+
+        raise UserError(self.t("term_unknown_arg", arg=args.strip()))
+
     async def run_bash(
         self,
         key: str,
         session: Session | None,
         cmd: str,
-        on_update: Callable[[str, bool], Awaitable[None]],
+        # (html, done, путь-к-файлу-с-полным-выводом|None)
+        on_update: Callable[[str, bool, str | None], Awaitable[None]],
     ) -> None:
         """Выполнить команду в постоянном bash-терминале. Скоуп зависит от
         контекста: в сессии — та же файловая песочница, что у claude (только
@@ -1482,6 +1536,9 @@ class OrchestratorCore:
         if shell.busy:
             raise UserError(self.t("bash_busy"))
         shell.busy = True
+        # Запоминаем команду в историю терминала (стрелка вверх для чата):
+        # повтор и правка сообщения работают от этой записи.
+        self.termhist.add(key, cmd)
         # Маркеры начала И конца: смещение по длине буфера ненадёжно —
         # BashSession тримит буфер до _BUF_CAP, и после переполнения
         # len(snapshot) залипает на пределе, snapshot()[start:] становится
@@ -1491,6 +1548,9 @@ class OrchestratorCore:
         token = uuid.uuid4().hex
         start_marker = f"__BEG_{token}__"
         done_marker = f"__DONE_{token}__"
+        # Кнопке ⏹ нужно знать маркер этой команды: Ctrl-C убивает строку с
+        # ним, и без ручного дописывания цикл ниже не увидел бы конца.
+        self._done_markers[key] = done_marker
         interrupted = False
         try:
             # $? сразу за меткой — код возврата именно команды пользователя.
@@ -1518,10 +1578,17 @@ class OrchestratorCore:
                     ln for ln in out.split(b"\n")
                     if done_marker.encode() not in ln and start_marker.encode() not in ln
                 )
-                shown = self.bash_render(cmd, out, code)
+                shown, truncated = self.bash_render(cmd, out, code)
+                is_terminal = code is not None
                 if shown != last_shown:
+                    # Файл с полным выводом создаём только на terminal-обновлении
+                    # (завершение или таймаут), чтобы не плодить файлы на каждом
+                    # промежуточном полле. Полный вывод лежит в out (bytes).
+                    file_path = self.save_bash_output(cmd, out, session) if (
+                        truncated and is_terminal
+                    ) else None
                     try:
-                        await on_update(shown, code is not None)
+                        await on_update(shown, is_terminal, file_path)
                         last_shown = shown
                     except Exception:
                         pass  # рендер не должен ронять исполнение
@@ -1531,7 +1598,10 @@ class OrchestratorCore:
             # гадила в общий буфер следующему вызову. Оболочка живёт.
             interrupted = True
             shell.interrupt()
-            await on_update(self.bash_render(cmd, out, None, timeout=True), True)
+            # При таймауте тоже может быть длинный вывод — отдаём файлом.
+            shown, truncated = self.bash_render(cmd, out, None, timeout=True)
+            file_path = self.save_bash_output(cmd, out, session) if truncated else None
+            await on_update(shown, True, file_path)
         except asyncio.CancelledError:
             # Клиент отвалился (веб: закрыл вкладку) — команда ещё бежит.
             # Прерываем её, иначе её вывод перемешается со следующим /bash,
@@ -1540,6 +1610,7 @@ class OrchestratorCore:
             shell.interrupt()
             raise
         finally:
+            self._done_markers.pop(key, None)
             if not interrupted:
                 shell.busy = False
             else:
@@ -1573,12 +1644,54 @@ class OrchestratorCore:
         shell.write(text + "\n")
         return True
 
+    def bash_input_if_busy(self, key: str, text: str) -> bool:
+        """Отдать текст РАБОТАЮЩЕЙ команде на вход. False — команды уже нет.
+
+        Проверка «занят» и запись — одним вызовом, потому что порознь они
+        образуют гонку: команда успевает завершиться между ними, и то, что
+        оператор писал ей в ответ («y», пароль), достаётся освободившейся
+        оболочке уже как КОМАНДА. Событийный цикл у нас один, поэтому
+        достаточно не делать await между проверкой и записью.
+        """
+        shell = self.bash.get(key)
+        if shell is None or not shell.busy:
+            return False
+        shell.write(text + "\n")
+        return True
+
+    def term_last_commands(self, key: str, count: int = 5) -> list[str]:
+        """Последние команды терминала — для кнопки «История» и меню."""
+        return self.termhist.last(key, count)
+
+    def interrupt_bash(self, key: str) -> bool:
+        """Прервать бегущую команду терминала (Ctrl-C). False — оболочки нет.
+
+        Ctrl-C стирает недописанную строку bash — а в ней лежит наш маркер
+        конца, поэтому он НЕ придёт никогда: цикл в run_bash досидел бы до
+        таймаута (10 минут) с застывшим статусом, кнопкой ⏹ и залипшим busy,
+        из-за которого следующие сообщения уходили бы в stdin вместо запуска.
+        Поэтому маркер дописываем сами: команда убита, но цикл видит конец,
+        рисует финальный статус и штатно освобождает терминал.
+        """
+        shell = self.bash.get(key)
+        if shell is None:
+            return False
+        shell.interrupt()
+        marker = self._done_markers.get(key)
+        if marker is not None:
+            # 130 — код возврата команды, убитой SIGINT (128 + 2), как в шелле.
+            shell.write(f"echo {marker} 130\n")
+        return True
+
     def bash_render(
         self, cmd: str, out: bytes, code: str | None, timeout: bool = False
-    ) -> str:
-        """HTML статуса bash: команда + вывод в <pre>, обрезка с хвоста."""
+    ) -> tuple[str, bool]:
+        """HTML статуса bash: команда + вывод в <pre>, обрезка с хвоста.
+        Возвращает (html, was_truncated) — флаг обрезки нужен вызывающему,
+        чтобы сохранить полный вывод в файл и отдать адаптеру."""
         text = out.decode(errors="replace")
-        if len(text) > BASH_OUTPUT_LIMIT:
+        truncated = len(text) > BASH_OUTPUT_LIMIT
+        if truncated:
             text = "…" + text[-BASH_OUTPUT_LIMIT:]
         body = html.escape(text) if text else self.t("bash_no_output")
         header = f"⚡ <code>{html.escape(cmd)}</code>"
@@ -1588,7 +1701,75 @@ class OrchestratorCore:
             footer = self.t("bash_wait")
         else:
             footer = self.t("bash_done", code=code)
-        return f"{header}\n<pre>{body}</pre>\n{footer}"
+        return f"{header}\n<pre>{body}</pre>\n{footer}", truncated
+
+    @staticmethod
+    def _trim_bash_outputs(folder: Path, keep: int = BASH_OUTPUTS_KEEP) -> None:
+        """Держать в папке только последние `keep` выводов.
+
+        Иначе файлы копятся до удаления сессии: сборочный лог на десятки
+        мегабайт, запускаемый по десять раз в день, за неделю съедает диск.
+        Старое здесь уже не нужно — за ним всё равно никто не возвращается,
+        а свежий вывод лежит рядом со свежим сообщением в чате.
+        """
+        try:
+            files = sorted(
+                folder.glob("bash_*.txt"), key=lambda p: p.stat().st_mtime, reverse=True
+            )
+        except OSError:
+            return
+        for stale in files[keep:]:
+            try:
+                stale.unlink()
+            except OSError:
+                pass  # чужой файл//гонка — чистка не должна ронять команду
+
+    def save_bash_output(
+        self, cmd: str, out: bytes, session: Session | None
+    ) -> str | None:
+        """Как _save_bash_output, но НЕ роняет команду при сбое записи.
+
+        Диск полон, нет прав, подложен симлинк — вывод не сохранён, но сама
+        команда уже отработала, и терять её результат из-за вспомогательного
+        файла нельзя: оператор увидел бы отсутствие ответа вместо вывода.
+        """
+        try:
+            return self._save_bash_output(cmd, out, session)
+        except OSError as e:
+            logger.warning("Не удалось сохранить вывод команды в файл: %s", e)
+            return None
+
+    def _save_bash_output(
+        self, cmd: str, out: bytes, session: Session | None
+    ) -> str:
+        """Сохранить полный вывод команды в файл и вернуть путь.
+        При сессии — в workspace (.bash_outputs/ в session_dir), чтобы
+        веб мог отдать через существующий h_file (jail пустит).
+        Без сессии (main-chat) — во временный каталог ОС; такой файл
+        жив только до отправки адаптером, удаление — забота адаптера.
+        """
+        text = out.decode(errors="replace")
+        # Имя с командой и временем — удобно найти глазами в папке.
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        slug = slugify(cmd)[:40]
+        fname = f"bash_{ts}_{slug}.txt"
+        if session is not None:
+            d = session.session_dir / ".bash_outputs"
+            # Папку сессии модель видит на запись и может подложить туда
+            # симлинк — тогда и запись, и последующая чистка ушли бы наружу,
+            # удаляя чужие bash_*.txt. Симлинк не наш: отказываемся.
+            if d.is_symlink():
+                raise OSError(f"{d} — симлинк, отказ записи вывода")
+            d.mkdir(parents=True, exist_ok=True)
+            path = d / fname
+            path.write_text(text, encoding="utf-8")
+            self._trim_bash_outputs(d)
+        else:
+            fd, path_str = tempfile.mkstemp(suffix=".txt", prefix="bash_output_")
+            os.close(fd)
+            Path(path_str).write_text(text, encoding="utf-8")
+            return path_str
+        return str(path)
 
     # ── уведомления жизненного цикла ────────────────────────────
 

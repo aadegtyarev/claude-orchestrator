@@ -652,10 +652,13 @@ class WebAdapter:
         key = self.core.bash_key(session, "web")
         sname = session.name
 
-        async def on_update(html_text: str, done: bool) -> None:
-            await self._broadcast(
-                {"type": "bash", "session": sname, "html": html_text, "done": done}
-            )
+        async def on_update(html_text: str, done: bool, file_path: str | None = None) -> None:
+            payload = {"type": "bash", "session": sname, "html": html_text, "done": done}
+            if file_path:
+                # Путь в workspace (.bash_outputs/ в session_dir) — клиент
+                # скачает через существующий GET /api/.../file?path=... (h_file).
+                payload["output_file"] = file_path
+            await self._broadcast(payload)
 
         try:
             # Держим запрос до конца команды: busy-конфликт отдаётся кодом 400,
