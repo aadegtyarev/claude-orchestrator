@@ -781,11 +781,26 @@ class TelegramAdapter:
         # чтобы не забивать /tmp.
         if output_file:
             out_path = Path(output_file)
+            keep_file = False
             try:
+                size = out_path.stat().st_size
+                if size > FILE_LIMIT:
+                    keep_file = True  # оператору дали путь — файл нужен на месте
+                    # Telegram больше не примет, а read_text ниже затянул бы
+                    # гигабайты в память процесса. Честно говорим, где файл.
+                    await message.reply(self.t(
+                        "bash_output_too_big",
+                        size=f"{size / 1024 / 1024:.0f} MB",
+                        path=html.escape(str(out_path)),
+                    ), parse_mode="HTML")
+                    return
                 # caption — краткая справка; текст уже в бабле, не дублируем.
-                lines = out_path.read_text(encoding="utf-8").count("\n") + 1
-                size_kb = out_path.stat().st_size / 1024
-                caption = self.t("bash_output_truncated", lines=lines, size=f"{size_kb:.0f} KB")
+                # Считаем строки потоком: файл может быть на десятки мегабайт.
+                with out_path.open("rb") as fh:
+                    lines = sum(chunk.count(b"\n") for chunk in iter(
+                        lambda: fh.read(1 << 20), b"")) + 1
+                caption = self.t(
+                    "bash_output_truncated", lines=lines, size=f"{size / 1024:.0f} KB")
                 await self.bot.send_document(
                     chat_id=self.chat_id,
                     document=FSInputFile(out_path),
@@ -797,10 +812,13 @@ class TelegramAdapter:
             finally:
                 # Удаляем в любом случае: отправка удалась — файл у пользователя,
                 # не удалась — бесполезный артефакт. Ошибку удаления глушим.
-                try:
-                    out_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                # Исключение — слишком большой файл: мы дали оператору путь к
+                # нему, и стирать его сразу после этого было бы издевательством.
+                if not keep_file:
+                    try:
+                        out_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
 
     def _term_keyboard(self, thread_id: int, *, running: bool = True) -> InlineKeyboardMarkup:
         """Inline-клавиатура под выводом команды терминала.

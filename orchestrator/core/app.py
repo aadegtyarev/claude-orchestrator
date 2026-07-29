@@ -21,7 +21,6 @@ import asyncio
 import html
 import json
 import logging
-import os
 import re
 import tempfile
 import time
@@ -33,7 +32,8 @@ import aiohttp
 
 from box import profiles
 
-from .bashshell import BashShellManager, clean as bash_clean
+from . import bashshell
+from .bashshell import BashShellManager
 from .bubble import BubbleManager
 from .termhistory import TermHistory
 from .termmode import TerminalMode
@@ -1552,41 +1552,46 @@ class OrchestratorCore:
         # ним, и без ручного дописывания цикл ниже не увидел бы конца.
         self._done_markers[key] = done_marker
         interrupted = False
+        # Перехват вывода ЭТОЙ команды: читающий поток PTY кормит его напрямую
+        # (attach_capture), поэтому размер вывода больше не ограничен кольцевым
+        # буфером — раньше вывод крупнее _BUF_CAP вытеснял из него метку
+        # начала, и команда доезжала до таймаута с пустым результатом.
+        #
+        # Создаём ДО try: упади это здесь — finally ниже свалился бы на
+        # необъявленной переменной, подменив настоящую ошибку и не дойдя до
+        # снятия busy. Терминал залип бы навсегда, а в липком режиме следующие
+        # сообщения оператора уходили бы в stdin мёртвой команды.
+        out_path = self.bash_output_path(cmd, session)
+        # Хвост держим ровно по размеру показа: файл заводится, как только
+        # вывод в сообщение не влез. Возьми хвост больше — вывод на 20 КБ
+        # оператор увидел бы обрезанным и БЕЗ файла, то есть потерял бы то,
+        # что до этой ветки доезжало целиком.
+        capture = bashshell.OutputCapture(
+            out_path, start_marker, done_marker, tail_cap=BASH_OUTPUT_LIMIT)
         try:
+            shell.attach_capture(capture)
             # $? сразу за меткой — код возврата именно команды пользователя.
             shell.write(f"echo {start_marker}\n{cmd}\necho {done_marker} $?\n")
             out = b""
             code = None
             deadline = asyncio.get_running_loop().time() + BASH_TIMEOUT
             last_shown = ""
-            beg_re = re.escape(start_marker).encode()
-            done_re = re.escape(done_marker).encode() + rb"\s+(\d+)"
             while asyncio.get_running_loop().time() < deadline:
                 await asyncio.sleep(BASH_POLL_INTERVAL)
-                raw = bash_clean(shell.snapshot())
-                # Берём последнее вхождение маркера начала (эхо команды выше
-                # тоже содержит его текст) и всё, что после.
-                begs = list(re.finditer(beg_re, raw))
-                region = raw[begs[-1].end():] if begs else b""
-                out = region
-                m = re.search(done_re, region)
-                if m:
-                    code = m.group(1).decode()
-                    out = region[: m.start()]
-                # Вымарываем эхо самих echo-маркеров из показа.
-                out = b"\n".join(
-                    ln for ln in out.split(b"\n")
-                    if done_marker.encode() not in ln and start_marker.encode() not in ln
-                )
-                shown, truncated = self.bash_render(cmd, out, code)
+                out = capture.tail()
+                code = capture.code
+                shown, _ = self.bash_render(cmd, out, code)
                 is_terminal = code is not None
-                if shown != last_shown:
-                    # Файл с полным выводом создаём только на terminal-обновлении
-                    # (завершение или таймаут), чтобы не плодить файлы на каждом
-                    # промежуточном полле. Полный вывод лежит в out (bytes).
-                    file_path = self.save_bash_output(cmd, out, session) if (
-                        truncated and is_terminal
-                    ) else None
+                if shown != last_shown or is_terminal:
+                    # Файл отдаём только когда вывод в него реально уехал
+                    # (не влез в хвост) и команда закончилась.
+                    file_path = None
+                    if is_terminal:
+                        # Закрываем ДО отдачи пути: адаптер сразу отправит файл,
+                        # и недописанный буфер уехал бы обрезанным. Повторный
+                        # close в finally безвреден (идемпотентен).
+                        capture.close()
+                        file_path = str(capture.path) if capture.overflowed else None
                     try:
                         await on_update(shown, is_terminal, file_path)
                         last_shown = shown
@@ -1599,8 +1604,9 @@ class OrchestratorCore:
             interrupted = True
             shell.interrupt()
             # При таймауте тоже может быть длинный вывод — отдаём файлом.
-            shown, truncated = self.bash_render(cmd, out, None, timeout=True)
-            file_path = self.save_bash_output(cmd, out, session) if truncated else None
+            capture.close()
+            shown, _ = self.bash_render(cmd, capture.tail(), None, timeout=True)
+            file_path = str(capture.path) if capture.overflowed else None
             await on_update(shown, True, file_path)
         except asyncio.CancelledError:
             # Клиент отвалился (веб: закрыл вкладку) — команда ещё бежит.
@@ -1611,6 +1617,14 @@ class OrchestratorCore:
             raise
         finally:
             self._done_markers.pop(key, None)
+            # Отцепляем перехват в ЛЮБОМ случае: иначе вывод следующей команды
+            # продолжал бы литься в файл предыдущей.
+            capture.close()
+            shell.attach_capture(None)
+            # Файлы с выводом копились бы до удаления сессии: сборочный лог на
+            # десятки мегабайт, гоняемый по десять раз в день, съедает диск.
+            if capture.overflowed:
+                self._trim_bash_outputs(out_path.parent)
             if not interrupted:
                 shell.busy = False
             else:
@@ -1724,52 +1738,26 @@ class OrchestratorCore:
             except OSError:
                 pass  # чужой файл//гонка — чистка не должна ронять команду
 
-    def save_bash_output(
-        self, cmd: str, out: bytes, session: Session | None
-    ) -> str | None:
-        """Как _save_bash_output, но НЕ роняет команду при сбое записи.
+    def bash_output_path(self, cmd: str, session: Session | None) -> Path:
+        """Куда OutputCapture положит полный вывод команды.
 
-        Диск полон, нет прав, подложен симлинк — вывод не сохранён, но сама
-        команда уже отработала, и терять её результат из-за вспомогательного
-        файла нельзя: оператор увидел бы отсутствие ответа вместо вывода.
+        Файл заводится ЛЕНИВО (только если вывод не влез в хвост), поэтому
+        здесь мы лишь считаем путь и ничего не создаём. В сессии — в её папке
+        (веб отдаёт оттуда через существующий jail), иначе — во временный
+        каталог ОС.
         """
-        try:
-            return self._save_bash_output(cmd, out, session)
-        except OSError as e:
-            logger.warning("Не удалось сохранить вывод команды в файл: %s", e)
-            return None
-
-    def _save_bash_output(
-        self, cmd: str, out: bytes, session: Session | None
-    ) -> str:
-        """Сохранить полный вывод команды в файл и вернуть путь.
-        При сессии — в workspace (.bash_outputs/ в session_dir), чтобы
-        веб мог отдать через существующий h_file (jail пустит).
-        Без сессии (main-chat) — во временный каталог ОС; такой файл
-        жив только до отправки адаптером, удаление — забота адаптера.
-        """
-        text = out.decode(errors="replace")
-        # Имя с командой и временем — удобно найти глазами в папке.
+        # Суффикс-токен обязателен: одна и та же команда из телеграма и из веба
+        # идёт параллельно (ключи оболочек разные), и без него оба перехвата
+        # открыли бы ОДИН файл — один обнулил бы другой, а в итоге оператор
+        # получил бы чересполосицу двух логов.
         ts = time.strftime("%Y%m%d_%H%M%S")
-        slug = slugify(cmd)[:40]
-        fname = f"bash_{ts}_{slug}.txt"
+        fname = f"bash_{ts}_{slugify(cmd)[:40]}_{uuid.uuid4().hex[:6]}.txt"
         if session is not None:
-            d = session.session_dir / ".bash_outputs"
-            # Папку сессии модель видит на запись и может подложить туда
-            # симлинк — тогда и запись, и последующая чистка ушли бы наружу,
-            # удаляя чужие bash_*.txt. Симлинк не наш: отказываемся.
-            if d.is_symlink():
-                raise OSError(f"{d} — симлинк, отказ записи вывода")
-            d.mkdir(parents=True, exist_ok=True)
-            path = d / fname
-            path.write_text(text, encoding="utf-8")
-            self._trim_bash_outputs(d)
-        else:
-            fd, path_str = tempfile.mkstemp(suffix=".txt", prefix="bash_output_")
-            os.close(fd)
-            Path(path_str).write_text(text, encoding="utf-8")
-            return path_str
-        return str(path)
+            return session.session_dir / ".bash_outputs" / fname
+        # СВОЯ подпапка, а не корень /tmp: чистка старых выводов удаляет всё,
+        # что подходит под bash_*.txt, и в общем /tmp снесла бы чужие файлы —
+        # хоть соседнего экземпляра оркестратора, хоть постороннего процесса.
+        return Path(tempfile.gettempdir()) / "claude-orchestrator-bash" / fname
 
     # ── уведомления жизненного цикла ────────────────────────────
 

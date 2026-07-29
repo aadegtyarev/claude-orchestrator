@@ -55,6 +55,10 @@ MESSAGES: dict[str, dict[str, str]] = {
         "bash_timeout": "⏱ таймаут — процесс мог остаться работать в фоне. Ответить ему: /term on и обычным сообщением.",
         "bash_not_running": "В этом топике нет открытого /bash. Запусти командой /bash &lt;команда&gt;.",
         "bash_output_truncated": "📄 Вывод не влез в сообщение — прикрепил файлом ({lines} строк, {size}).",
+        "bash_output_too_big": (
+            "📄 Вывод слишком велик для Telegram ({size}, лимит 50 MB) — файл "
+            "остался на диске:\n<code>{path}</code>"
+        ),
         "bashin_sent": "⌨️ Отправил в терминал: <code>{text}</code>",
         "term_on": (
             "🖥 Режим терминала включён. Обычные сообщения уходят в шелл.\n"
@@ -404,6 +408,10 @@ MESSAGES: dict[str, dict[str, str]] = {
         "bash_timeout": "⏱ timeout — the process may still be running in the background. To answer it: /term on, then a plain message.",
         "bash_not_running": "No open /bash in this topic. Start one with /bash &lt;command&gt;.",
         "bash_output_truncated": "📄 Output didn't fit in the message — attached as file ({lines} lines, {size}).",
+        "bash_output_too_big": (
+            "📄 The output is too large for Telegram ({size}, 50 MB limit) — the "
+            "file stayed on disk:\n<code>{path}</code>"
+        ),
         "bashin_sent": "⌨️ Sent to terminal: <code>{text}</code>",
         "term_on": (
             "🖥 Terminal mode ON. Plain messages go to the shell.\n"
