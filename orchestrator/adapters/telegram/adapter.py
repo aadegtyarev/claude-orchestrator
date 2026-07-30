@@ -101,10 +101,7 @@ class TelegramAdapter:
             BotCommand(command="close_session", description=self.t("menu_close")),
             BotCommand(command="delete_session", description=self.t("menu_delete")),
             BotCommand(command="bash", description=self.t("menu_bash")),
-            # /bashin из меню убран: в липком режиме (/term on) ответ команде
-            # уходит обычным сообщением, вспоминать отдельную команду больше не
-            # нужно. Сама команда работает — она осталась для случая «терминал
-            # занят, а режим выключен», просто не мозолит глаза в списке.
+            BotCommand(command="bashin", description=self.t("menu_bashin")),
             BotCommand(command="term", description=self.t("menu_term")),
             BotCommand(command="chat_id", description=self.t("menu_chat_id")),
             BotCommand(command="help", description=self.t("menu_help")),
