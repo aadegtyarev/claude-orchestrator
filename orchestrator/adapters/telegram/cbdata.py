@@ -136,6 +136,15 @@ def parse_termhist(data: str) -> int | None:
     return _parse_thread(data)
 
 
+def termclose_cb(thread_id: int) -> str:
+    """✖ Закрыть липкий терминал (/term off + открепить статус)."""
+    return f"termclose:{thread_id}"
+
+
+def parse_termclose(data: str) -> int | None:
+    return _parse_thread(data)
+
+
 def cmd_digest(cmd: str) -> str:
     """Короткий отпечаток команды для callback_data.
 

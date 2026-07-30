@@ -67,6 +67,10 @@ class TelegramAdapter:
         # чтобы правка сообщения переисполнила команду и обновила тот же ответ.
         # Значение: (status_msg_id, bash_key, последняя_выполненная_команда).
         self._term_msgs: dict[int, tuple[int, str, str | None]] = {}
+        # Ключ терминала → id закреплённого сообщения «терминал активен».
+        # Пока липкий режим включён, закреп висит (чтобы не забыть); при выкл. —
+        # открепляется и удаляется.
+        self._term_pins: dict[str, int] = {}
         self._register_handlers()
 
     # ── Transport: жизненный цикл ───────────────────────────────
@@ -452,6 +456,8 @@ class TelegramAdapter:
             self.on_termhist_button, F.data.startswith("termhist:"))
         dp.callback_query.register(
             self.on_termhistrun_button, F.data.startswith("termhistrun:"))
+        dp.callback_query.register(
+            self.on_termclose_button, F.data.startswith("termclose:"))
         dp.edited_message.register(self.on_edited_message)
 
     def _accept(self, message: Message) -> bool:
@@ -857,19 +863,75 @@ class TelegramAdapter:
     async def cmd_term(self, message: Message, command: CommandObject) -> None:
         """/term [on|off]: липкий режим терминала — обычные сообщения уходят в шелл.
 
-        Без аргументов — краткий статус. Включение только в топике сессии:
-        в основном чате шелл на хосте с правами оператора, и случайное
-        сообщение там выполнилось бы без песочницы.
+        Пока режим включён, в чате висит закреплённый статус «терминал активен»
+        с кнопками — чтобы не забыть, что сообщения уходят в шелл. При выключении
+        закреп открепляется и удаляется. Работает и в главном чате (там шелл на
+        хосте — при включении оператор об этом предупреждается).
         """
         if not self._accept(message):
             return
         session = self._topic_session(message)
-        key = self.core.bash_key(session, f"tg{message.message_thread_id or 0}")
+        thread_id = message.message_thread_id or 0
+        key = self.core.bash_key(session, f"tg{thread_id}")
         try:
             text = self.core.term_command(session, key, command.args or "")
         except UserError as e:
-            text = str(e)
+            await message.reply(str(e), parse_mode="HTML")
+            return
         await message.reply(text, parse_mode="HTML")
+        # Состояние режима решает, закреплять или откреплять: term_command уже
+        # переключил его, осталось отразить в чате.
+        if self.core.term.is_on(key):
+            await self._term_pin(session, key, thread_id)
+        else:
+            await self._term_unpin(key)
+
+    async def _term_pin(self, session, key: str, thread_id: int) -> None:
+        """Закрепить статус «терминал активен» с кнопками управления."""
+        if self.chat_id is None:
+            return
+        cwd = self.core.bash_cwd(session)
+        text = self.core.t("term_pin", cwd=str(cwd)) + (
+            self.core.t("term_on_host_warn") if session is None else ""
+        )
+        markup = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text=self.t("term_btn_history"),
+                                 callback_data=cbdata.termhist_cb(thread_id)),
+            InlineKeyboardButton(text=self.t("term_btn_repeat"),
+                                 callback_data=cbdata.termrepeat_cb(thread_id)),
+            InlineKeyboardButton(text=self.t("term_btn_close"),
+                                 callback_data=cbdata.termclose_cb(thread_id)),
+        ]])
+        kwargs: dict = {"chat_id": self.chat_id}
+        if thread_id:
+            kwargs["message_thread_id"] = thread_id
+        try:
+            msg = await self.bot.send_message(
+                text=text, parse_mode="HTML", reply_markup=markup, **kwargs)
+            # Предыдущий закреп (если был) чистим — нужен один.
+            await self._term_unpin(key)
+            self._term_pins[key] = msg.message_id
+            await self.bot.pin_chat_message(
+                chat_id=self.chat_id, message_id=msg.message_id,
+                disable_notification=True)
+        except Exception as e:
+            logger.warning("Не удалось закрепить статус терминала: %s", e)
+
+    async def _term_unpin(self, key: str) -> None:
+        """Открепить и удалить статус терминала (если он был)."""
+        msg_id = self._term_pins.pop(key, None)
+        if msg_id is None or self.chat_id is None:
+            return
+        for action in ("unpin", "delete"):
+            try:
+                if action == "unpin":
+                    await self.bot.unpin_chat_message(
+                        chat_id=self.chat_id, message_id=msg_id)
+                else:
+                    await self.bot.delete_message(
+                        chat_id=self.chat_id, message_id=msg_id)
+            except Exception:
+                pass  # уже удалён/нет прав — не критично
 
     async def cmd_close(self, message: Message) -> None:
         """Остановить сессию; топик и запись остаются, resume по сообщению."""
@@ -1104,16 +1166,22 @@ class TelegramAdapter:
             return
         await self._react(message, "👀")
         session = self._topic_session(message)
-        if session is None or not message.text:
+        if not message.text:
             return
 
         # Липкий режим терминала: обычные сообщения → шелл, `>` → claude.
-        # Ключ ровно тот же, что у оболочки (bash_key) — см. termmode.
+        # Проверяем ДО раннего возврата по «нет сессии»: в главном чате
+        # сессии нет, но /term там тоже работает (шелл на хосте).
         key = self.core.bash_key(session, f"tg{message.message_thread_id or 0}")
         if self.core.term.is_on(key):
             where, text = self.core.term.split_escape(message.text)
             if where == "claude":
-                # Сообщение начинается с `>` — уходит claude как обычно.
+                # Сообщение начинается с `>` — уходит claude как обычно. В
+                # главном чате claude-сессии нет: `>` там игнорируем (некому
+                # получать). Чтобы всё же отправить строку, начинающуюся с `>`
+                # в шелл, есть экранирование `>>`.
+                if session is None:
+                    return
                 if not await self._ensure_running(session, message):
                     return
                 await self._forward(session, message, text)
@@ -1135,7 +1203,10 @@ class TelegramAdapter:
             await self._run_bash_cmd(message, session, key, text)
             return
 
-        # Без липкого режима — поведение как раньше.
+        # Без липкого режима — поведение как раньше. В главном чате сессии
+        # нет: обычные сообщения там некому обрабатывать (нет claude).
+        if session is None:
+            return
         if not await self._ensure_running(session, message):
             return
         await self._forward(session, message, self._with_quote(message))
@@ -1395,9 +1466,10 @@ class TelegramAdapter:
             await callback.answer()
             return
         session = self._topic_by_thread(thread_id)
-        if session is None:
-            # Нет сессии — main-ключ дал бы терминал на ХОСТЕ без песочницы.
-            # Кнопка под выводом сессии не должна открывать такой путь.
+        if session is None and thread_id:
+            # Топик удалён/переиспользован — сессии больше нет. Главный чат
+            # (thread_id=0, session=None) НЕ отвергаем: там /term разрешён и
+            # шелл идёт по хосту осознанно.
             await callback.answer(self.t("term_history_gone"))
             return
         key = self.core.bash_key(session, f"tg{thread_id}")
@@ -1416,9 +1488,10 @@ class TelegramAdapter:
             await callback.answer()
             return
         session = self._topic_by_thread(thread_id)
-        if session is None:
-            # Нет сессии — main-ключ дал бы терминал на ХОСТЕ без песочницы.
-            # Кнопка под выводом сессии не должна открывать такой путь.
+        if session is None and thread_id:
+            # Топик удалён/переиспользован — сессии больше нет. Главный чат
+            # (thread_id=0, session=None) НЕ отвергаем: там /term разрешён и
+            # шелл идёт по хосту осознанно.
             await callback.answer(self.t("term_history_gone"))
             return
         key = self.core.bash_key(session, f"tg{thread_id}")
@@ -1433,6 +1506,21 @@ class TelegramAdapter:
         if isinstance(callback.message, Message):
             await self._run_bash_cmd(callback.message, session, key, cmds[0])
 
+    async def on_termclose_button(self, callback: CallbackQuery) -> None:
+        """✖ Закрыть липкий терминал (/term off) и открепить статус."""
+        if not self._accept_callback(callback):
+            await callback.answer()
+            return
+        thread_id = cbdata.parse_termclose(callback.data or "")
+        if thread_id is None:
+            await callback.answer()
+            return
+        session = self._topic_by_thread(thread_id)
+        key = self.core.bash_key(session, f"tg{thread_id}")
+        self.core.term.turn_off(key)
+        await self._term_unpin(key)
+        await callback.answer(self.t("term_off_answer"))
+
     async def on_termhist_button(self, callback: CallbackQuery) -> None:
         """🕘 Показать меню последних команд терминала."""
         if not self._accept_callback(callback):
@@ -1443,9 +1531,10 @@ class TelegramAdapter:
             await callback.answer()
             return
         session = self._topic_by_thread(thread_id)
-        if session is None:
-            # Нет сессии — main-ключ дал бы терминал на ХОСТЕ без песочницы.
-            # Кнопка под выводом сессии не должна открывать такой путь.
+        if session is None and thread_id:
+            # Топик удалён/переиспользован — сессии больше нет. Главный чат
+            # (thread_id=0, session=None) НЕ отвергаем: там /term разрешён и
+            # шелл идёт по хосту осознанно.
             await callback.answer(self.t("term_history_gone"))
             return
         key = self.core.bash_key(session, f"tg{thread_id}")
@@ -1492,9 +1581,9 @@ class TelegramAdapter:
             return
         thread_id, digest = parsed
         session = self._topic_by_thread(thread_id)
-        if session is None:
-            # Сессии нет (топик удалён/переиспользован) — молча уехать на
-            # main-ключ значит выполнить команду на ХОСТЕ без песочницы.
+        if session is None and thread_id:
+            # Топик удалён/переиспользован — сессии нет. Главный чат
+            # (thread_id=0) не отвергаем: /term там разрешён.
             await callback.answer(self.t("term_history_gone"))
             return
         key = self.core.bash_key(session, f"tg{thread_id}")

@@ -66,7 +66,18 @@ MESSAGES: dict[str, dict[str, str]] = {
             "<code>&gt;</code> перед сообщением — отправить claude, "
             "<code>&gt;&gt;</code> — экранировать сам <code>&gt;</code> (уйдёт в шелл)."
         ),
+        "term_on_host_warn": (
+            "\n⚠️ Это ОСНОВНОЙ чат: шелл идёт на ХОСТЕ с твоими правами, без "
+            "песочницы. Любая опечатка или вставленный текст выполнятся на "
+            "машине сразу. Закреп выше — чтобы не забыть, что ты в терминале."
+        ),
+        "term_pin": (
+            "🖥 Терминал активен\n"
+            "Каталог: <code>{cwd}</code>\n"
+            "Обычные сообщения уходят в шелл. <code>&gt;</code> → claude."
+        ),
         "term_off": "🖥 Режим терминала выключен. Сообщения снова уходят claude.",
+        "term_off_answer": "Терминал закрыт",
         "term_status_on": (
             "🖥 Режим терминала: <b>включён</b>\n"
             "Каталог: <code>{cwd}</code>\n"
@@ -360,6 +371,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "term_btn_interrupt": "⏹ Прервать",
         "term_btn_repeat": "↻ Повторить",
         "term_btn_history": "🕘 История",
+        "term_btn_close": "✖ Закрыть",
         "term_interrupted": "⏹ Прервано (Ctrl-C).",
         "term_history_title": "🕘 Последние команды:",
         "term_history_empty": "История команд пуста.",
@@ -428,7 +440,18 @@ MESSAGES: dict[str, dict[str, str]] = {
             "<code>&gt;</code> prefix — send to claude, "
             "<code>&gt;&gt;</code> — escape the <code>&gt;</code> itself (goes to shell)."
         ),
+        "term_on_host_warn": (
+            "\n⚠️ This is the MAIN chat: the shell runs on the HOST with your "
+            "rights, no sandbox. Any typo or pasted text executes on the "
+            "machine at once. The pin above is so you don't forget you're in a terminal."
+        ),
+        "term_pin": (
+            "🖥 Terminal active\n"
+            "Directory: <code>{cwd}</code>\n"
+            "Plain messages go to the shell. <code>&gt;</code> → claude."
+        ),
         "term_off": "🖥 Terminal mode OFF. Messages go to claude again.",
+        "term_off_answer": "Terminal closed",
         "term_status_on": (
             "🖥 Terminal mode: <b>ON</b>\n"
             "Directory: <code>{cwd}</code>\n"
@@ -715,6 +738,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "term_btn_interrupt": "⏹ Interrupt",
         "term_btn_repeat": "↻ Repeat",
         "term_btn_history": "🕘 History",
+        "term_btn_close": "✖ Close",
         "term_interrupted": "⏹ Interrupted (Ctrl-C).",
         "term_history_title": "🕘 Recent commands:",
         "term_history_empty": "Command history is empty.",
