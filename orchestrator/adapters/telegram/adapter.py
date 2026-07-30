@@ -1466,9 +1466,10 @@ class TelegramAdapter:
             await callback.answer()
             return
         session = self._topic_by_thread(thread_id)
-        if session is None:
-            # Нет сессии — main-ключ дал бы терминал на ХОСТЕ без песочницы.
-            # Кнопка под выводом сессии не должна открывать такой путь.
+        if session is None and thread_id:
+            # Топик удалён/переиспользован — сессии больше нет. Главный чат
+            # (thread_id=0, session=None) НЕ отвергаем: там /term разрешён и
+            # шелл идёт по хосту осознанно.
             await callback.answer(self.t("term_history_gone"))
             return
         key = self.core.bash_key(session, f"tg{thread_id}")
@@ -1487,9 +1488,10 @@ class TelegramAdapter:
             await callback.answer()
             return
         session = self._topic_by_thread(thread_id)
-        if session is None:
-            # Нет сессии — main-ключ дал бы терминал на ХОСТЕ без песочницы.
-            # Кнопка под выводом сессии не должна открывать такой путь.
+        if session is None and thread_id:
+            # Топик удалён/переиспользован — сессии больше нет. Главный чат
+            # (thread_id=0, session=None) НЕ отвергаем: там /term разрешён и
+            # шелл идёт по хосту осознанно.
             await callback.answer(self.t("term_history_gone"))
             return
         key = self.core.bash_key(session, f"tg{thread_id}")
@@ -1529,9 +1531,10 @@ class TelegramAdapter:
             await callback.answer()
             return
         session = self._topic_by_thread(thread_id)
-        if session is None:
-            # Нет сессии — main-ключ дал бы терминал на ХОСТЕ без песочницы.
-            # Кнопка под выводом сессии не должна открывать такой путь.
+        if session is None and thread_id:
+            # Топик удалён/переиспользован — сессии больше нет. Главный чат
+            # (thread_id=0, session=None) НЕ отвергаем: там /term разрешён и
+            # шелл идёт по хосту осознанно.
             await callback.answer(self.t("term_history_gone"))
             return
         key = self.core.bash_key(session, f"tg{thread_id}")
@@ -1578,9 +1581,9 @@ class TelegramAdapter:
             return
         thread_id, digest = parsed
         session = self._topic_by_thread(thread_id)
-        if session is None:
-            # Сессии нет (топик удалён/переиспользован) — молча уехать на
-            # main-ключ значит выполнить команду на ХОСТЕ без песочницы.
+        if session is None and thread_id:
+            # Топик удалён/переиспользован — сессии нет. Главный чат
+            # (thread_id=0) не отвергаем: /term там разрешён.
             await callback.answer(self.t("term_history_gone"))
             return
         key = self.core.bash_key(session, f"tg{thread_id}")
