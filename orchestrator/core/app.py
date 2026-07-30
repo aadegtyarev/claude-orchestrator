@@ -62,10 +62,6 @@ BASH_OUTPUT_LIMIT = 3500
 # Сколько файлов с полным выводом держим в папке сессии (см. _trim_bash_outputs).
 BASH_OUTPUTS_KEEP = 20
 
-# Окно контекста для процента в /stats. Захардкожено грубо: у моделей с
-# 1M-окном цифра будет занижать реальный запас — это ориентир, не факт.
-CONTEXT_WINDOW = 200_000
-
 # Синонимы моделей для кнопок /model. Маппинг на конкретные версии делает
 # сам Claude Code — мы не дублируем его каталог и не отстаём от переименований.
 MODEL_ALIASES = ["fable", "opus", "sonnet", "haiku"]
@@ -1269,15 +1265,22 @@ class OrchestratorCore:
                 tail=tail or self.t("log_empty"),
             )
         ctx = stats["context_tokens"]
+        window = self.config.context_window
+        engine = self.manager.engine_of(session)
+        wallet = "wallet" in self.config.modules
         return self.t(
             "stats_body",
             header=header,
             model=self.model_display(session, stats),
             ctx=self.fmt_num(ctx),
-            pct=f"{ctx / CONTEXT_WINDOW * 100:.0f}",
+            pct=f"{ctx / window * 100:.0f}",
+            window=self.fmt_num(window),
             out=self.fmt_num(stats["output_tokens"]),
             turns=stats["turns"],
             kb=f"{stats['transcript_bytes'] / 1024:.0f}",
+            sandbox=self.box_name(engine),
+            wallet=self.t("stats_wallet_on" if wallet and engine == "bwrap"
+                          else "stats_wallet_off"),
             uptime=uptime,
         )
 
