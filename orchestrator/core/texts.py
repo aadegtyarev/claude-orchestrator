@@ -61,12 +61,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "остался на диске:\n<code>{path}</code>"
         ),
         "bashin_sent": "⌨️ Отправил в терминал: <code>{text}</code>",
-        "term_on": (
-            "🖥 Режим терминала включён. Обычные сообщения уходят в шелл.\n"
-            "Рабочий каталог: <code>{cwd}</code>\n"
-            "<code>&gt;</code> перед сообщением — отправить claude, "
-            "<code>&gt;&gt;</code> — экранировать сам <code>&gt;</code> (уйдёт в шелл)."
-        ),
+        "term_on": "🖥 Терминал включён — подробности в закрепе выше.",
         "term_on_host_warn": (
             "\n⚠️ Это ОСНОВНОЙ чат: шелл идёт на ХОСТЕ с твоими правами, без "
             "песочницы. Любая опечатка или вставленный текст выполнятся на "
@@ -446,12 +441,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "file stayed on disk:\n<code>{path}</code>"
         ),
         "bashin_sent": "⌨️ Sent to terminal: <code>{text}</code>",
-        "term_on": (
-            "🖥 Terminal mode ON. Plain messages go to the shell.\n"
-            "Working directory: <code>{cwd}</code>\n"
-            "<code>&gt;</code> prefix — send to claude, "
-            "<code>&gt;&gt;</code> — escape the <code>&gt;</code> itself (goes to shell)."
-        ),
+        "term_on": "🖥 Terminal is on — see the pinned message above for details.",
         "term_on_host_warn": (
             "\n⚠️ This is the MAIN chat: the shell runs on the HOST with your "
             "rights, no sandbox. Any typo or pasted text executes on the "

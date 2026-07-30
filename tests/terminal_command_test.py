@@ -91,6 +91,21 @@ def test_term_on_off_roundtrip():
     assert core.term.is_on(key) is False
 
 
+def test_term_on_is_short_no_duplicate_with_pin():
+    """/term on в топике — короткое подтверждение, БЕЗ дублирования закрепа.
+
+    Регресс: раньше ответ команды повторял каталог и подсказки про >/>>,
+    которые тут же появляются в закрепе (_term_pin) — оператор получал два
+    почти одинаковых сообщения подряд ("много пустого текста")."""
+    core = make_core()
+    session = make_session()
+    key = "s:proj:tg123"
+    r = core.term_command(session, key, "on")
+    assert len(r) < 80, f"ответ /term on раздут: {r!r}"
+    # Подробности (каталог, >/>>) живут в закрепе — не в этом сообщении.
+    assert "Каталог" not in r and "&gt;" not in r, r
+
+
 def test_term_on_refused_in_main_chat():
     """В главном чате (session=None) /term on разрешён, но с предупреждением:
     шелл идёт по ХОСТУ с правами оператора без песочницы, любая опечатка

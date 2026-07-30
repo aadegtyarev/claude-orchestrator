@@ -1534,6 +1534,17 @@ class TelegramAdapter:
         self.core.term.turn_off(key)
         await self._term_unpin(key)
         await callback.answer(self.t("term_off_answer"))
+        # Тост callback.answer() исчезает мгновенно и легко теряется — та же
+        # обратная связь, что у команды /term off, должна остаться в чате.
+        if isinstance(callback.message, Message):
+            try:
+                await self.bot.send_message(
+                    chat_id=callback.message.chat.id,
+                    message_thread_id=thread_id or None,
+                    text=self.t("term_off"), parse_mode="HTML",
+                )
+            except Exception as e:
+                logger.warning("Не удалось отправить term_off в чат: %s", e)
 
     async def on_termhist_button(self, callback: CallbackQuery) -> None:
         """🕘 Показать меню последних команд терминала."""
