@@ -149,6 +149,33 @@ async def test_stopped_session_is_not_bothered():
     print("OK policy drift: остановленная сессия не тревожится")
 
 
+async def test_resume_does_not_re_notify_known_drift():
+    """Resume (session_env) не сбрасывает _env_notified — иначе дрифт, о
+    котором уже сообщили, объявлялся бы при каждом возобновлении сессии.
+
+    Раньше session_env делал _env_notified.pop на каждом вызове (а он зовётся
+    на каждом resume), переоружая уведомление. Дедупликация (_env_notified ==
+    fresh) обязана переживать resume, иначе она бесполезна.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="wallet_drift_resume_"))
+    secrets = tmp / "secrets.toml"
+    _write(secrets)
+    mod, notices = _module(secrets)
+    sess = _session("ikar")
+    mod.core.manager.list_all = lambda: [sess]
+
+    # Старт с базовой policy, затем секрет добавили на лету → дрифт.
+    mod.session_env(sess)
+    _write(secrets, _MATRIX)
+    await _tick(mod)
+    assert len(notices) == 1
+    assert "ikar" in mod._env_notified, "сторож не пометил дрифт известным"
+
+    # Resume: session_env зовётся снова — флаг «известно» должен остаться.
+    mod.session_env(sess)
+    assert "ikar" in mod._env_notified, "resume сбросил _env_notified — будет спам"
+
+
 async def test_session_without_delivered_env_is_skipped():
     """Сессия, которой мы env не отдавали (стартовала до модуля), не сравнивается."""
     tmp = Path(tempfile.mkdtemp(prefix="wallet_drift_unknown_"))
@@ -163,6 +190,7 @@ async def test_session_without_delivered_env_is_skipped():
 
 def main() -> None:
     asyncio.run(test_policy_change_notifies_once())
+    asyncio.run(test_resume_does_not_re_notify_known_drift())
     asyncio.run(test_stopped_session_is_not_bothered())
     asyncio.run(test_session_without_delivered_env_is_skipped())
     print("ALL WALLET-POLICY-DRIFT OK")

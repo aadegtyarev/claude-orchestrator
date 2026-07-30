@@ -1576,11 +1576,12 @@ class OrchestratorCore:
             code = None
             deadline = asyncio.get_running_loop().time() + BASH_TIMEOUT
             last_shown = ""
+            cwd = self._short_cwd(session)
             while asyncio.get_running_loop().time() < deadline:
                 await asyncio.sleep(BASH_POLL_INTERVAL)
                 out = capture.tail()
                 code = capture.code
-                shown, _ = self.bash_render(cmd, out, code)
+                shown, _ = self.bash_render(cmd, out, code, cwd=cwd)
                 is_terminal = code is not None
                 if shown != last_shown or is_terminal:
                     # Файл отдаём только когда вывод в него реально уехал
@@ -1605,7 +1606,7 @@ class OrchestratorCore:
             shell.interrupt()
             # При таймауте тоже может быть длинный вывод — отдаём файлом.
             capture.close()
-            shown, _ = self.bash_render(cmd, capture.tail(), None, timeout=True)
+            shown, _ = self.bash_render(cmd, capture.tail(), None, timeout=True, cwd=cwd)
             file_path = str(capture.path) if capture.overflowed else None
             await on_update(shown, True, file_path)
         except asyncio.CancelledError:
@@ -1697,18 +1698,37 @@ class OrchestratorCore:
             shell.write(f"echo {marker} 130\n")
         return True
 
+    def _short_cwd(self, session: Session | None) -> str:
+        """Базовый каталог терминала для шапки вывода: ~/... вместо полного."""
+        cwd = self.bash_cwd(session)
+        home = Path.home()
+        try:
+            rel = cwd.relative_to(home)
+            return f"~/{rel}" if str(rel) != "." else "~"
+        except ValueError:
+            return str(cwd)
+
     def bash_render(
-        self, cmd: str, out: bytes, code: str | None, timeout: bool = False
+        self, cmd: str, out: bytes, code: str | None, timeout: bool = False,
+        cwd: str | None = None,
     ) -> tuple[str, bool]:
         """HTML статуса bash: команда + вывод в <pre>, обрезка с хвоста.
         Возвращает (html, was_truncated) — флаг обрезки нужен вызывающему,
-        чтобы сохранить полный вывод в файл и отдать адаптеру."""
+        чтобы сохранить полный вывод в файл и отдать адаптеру.
+
+        cwd — рабочий каталог сессии в шапке (чтобы было видно, ГДЕ выполнено).
+        Это базовый каталог терминала, а не живой pwd: после `cd subdir` он не
+        обновится. Живой pwd потянул бы чтение /proc бwrap'а — дорого и хрупко,
+        а «в каком проекте» — отвечает и базовый."""
         text = out.decode(errors="replace")
         truncated = len(text) > BASH_OUTPUT_LIMIT
         if truncated:
             text = "…" + text[-BASH_OUTPUT_LIMIT:]
         body = html.escape(text) if text else self.t("bash_no_output")
-        header = f"⚡ <code>{html.escape(cmd)}</code>"
+        if cwd:
+            header = f"⚡ <code>{html.escape(cwd)}</code> ❯ <code>{html.escape(cmd)}</code>"
+        else:
+            header = f"⚡ <code>{html.escape(cmd)}</code>"
         if timeout:
             footer = self.t("bash_timeout")
         elif code is None:
