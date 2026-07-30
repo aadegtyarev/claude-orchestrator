@@ -150,12 +150,15 @@ MESSAGES: dict[str, dict[str, str]] = {
         "stats_body": (
             "{header}\n"
             "Модель: {model}\n"
-            "Контекст: ~{ctx} токенов (~{pct}% от 200k)\n"
+            "Контекст: ~{ctx} / {window} токенов (~{pct}%)\n"
             "Сгенерировано за сессию: {out} токенов\n"
             "Сообщений пользователя: {turns}\n"
+            "Изоляция: {sandbox} · Кошелёк: {wallet}\n"
             "Транскрипт: {kb} КБ\n"
             "Аптайм: {uptime}"
         ),
+        "stats_wallet_on": "✅ вкл",
+        "stats_wallet_off": "⏸ выкл",
         "usage_collecting": "💰 Собираю расходы и лимиты…",
         "usage_failed": "Не удалось разобрать вывод /cost (возможно, другая версия Claude Code). Данные — в claude.log.",
         "usage_title": "💰 Расходы и лимиты — {name}",
@@ -509,12 +512,15 @@ MESSAGES: dict[str, dict[str, str]] = {
         "stats_body": (
             "{header}\n"
             "Model: {model}\n"
-            "Context: ~{ctx} tokens (~{pct}% of 200k)\n"
+            "Context: ~{ctx} / {window} tokens (~{pct}%)\n"
             "Generated this session: {out} tokens\n"
             "User messages: {turns}\n"
+            "Isolation: {sandbox} · Wallet: {wallet}\n"
             "Transcript: {kb} KB\n"
             "Uptime: {uptime}"
         ),
+        "stats_wallet_on": "✅ on",
+        "stats_wallet_off": "⏸ off",
         "usage_collecting": "💰 Collecting cost and limits…",
         "usage_failed": "Could not parse /cost output (maybe a different Claude Code version). See claude.log.",
         "usage_title": "💰 Cost and limits — {name}",

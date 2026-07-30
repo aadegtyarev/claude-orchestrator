@@ -102,6 +102,10 @@ class Config:
     channel_port_end: int
     sessions_dir: Path
     max_instances: int  # лимит ОДНОВРЕМЕННО ЗАПУЩЕННЫХ (остановленные не в счёт)
+    # Контекстное окно модели для расчёта процента в /stats. По умолчанию 200k
+    # (Claude), но прокси может давать модели с большим окном (glm-5.2, deepseek
+    # — 1M). Транскрипт реальное окно не несёт, поэтому берём отсюда.
+    context_window: int
     # Сколько МБ памяти обязано остаться машине после старта сессии. 0 —
     # проверку не делать (лимит тогда только по штукам, как раньше).
     min_free_ram_mb: int
@@ -339,6 +343,7 @@ class Config:
                 os.getenv("SESSIONS_DIR", "~/claude-orchestrator-sessions")
             ).expanduser(),
             max_instances=int(os.getenv("MAX_INSTANCES", "5")),
+            context_window=int(os.getenv("CONTEXT_WINDOW", "200000")),
             min_free_ram_mb=int(os.getenv("MIN_FREE_RAM_MB", "1024")),
             claude_bin=os.getenv("CLAUDE_BIN", "claude"),
             orch_host=os.getenv("ORCH_HOST", "127.0.0.1"),
