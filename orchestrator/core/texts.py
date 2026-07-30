@@ -71,9 +71,14 @@ MESSAGES: dict[str, dict[str, str]] = {
             "🖥 Режим терминала: <b>включён</b>\n"
             "Каталог: <code>{cwd}</code>\n"
             "Занят командой: {busy}\n"
-            "<code>&gt;</code> → claude, <code>&gt;&gt;</code> → экранировать <code>&gt;</code>"
+            "<code>&gt;</code> перед сообщением → claude, <code>&gt;&gt;</code> → экранировать <code>&gt;</code>\n"
+            "Выключить: <code>/term off</code>"
         ),
-        "term_status_off": "🖥 Режим терминала: <b>выключен</b>",
+        "term_status_off": (
+            "🖥 Режим терминала: <b>выключен</b> (сообщения уходят claude)\n"
+            "Включить в топике сессии: <code>/term on</code> — обычные сообщения "
+            "пойдут в шелл. <code>&gt;</code> перед сообщением отправит его claude."
+        ),
         "term_no_main_chat": (
             "❌ Режим терминала включается только в топике сессии — не в основном чате.\n\n"
             "В основном чате /bash выполняет команды на ХОСТЕ с правами оператора "
@@ -330,6 +335,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "menu_delete": "Удалить сессию и топик",
         "menu_help": "Справка",
         "menu_bash": "Выполнить bash-команду (мимо Claude)",
+        "menu_bashin": "Дослать ввод в открытый /bash (y/n и т.п.)",
         "menu_term": "Липкий режим терминала: сообщения → шелл",
         "menu_chat_id": "ID чата (для TELEGRAM_CHAT_ID)",
         "chat_id_bound_now": (
@@ -424,9 +430,14 @@ MESSAGES: dict[str, dict[str, str]] = {
             "🖥 Terminal mode: <b>ON</b>\n"
             "Directory: <code>{cwd}</code>\n"
             "Busy: {busy}\n"
-            "<code>&gt;</code> → claude, <code>&gt;&gt;</code> → escape <code>&gt;</code>"
+            "<code>&gt;</code> prefix → claude, <code>&gt;&gt;</code> → escape <code>&gt;</code>\n"
+            "Turn off: <code>/term off</code>"
         ),
-        "term_status_off": "🖥 Terminal mode: <b>OFF</b>",
+        "term_status_off": (
+            "🖥 Terminal mode: <b>OFF</b> (messages go to claude)\n"
+            "Enable in a session topic: <code>/term on</code> — plain messages "
+            "go to the shell. Prefix with <code>&gt;</code> to send to claude."
+        ),
         "term_no_main_chat": (
             "❌ Terminal mode can only be turned on in a session topic — not in the main chat.\n\n"
             "In the main chat, /bash runs commands on the HOST with operator privileges "
@@ -676,6 +687,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "menu_delete": "Delete session and topic",
         "menu_help": "Help",
         "menu_bash": "Run a bash command (bypasses Claude)",
+        "menu_bashin": "Send input to an open /bash (y/n, etc.)",
         "menu_term": "Sticky terminal mode: messages → shell",
         "menu_chat_id": "Chat ID (for TELEGRAM_CHAT_ID)",
         "chat_id_bound_now": (
