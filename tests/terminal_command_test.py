@@ -92,14 +92,16 @@ def test_term_on_off_roundtrip():
 
 
 def test_term_on_refused_in_main_chat():
-    """В главном чате (session=None) /term on отказывает — безопасность: шелл
-    идёт по хосту с правами оператора без песочницы."""
+    """В главном чате (session=None) /term on разрешён, но с предупреждением:
+    шелл идёт по ХОСТУ с правами оператора без песочницы, любая опечатка
+    выполнится на машине. Риск «забыл, что в терминале» снимает закреп."""
     core = make_core()
     key = "main:tg0"
 
-    with pytest.raises(UserError) as exc:
-        core.term_command(None, key, "on")
-    assert "основном" in str(exc.value) or "main chat" in str(exc.value).lower(), str(exc.value)
+    r = core.term_command(None, key, "on")
+    assert core.term.is_on(key) is True
+    # Предупреждение о хосте обязано быть — иначе оператор не поймёт риск.
+    assert "ХОСТ" in r or "HOST" in r.upper(), r
 
 
 def test_term_off_works_in_main_chat():
@@ -113,6 +115,26 @@ def test_term_off_works_in_main_chat():
     r = core.term_command(None, key, "off")
     assert "выключен" in r.lower() or "OFF" in r, r
     assert core.term.is_on(key) is False
+
+
+def test_termclose_cbdata_roundtrip():
+    """Кнопка ✖ «Закрыть» кодирует и парсит thread_id."""
+    from orchestrator.adapters.telegram.cbdata import (
+        parse_termclose, termclose_cb,
+    )
+    assert termclose_cb(42) == "termclose:42"
+    assert parse_termclose("termclose:42") == 42
+    assert parse_termclose("garbage") is None
+
+
+def test_term_on_no_host_warning_in_session():
+    """В топике сессии предупреждения о хосте НЕ должно быть: там bwrap."""
+    core = make_core()
+    sess = make_session("proj")
+    r = core.term_command(sess, "s:proj:tg1", "on")
+    assert core.term.is_on("s:proj:tg1") is True
+    assert "ХОСТ" not in r and "HOST" not in r.upper(), r
+
 
 
 def test_term_status_on():
