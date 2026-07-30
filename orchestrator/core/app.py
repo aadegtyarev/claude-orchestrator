@@ -1185,11 +1185,23 @@ class OrchestratorCore:
     # ── permission relay ────────────────────────────────────────
 
     async def handle_permission_request(self, session_name: str, payload: dict) -> None:
-        """Запрос разрешения ОТ Claude Code (зовётся reply_server'ом) → PermissionRelay."""
+        """Запрос разрешения ОТ Claude Code (зовётся reply_server'ом) → PermissionRelay.
+
+        Если у сессии стоит auto_allow (кнопка «✅ Всё» / /perms auto) — одобряем
+        сразу, без кнопок в чат: оператор уже сказал «мне пофиг, разрешай всё»
+        (живой случай: модель лезет в SSH, и каждый чих спрашивать — мука)."""
         session = self.manager.get(session_name)
         if session is None:
             return
-        await self.perms.request_from_claude(session, payload)
+        request_id = str(payload.get("request_id", ""))
+        if session.auto_allow:
+            try:
+                await self.manager.send_permission(session, request_id, "allow")
+            except Exception as e:
+                logger.error("Сессия %s: авто-одобрение не ушло: %s", session.name, e)
+            return
+        await self.perms.request_from_claude(
+            session, payload, always_label=self.t("perm_allow_all"))
 
     async def request_confirmation(
         self,
@@ -1281,6 +1293,8 @@ class OrchestratorCore:
             sandbox=self.box_name(engine),
             wallet=self.t("stats_wallet_on" if wallet and engine == "bwrap"
                           else "stats_wallet_off"),
+            perms_mode=self.config.permission_mode,
+            perms_auto=(" · " + self.t("perms_auto_yes")) if session.auto_allow else "",
             uptime=uptime,
         )
 
@@ -1470,6 +1484,33 @@ class OrchestratorCore:
         if session is not None:
             return self.manager.effective_cwd(session)
         return Path.home()
+
+    def perms_command(self, session: Session | None, args: str) -> str:
+        """/perms [auto|lock]: авто-одобрение запросов разрешений сессии.
+
+        Без аргументов — статус. `auto` — одобрять всё, не спрашивая (тот же
+        эффект, что у кнопки «✅ Всё» на запросе). `lock` — снова спрашивать
+        по каждому запросу."""
+        action = (args or "").strip().lower()
+        if action == "auto":
+            if session is None:
+                raise UserError(self.t("only_topic"))
+            session.auto_allow = True
+            return self.t("perms_auto_on")
+        if action == "lock":
+            if session is None:
+                raise UserError(self.t("only_topic"))
+            session.auto_allow = False
+            return self.t("perms_auto_off")
+        if action:
+            raise UserError(self.t("perms_unknown_arg", arg=action))
+        if session is None:
+            return self.t("perms_status_main")
+        return self.t(
+            "perms_status",
+            mode=self.config.permission_mode,
+            auto=self.t("perms_auto_yes" if session.auto_allow else "perms_auto_no"),
+        )
 
     def term_command(self, session: Session | None, key: str, args: str) -> str:
         """Обработка /term [on|off]: включить/выключить липкий режим терминала.

@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from orchestrator.core.errors import UserError  # noqa: E402
 from orchestrator.core.permission import PermissionRelay  # noqa: E402
 
-SESSION = SimpleNamespace(name="noos")
+SESSION = SimpleNamespace(name="noos", auto_allow=False)
 
 
 class Harness:
@@ -203,16 +203,32 @@ async def test_choice_timeout_is_deny():
     print("OK request_choice: таймаут → deny (Р0), кнопки погашены")
 
 
-async def test_claude_request_ignores_unknown_behavior():
-    """Запрос ОТ Claude двоичен: allow_always туда не отправляется вовсе (иначе
-    Claude Code получил бы неизвестный вердикт), запрос остаётся открытым."""
+async def test_claude_request_allow_always_sets_auto_allow():
+    """«✅ Всё» на запросе от Claude: ставит auto_allow и одобряет (как allow).
+
+    Раньше allow_always для Claude-запросов отвергался — теперь это кнопка
+    «разрешить всё на сессию»: сессия получает auto_allow, и дальше запросы
+    одобряются сами (см. handle_permission_request)."""
     h = Harness()
     r = _relay(h)
     await r.request_from_claude(SESSION, {"request_id": "r1", "tool_name": "Bash"})
-    assert await r.verdict(SESSION, "r1", "allow_always", via="web") is False
+    assert SESSION.auto_allow is False
+    assert await r.verdict(SESSION, "r1", "allow_always", via="web") is True
+    assert SESSION.auto_allow is True, "allow_always обязан включить auto_allow"
+    assert h.sent == [("r1", "allow")], h.sent  # в Claude ушёл allow
+    print("OK запрос от Claude: allow_always → auto_allow + allow")
+
+
+async def test_claude_request_ignores_unknown_behavior():
+    """Незнакомый вердикт (не allow/deny/allow_always) на запросе Claude не
+    уходит в Claude Code — запрос остаётся открытым."""
+    h = Harness()
+    r = _relay(h)
+    await r.request_from_claude(SESSION, {"request_id": "r1", "tool_name": "Bash"})
+    assert await r.verdict(SESSION, "r1", "maybe", via="web") is False
     assert h.sent == [], "неизвестный вердикт не должен уходить в Claude"
     assert ("noos", "r1") in r._pending, "запрос должен остаться открытым"
-    print("OK запрос от Claude: allow_always игнорируется, запрос жив")
+    print("OK запрос от Claude: неизвестный вердикт игнорируется, запрос жив")
 
 
 async def main():
