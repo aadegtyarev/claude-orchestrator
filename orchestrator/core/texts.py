@@ -27,6 +27,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• текст — отправить Claude (остановленная сессия возобновится сама)\n"
             "• фото/файл — сохранится в папку сессии, Claude получит путь\n"
             "• <code>/stats</code> — контекст и статистика\n"
+            "• <code>/perms [auto|lock]</code> — авто-одобрение разрешений на сессию\n"
             "• <code>/log</code> — скачать полный лог сессии (для отладки)\n"
             "• <code>/usage</code> — расходы и лимиты плана\n"
             "• <code>/model</code> — модель: fable/opus/sonnet/haiku или точное имя\n"
@@ -165,6 +166,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "Сгенерировано за сессию: {out} токенов\n"
             "Сообщений пользователя: {turns}\n"
             "Изоляция: {sandbox} · Кошелёк: {wallet}\n"
+            "Пермиссии: {perms_mode}{perms_auto}\n"
             "Транскрипт: {kb} КБ\n"
             "Аптайм: {uptime}"
         ),
@@ -328,6 +330,14 @@ MESSAGES: dict[str, dict[str, str]] = {
         "perm_request": "🔐 <b>Запрос разрешения</b>\n{tool}: {desc}\n<pre>{preview}</pre>",
         "perm_allow": "✅ Разрешить",
         "perm_deny": "❌ Отклонить",
+        "perm_allow_all": "✅ Всё (на сессию)",
+        "perms_auto_on": "🔓 Авто-одобрение включено: запросы разрешений этой сессии больше не приходят. /perms lock — снова спрашивать.",
+        "perms_auto_off": "🔒 Авто-одобрение выключено: каждый запрос разрешений снова приходит кнопками.",
+        "perms_status": "Режим: <code>{mode}</code> · Авто-одобрение: {auto}\n<code>/perms auto</code> — разрешать всё, <code>/perms lock</code> — спрашивать.",
+        "perms_status_main": "/perms работает в топике сессии.",
+        "perms_auto_yes": "✅ вкл",
+        "perms_auto_no": "⏸ выкл",
+        "perms_unknown_arg": "❌ Неизвестный аргумент: <code>{arg}</code>. Допустимо: <code>auto</code>, <code>lock</code>.",
         "perm_allowed": "✅ Разрешено: {tool}",
         "perm_allowed_always": "🔒 Разрешено навсегда (записано в policy): {tool}",
         "perm_denied": "❌ Отклонено: {tool}",
@@ -338,6 +348,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "menu_bg": "Фоновые процессы сессии",
         "menu_wallet": "Кошелёк: policy секретов",
         "menu_stats": "Контекст и статистика сессии",
+        "menu_perms": "Авто-одобрение разрешений (на сессию)",
         "menu_usage": "Расходы и лимиты плана",
         "menu_model": "Модель сессии (fable/opus/sonnet/haiku)",
         "menu_skills": "Список скиллов",
@@ -401,6 +412,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• text — send to Claude (a stopped session resumes automatically)\n"
             "• photo/file — saved into the session folder, Claude gets the path\n"
             "• <code>/stats</code> — context and usage stats\n"
+            "• <code>/perms [auto|lock]</code> — auto-approve permissions for the session\n"
             "• <code>/log</code> — download the full session log (for debugging)\n"
             "• <code>/usage</code> — cost and plan limits\n"
             "• <code>/model</code> — model: fable/opus/sonnet/haiku or an exact name\n"
@@ -539,6 +551,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "Generated this session: {out} tokens\n"
             "User messages: {turns}\n"
             "Isolation: {sandbox} · Wallet: {wallet}\n"
+            "Permissions: {perms_mode}{perms_auto}\n"
             "Transcript: {kb} KB\n"
             "Uptime: {uptime}"
         ),
@@ -695,6 +708,14 @@ MESSAGES: dict[str, dict[str, str]] = {
         "perm_request": "🔐 <b>Permission request</b>\n{tool}: {desc}\n<pre>{preview}</pre>",
         "perm_allow": "✅ Allow",
         "perm_deny": "❌ Deny",
+        "perm_allow_all": "✅ All (this session)",
+        "perms_auto_on": "🔓 Auto-approve ON: permission requests for this session no longer arrive. /perms lock — ask again.",
+        "perms_auto_off": "🔒 Auto-approve OFF: each permission request arrives with buttons again.",
+        "perms_status": "Mode: <code>{mode}</code> · Auto-approve: {auto}\n<code>/perms auto</code> — allow all, <code>/perms lock</code> — ask.",
+        "perms_status_main": "/perms works in a session topic.",
+        "perms_auto_yes": "✅ on",
+        "perms_auto_no": "⏸ off",
+        "perms_unknown_arg": "❌ Unknown argument: <code>{arg}</code>. Allowed: <code>auto</code>, <code>lock</code>.",
         "perm_allowed": "✅ Allowed: {tool}",
         "perm_allowed_always": "🔒 Allowed forever (written to policy): {tool}",
         "perm_denied": "❌ Denied: {tool}",
@@ -705,6 +726,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "menu_bg": "Session background processes",
         "menu_wallet": "Wallet: secrets policy",
         "menu_stats": "Session context and stats",
+        "menu_perms": "Auto-approve permissions (per session)",
         "menu_usage": "Cost and plan limits",
         "menu_model": "Session model (fable/opus/sonnet/haiku)",
         "menu_skills": "List skills",

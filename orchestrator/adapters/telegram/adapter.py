@@ -97,6 +97,7 @@ class TelegramAdapter:
             BotCommand(command="orchestrator_restart", description=self.t("menu_restart")),
             BotCommand(command="orchestrator_web", description=self.t("menu_web")),
             BotCommand(command="stats", description=self.t("menu_stats")),
+            BotCommand(command="perms", description=self.t("menu_perms")),
             BotCommand(command="usage", description=self.t("menu_usage")),
             BotCommand(command="model", description=self.t("menu_model")),
             BotCommand(command="skills", description=self.t("menu_skills")),
@@ -437,6 +438,7 @@ class TelegramAdapter:
         dp.message.register(self.cmd_bash, Command("bash"))
         dp.message.register(self.cmd_bashin, Command("bashin"))
         dp.message.register(self.cmd_term, Command("term"))
+        dp.message.register(self.cmd_perms, Command("perms"))
         dp.message.register(self.on_text, F.text & ~F.text.startswith("/"))
         dp.message.register(self.on_file, F.photo | F.document)
         # Последним: неизвестные /команды уходят в терминал Claude.
@@ -859,6 +861,18 @@ class TelegramAdapter:
             await message.reply(self.t("bash_not_running"))
             return
         await message.reply(self.t("bashin_sent", text=html.escape(text) or "⏎"))
+
+    async def cmd_perms(self, message: Message, command: CommandObject) -> None:
+        """/perms [auto|lock]: авто-одобрение запросов разрешений сессии."""
+        if not self._accept(message):
+            return
+        session = self._topic_session(message)
+        try:
+            text = self.core.perms_command(session, command.args or "")
+        except UserError as e:
+            await message.reply(str(e), parse_mode="HTML")
+            return
+        await message.reply(text, parse_mode="HTML")
 
     async def cmd_term(self, message: Message, command: CommandObject) -> None:
         """/term [on|off]: липкий режим терминала — обычные сообщения уходят в шелл.

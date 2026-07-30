@@ -120,6 +120,10 @@ class Session:
     # даже если в .env профиль задан). Как и движок, выбирается при создании и
     # живёт с сессией: resume/clear поднимают её тем же профилем.
     profile: str | None = None
+    # Авто-одобрение ВСЕХ запросов разрешений этой сессии (кнопка «✅ Всё» на
+    # запросе или /perms auto). Только в памяти: после рестарта снова спросит —
+    # осознанно не персистим (модель получает carta blanca на хосте сессии).
+    auto_allow: bool = False
     started_at: float = field(default_factory=time.time)
     last_activity: float = field(default_factory=time.time)
     process: asyncio.subprocess.Process | None = None

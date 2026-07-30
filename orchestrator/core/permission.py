@@ -86,9 +86,15 @@ class PermissionRelay:
         self._pending: set[tuple[str, str]] = set()
         self._local: dict[tuple[str, str], _Local] = {}
 
-    async def request_from_claude(self, session: "Session", payload: dict) -> None:
+    async def request_from_claude(
+        self, session: "Session", payload: dict, *, always_label: str | None = None,
+    ) -> None:
         """Запрос разрешения ОТ Claude Code — кнопками во все адаптеры; применяется
-        первый ответ (параллельно остаётся открытым и локальный TUI-диалог)."""
+        первый ответ (параллельно остаётся открытым и локальный TUI-диалог).
+
+        always_label — текст третьей кнопки «разрешить всё на сессию» (см.
+        verdict: по ней сессия получает auto_allow, и дальше запросы не
+        доходят до оператора). None — только ✅/❌, как раньше."""
         raw_preview = str(payload.get("input_preview", ""))
         if len(raw_preview) > PERM_PREVIEW_LIMIT:
             raw_preview = raw_preview[:PERM_PREVIEW_LIMIT] + " …(обрезано)"
@@ -97,6 +103,7 @@ class PermissionRelay:
             tool=str(payload.get("tool_name", "?")),
             description=str(payload.get("description", "")),
             preview=raw_preview,
+            always_label=always_label,
         )
         self._pending.add((session.name, request.request_id))
         self._record(
@@ -213,7 +220,12 @@ class PermissionRelay:
             return True
         if key not in self._pending:
             return False
-        if behavior not in (ALLOW, DENY):
+        if behavior == ALLOW_ALWAYS:
+            # «✅ Всё»: с этого момента сессия одобряет запросы сама (auto_allow).
+            # Текущий запрос одобряем сейчас как обычный allow.
+            session.auto_allow = True
+            behavior = ALLOW
+        elif behavior not in (ALLOW, DENY):
             # Вердикт ОТ Claude Code двоичен (allow/deny) — «навсегда» там кнопкой
             # не предлагается. Незнакомое значение не пересылаем в Claude вовсе:
             # запрос остаётся открытым, оператор ответит нормальной кнопкой.

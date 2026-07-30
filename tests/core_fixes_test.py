@@ -29,7 +29,7 @@ from orchestrator.core.bubble import BubbleManager  # noqa: E402
 from orchestrator.core.texts import get_texts  # noqa: E402
 from orchestrator.core.turn import TurnSupervisor  # noqa: E402
 
-SESSION = SimpleNamespace(name="noos", title="noos", bindings={})
+SESSION = SimpleNamespace(name="noos", title="noos", bindings={}, auto_allow=False)
 
 
 class FakeMgr:
