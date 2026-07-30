@@ -293,7 +293,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "🔑 Policy кошелька изменилась ({changes}), но эта сессия запущена со "
             "старым окружением: переменные задаются при старте. Переоткрой сессию "
             "(/close_session и сообщение), либо бери секрет по требованию — "
-            "<code>wallet run &lt;имя&gt;</code>."
+            "`wallet run <имя>`."
         ),
         "wallet_disabled": "🔐 Кошелёк не подключён (SANDBOX_BWRAP_WALLET + SANDBOX=bwrap). /wallet недоступен.",
         "sendfile_not_found": "❌ Не удалось отправить: файл не найден: {path}",
@@ -645,7 +645,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "🔑 Wallet policy changed ({changes}), but this session started with the "
             "old environment: variables are set at launch. Reopen the session "
             "(/close_session and a message), or fetch the secret on demand — "
-            "<code>wallet run &lt;name&gt;</code>."
+            "`wallet run <name>`."
         ),
         "wallet_disabled": "🔐 Wallet not enabled (SANDBOX_BWRAP_WALLET + SANDBOX=bwrap). /wallet unavailable.",
         "sendfile_not_found": "❌ Cannot send: file not found: {path}",

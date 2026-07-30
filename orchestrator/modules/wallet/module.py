@@ -355,7 +355,12 @@ class WalletModule:
         # работать как раньше, а не падать на отсутствующем поле.
         if isinstance(getattr(self, "_env_delivered", None), dict):
             self._env_delivered[session.name] = set(out)
-            self._env_notified.pop(session.name, None)  # свежий старт — молчим заново
+            # ВНИМАНИЕ: раньше тут был _env_notified.pop — «свежий старт, молчим
+            # заново». Но session_env зовётся на КАЖДОМ resume, и pop переоружал
+            # уведомление, из-за чего устаревший дрифт (секрет добавили в policy
+            # после старта сессии) объявлялся оператору при каждом возобновлении.
+            # Дедупликация (_env_notified == fresh в стороже) должна переживать
+            # resume — иначе она бесполезна. Не сбрасываем.
         return out
 
     def _env_for(self, session_name: str) -> dict[str, str]:
