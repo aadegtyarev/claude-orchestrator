@@ -1531,7 +1531,7 @@ class OrchestratorCore:
             # предупреждаем, что любая опечатка выполнится на машине. В топике
             # сессии этого риска нет — там bwrap.
             host = session is None
-            return self.t("term_on", cwd=str(self.bash_cwd(session))) + (
+            return self.t("term_on") + (
                 self.t("term_on_host_warn") if host else ""
             )
 
