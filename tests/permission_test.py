@@ -15,7 +15,9 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from orchestrator.core.errors import UserError  # noqa: E402
-from orchestrator.core.permission import PermissionRelay  # noqa: E402
+from orchestrator.core.permission import (  # noqa: E402
+    PERM_DESC_LIMIT, PermissionRelay,
+)
 
 SESSION = SimpleNamespace(name="noos", auto_allow=False)
 
@@ -219,6 +221,27 @@ async def test_claude_request_allow_always_sets_auto_allow():
     print("OK запрос от Claude: allow_always → auto_allow + allow")
 
 
+async def test_request_from_claude_truncates_oversized_description():
+    """Workflow кладёт в description многоабзацные системные инструкции (в
+    реальном инциденте — 3530 символов); ядро прежде обрезало только preview,
+    и собранное HTML-сообщение (tool+desc+preview) превышало лимит Telegram
+    в 4096 символов — send_message падал, ошибка молча терялась, оператор
+    не видел запрос и сессия висела до ручного /interrupt (Esc).
+
+    Регресс: description тоже обязан резаться, как и preview."""
+    h = Harness()
+    r = _relay(h)
+    oversized = "x" * (PERM_DESC_LIMIT + 500)
+    await r.request_from_claude(
+        SESSION, {"request_id": "r1", "tool_name": "Workflow", "description": oversized},
+    )
+    req = h.requests[0]
+    assert len(req.description) <= PERM_DESC_LIMIT + len(" …(обрезано)"), \
+        f"description не обрезан: {len(req.description)} символов"
+    assert req.description.endswith("…(обрезано)")
+    print("OK request_from_claude: раздутый description (Workflow) обрезается")
+
+
 async def test_claude_request_ignores_unknown_behavior():
     """Незнакомый вердикт (не allow/deny/allow_always) на запросе Claude не
     уходит в Claude Code — запрос остаётся открытым."""
@@ -242,6 +265,7 @@ async def main():
     await test_binary_confirmation_rejects_allow_always()
     await test_choice_three_outcomes()
     await test_choice_timeout_is_deny()
+    await test_request_from_claude_truncates_oversized_description()
     await test_claude_request_ignores_unknown_behavior()
     print("ALL PERMISSION OK")
 
