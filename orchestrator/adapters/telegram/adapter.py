@@ -382,6 +382,25 @@ class TelegramAdapter:
             )
         except Exception as e:
             logger.error("Не удалось отправить permission-запрос: %s", e)
+            # Раньше на этом ошибка молча терялась: оператор не видел ни
+            # текста, ни кнопок и не мог ответить — сессия висела до ручного
+            # /interrupt. Короткий фолбэк без description/preview почти
+            # никогда не упрётся в тот же лимит (Telegram режет по 4096
+            # символам), а кнопки остаются рабочими.
+            fallback = self.t("perm_request_fallback", tool=html.escape(request.tool))
+            try:
+                msg = await self.bot.send_message(
+                    chat_id=self.chat_id,
+                    text=fallback,
+                    message_thread_id=thread_id,
+                    parse_mode="HTML",
+                    reply_markup=markup,
+                )
+                self._perm_msgs[(session.name, request.request_id)] = (
+                    msg.message_id, request.tool
+                )
+            except Exception as e2:
+                logger.error("Не удалось отправить и фолбэк permission-запроса: %s", e2)
 
     async def permission_resolved(
         self, session: Session, request_id: str, behavior: str, via: str

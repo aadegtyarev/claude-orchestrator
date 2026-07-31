@@ -137,6 +137,37 @@ def test_telegram_third_button_only_when_offered():
     print("OK telegram: третья кнопка только при always_label, callback влезает в лимит")
 
 
+def test_telegram_permission_prompt_falls_back_on_send_failure():
+    """Регресс инцидента с Workflow: send_message падает (сообщение слишком
+    длинное для Telegram) → раньше ошибка молча логировалась, оператор не
+    видел ни текста, ни кнопок и не мог ответить — сессия висела до /interrupt.
+
+    Теперь первый неудачный send должен смениться коротким фолбэком, который
+    ВСЁ ЕЩЁ несёт рабочие кнопки — иначе разрешить/отклонить нечем."""
+    a, sent = _tg_adapter()
+    calls = {"n": 0}
+    orig_send = a.bot.send_message
+
+    async def flaky_send(**kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("Bad Request: message is too long")
+        return await orig_send(**kw)
+
+    a.bot.send_message = flaky_send
+    req = PermissionRequest(request_id="r1", tool="Workflow", description="d" * 4000,
+                            preview="p" * 3500)
+    asyncio.run(a.permission_prompt(SESSION, req))
+    assert calls["n"] == 2, "после отказа должен быть ровно один повтор (фолбэк)"
+    assert sent, "фолбэк обязан всё-таки уйти в чат"
+    assert sent[-1]["reply_markup"].inline_keyboard, \
+        "фолбэк без кнопок оставил бы оператора без способа ответить"
+    assert ("r1" in a._perm_msgs.get((SESSION.name, "r1"), (None, None))
+            or a._perm_msgs.get((SESSION.name, "r1")) is not None), \
+        "message_id фолбэка должен быть запомнен — иначе кнопки потом не найдут своё сообщение"
+    print("OK telegram: отказ отправки → короткий фолбэк с рабочими кнопками")
+
+
 def test_web_third_button_only_when_offered():
     """Веб получает метку тем же полем: грант доступен в ОБОИХ интерфейсах."""
     from orchestrator.adapters.web.adapter import WebAdapter
@@ -459,6 +490,7 @@ def main():
     test_no_grant_for_service_root()
     test_grant_survives_dot_segments()
     test_telegram_third_button_only_when_offered()
+    test_telegram_permission_prompt_falls_back_on_send_failure()
     test_web_third_button_only_when_offered()
     test_history_keeps_always_label()
     test_write_is_atomic_symlink_safe_and_0600()

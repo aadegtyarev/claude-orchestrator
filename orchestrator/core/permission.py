@@ -40,6 +40,16 @@ logger = logging.getLogger(__name__)
 # Потолок предпросмотра ввода инструмента в кнопке-запросе (символы).
 PERM_PREVIEW_LIMIT = 3500
 
+# Потолок описания запроса (символы). У большинства тулов description — одна
+# фраза, но Workflow кладёт туда многоабзацные системные инструкции (в одном
+# инциденте — 3530 символов); вместе с preview собранное HTML-сообщение
+# превышало лимит Telegram (4096), send_message падал, а ошибка молча
+# логировалась — оператор вообще не видел запрос разрешения и сессия висела
+# до ручного /interrupt (Esc). См. orchestrator/adapters/telegram/adapter.py
+# permission_prompt — там теперь есть и фолбэк на случай, если что-то другое
+# всё равно перекроет лимит.
+PERM_DESC_LIMIT = 500
+
 # Исходы локального подтверждения. ДВА первых были всегда (кнопки ✅/❌); третий
 # добавлен для ASK-гранта кошелька (§4.6): «разрешить и записать в policy». Он
 # доступен ТОЛЬКО там, где вызывающий явно дал `always_label` — обычные
@@ -98,10 +108,13 @@ class PermissionRelay:
         raw_preview = str(payload.get("input_preview", ""))
         if len(raw_preview) > PERM_PREVIEW_LIMIT:
             raw_preview = raw_preview[:PERM_PREVIEW_LIMIT] + " …(обрезано)"
+        raw_desc = str(payload.get("description", ""))
+        if len(raw_desc) > PERM_DESC_LIMIT:
+            raw_desc = raw_desc[:PERM_DESC_LIMIT] + " …(обрезано)"
         request = PermissionRequest(
             request_id=str(payload.get("request_id", "")),
             tool=str(payload.get("tool_name", "?")),
-            description=str(payload.get("description", "")),
+            description=raw_desc,
             preview=raw_preview,
             always_label=always_label,
         )
