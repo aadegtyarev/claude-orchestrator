@@ -176,6 +176,35 @@ async def test_resume_does_not_re_notify_known_drift():
     assert "ikar" in mod._env_notified, "resume сбросил _env_notified — будет спам"
 
 
+async def test_sandbox_off_session_is_never_flagged():
+    """Сессия с sandbox=off (или agent-vm): кошелёк там и не применялся
+    (applies_to() == False, session_env отдаёт пустой env) — сторож не должен
+    твердить «policy изменилась», это переоткрытие никогда не устранит.
+
+    Регресс: _watch_policy сравнивал _env_delivered (пусто для off-сессии,
+    т.к. applies_to() отсекает её в session_env) с _env_for(session_name)
+    (полный набор — эта функция НЕ смотрит на applies_to), поэтому расхождение
+    было гарантировано и уведомление приходило на каждом рестарте сервиса
+    (живой случай: сессия claude-orchestrator, --box off)."""
+    tmp = Path(tempfile.mkdtemp(prefix="wallet_drift_off_"))
+    secrets = tmp / "secrets.toml"
+    _write(secrets)
+    mod, notices = _module(secrets)
+    sess = _session("claude-orchestrator")
+    mod.core.manager.list_all = lambda: [sess]
+    mod.core.manager.engine_of = lambda s: "off"  # эта сессия НЕ под bwrap
+
+    # session_env для off-сессии отдаёт пустой env (applies_to() == False).
+    env = mod.session_env(sess)
+    assert env == {}, f"кошелёк не должен давать env вне bwrap: {env}"
+
+    await _tick(mod)
+    assert notices == [], (
+        f"off-сессию сторож не должен тревожить дрифтом — применять нечего: {notices}"
+    )
+    print("OK policy drift: sandbox=off сессия никогда не получает уведомление")
+
+
 async def test_session_without_delivered_env_is_skipped():
     """Сессия, которой мы env не отдавали (стартовала до модуля), не сравнивается."""
     tmp = Path(tempfile.mkdtemp(prefix="wallet_drift_unknown_"))
@@ -192,6 +221,7 @@ def main() -> None:
     asyncio.run(test_policy_change_notifies_once())
     asyncio.run(test_resume_does_not_re_notify_known_drift())
     asyncio.run(test_stopped_session_is_not_bothered())
+    asyncio.run(test_sandbox_off_session_is_never_flagged())
     asyncio.run(test_session_without_delivered_env_is_skipped())
     print("ALL WALLET-POLICY-DRIFT OK")
 
