@@ -336,9 +336,21 @@ class BashSession:
         # wrapper — префикс песочницы (bwrap … --), пусто если SANDBOX=off.
         argv = [*(wrapper or []), "/bin/bash", "-i"]
         try:
+            # stderr → /dev/null ТОЛЬКО на подъём: под bwrap (--unshare-pid)
+            # bash не может стать foreground process group терминала (TTY —
+            # снаружи pid-namespace, TIOCSPGRP через границу не работает —
+            # ограничение ядра, не наше), и на КАЖДОМ старте печатает в
+            # stderr «не удаётся задать группу процесса терминала» + подсказку
+            # sudo. Само предупреждение безвредно (job control нам не нужен,
+            # Ctrl-C работает через отдельный сигнальный путь TTY — не через
+            # process group), но пугает оператора в /bashin и сыром выводе
+            # /term. Первая же команда ниже (exec 2>&1) возвращает stderr в
+            # общий с stdout канал для ВСЕХ последующих команд оператора —
+            # их собственные ошибки (`cat: файл не найден` и т.п.) видны как
+            # прежде, глушится только этот стартовый баннер самого bash.
             self.proc = subprocess.Popen(
                 argv,
-                stdin=slave, stdout=slave, stderr=slave,
+                stdin=slave, stdout=slave, stderr=subprocess.DEVNULL,
                 cwd=str(cwd), env=env, start_new_session=True,
             )
         finally:
@@ -350,7 +362,10 @@ class BashSession:
         # от настоящего вывода эвристиками — а они рвутся на границах кусков
         # PTY (замерено живьём: приглашение приезжает отдельным чтением).
         # Оператору это не видно: он и так видит только вывод своей команды.
-        self.write("stty -echo 2>/dev/null; PS1=''; PS2=''\n")
+        # `exec 2>&1` первой строкой — ДО stty: возвращает stderr процесса в
+        # PTY (см. комментарий у Popen выше), иначе оболочка навсегда
+        # осталась бы без стандартной ошибки для всех команд оператора.
+        self.write("exec 2>&1\nstty -echo 2>/dev/null; PS1=''; PS2=''\n")
 
     def _reader(self) -> None:
         while True:

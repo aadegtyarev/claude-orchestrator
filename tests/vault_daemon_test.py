@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -51,6 +52,85 @@ def _store(tmp: Path) -> SecretStore:
     )
     os.chmod(f, 0o600)
     return SecretStore(f)
+
+
+def _store_with_git(tmp: Path) -> SecretStore:
+    f = tmp / "secrets.toml"
+    f.write_text(
+        '[secrets.host]\nsessions=["*"]\ncommands=["git", "sh"]\nconfirm=false\n'
+    )
+    os.chmod(f, 0o600)
+    return SecretStore(f)
+
+
+async def test_git_calls_are_serialized_per_session_repo():
+    """/exec сериализует git-команды на (сессия, cwd): без этого параллельный
+    `git fetch`/`push` из разных тредов одной сессии на один .git — гонка
+    записи в refs/packed-refs (живой случай: fetch за секунды вернул три
+    разных снимка origin/master). Другие сессии/репозитории друг друга не
+    ждут — проверяем, что лок именно per-(session,cwd), а не глобальный."""
+    tmp = Path(tempfile.mkdtemp(prefix="vault_daemon_git_"))
+    cwd = tmp / "proj"
+    cwd.mkdir()
+    other_cwd = tmp / "other"
+    other_cwd.mkdir()
+    host = FakeHost()
+    daemon = VaultDaemon(_store_with_git(tmp), host, guard_on=False)
+    await daemon.start()
+    try:
+        # sleep-скрипт под именем git (симлинк): _execute сериализует по
+        # os.path.basename(cmd[0]) == "git" — как в проде, где это настоящий
+        # системный git.
+        fake_git = tmp / "fake-git"
+        fake_git.write_text("#!/bin/sh\nsleep 0.3\necho done $$\n")
+        os.chmod(fake_git, 0o755)
+        git_link = tmp / "git"
+        git_link.symlink_to(fake_git)
+
+        # Токены выдаём ДО параллельных вызовов: issue_token отзывает
+        # прежний токен той же сессии — выданные ОДНОВРЕМЕННО из двух call()
+        # для одной сессии гонялись бы друг с другом за живой токен.
+        token_dev = daemon.issue_token("dev", cwd)
+        token_dev2 = daemon.issue_token("dev2", other_cwd)
+
+        async def call(token: str) -> tuple[float, float]:
+            hdrs = {"Authorization": f"Bearer {token}"}
+            async with aiohttp.ClientSession() as http:
+                t0 = time.monotonic()
+                async with http.post(
+                    f"{daemon.url}/exec", headers=hdrs,
+                    json={"cmd": [str(git_link), "status"]},
+                ) as r:
+                    await r.json()
+                return t0, time.monotonic()
+
+        # Две параллельные git-команды в ОДНОМ репозитории (та же сессия) —
+        # оба запроса СТАРТУЮТ одновременно (это gather), но лок заставляет
+        # исполниться последовательно: суммарный интервал от первого старта
+        # до последнего конца должен быть ~0.6с (2×sleep 0.3), а не ~0.3с
+        # (как было бы при параллельном исполнении).
+        results = await asyncio.gather(call(token_dev), call(token_dev))
+        span = max(r[1] for r in results) - min(r[0] for r in results)
+        assert span >= 0.5, (
+            f"git-вызовы в одном репозитории не сериализованы (span={span:.2f}с): {results}")
+        print("OK vault daemon: параллельный git в одном репозитории сериализован")
+
+        # Два репозитория (сессии) — НЕ должны ждать друг друга. Свежие
+        # токены: прежние ещё валидны (revoke ниже их не трогал), но снова
+        # issue_token не зовём — он отозвал бы token_dev у себя же.
+        t_start = time.monotonic()
+        await asyncio.gather(call(token_dev), call(token_dev2))
+        elapsed = time.monotonic() - t_start
+        assert elapsed < 0.55, (
+            f"git-вызовы в РАЗНЫХ репозиториях не должны сериализоваться: {elapsed}с")
+        print("OK vault daemon: git в разных репозиториях выполняется параллельно")
+
+        daemon.revoke_session("dev")
+        assert not any(k[0] == "dev" for k in daemon._git_locks), (
+            "revoke_session должен снести git-локи отозванной сессии")
+        print("OK vault daemon: revoke_session чистит git-локи сессии")
+    finally:
+        await daemon.stop()
 
 
 async def main():
@@ -149,7 +229,8 @@ async def main():
 
 async def test_vault_daemon():
     await main()
+    await test_git_calls_are_serialized_per_session_repo()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(test_vault_daemon())

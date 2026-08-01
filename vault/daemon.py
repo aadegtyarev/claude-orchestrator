@@ -15,12 +15,14 @@ cwd через issue_token(session_name, cwd): оркестратор при п�
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import html
 import logging
 import os
 import secrets
 import socket
+from collections import defaultdict
 from pathlib import Path
 from typing import NamedTuple
 
@@ -82,6 +84,14 @@ class VaultDaemon:
         self._runner: web.AppRunner | None = None
         # Токен → (имя сессии, рабочий каталог). cwd снят при выдаче токена.
         self._tokens: dict[str, Ctx] = {}
+        # (сессия, cwd) → лок на git-команды в этом репозитории: /exec не
+        # сериализован, и параллельные `git fetch`/`push`/… из разных
+        # тредов/субагентов ОДНОЙ сессии на один и тот же .git — гонка записи
+        # в refs/packed-refs (живой случай: fetch за секунды вернул три
+        # разных снимка origin/master). Держит лок только сама execute() —
+        # policy/confirm снаружи, иначе зависший confirm блокировал бы
+        # остальные git-вызовы этого репозитория без причины.
+        self._git_locks: dict[tuple[str, str], asyncio.Lock] = defaultdict(asyncio.Lock)
 
     # ── жизненный цикл ──────────────────────────────────────────
     async def start(self) -> None:
@@ -108,6 +118,7 @@ class VaultDaemon:
             await self._runner.cleanup()
             self._runner = None
         self._tokens.clear()
+        self._git_locks.clear()
         if self.proxies is not None:
             await self.proxies.stop_all()
 
@@ -140,6 +151,12 @@ class VaultDaemon:
 
     def revoke_session(self, session_name: str) -> None:
         self._tokens = {t: c for t, c in self._tokens.items() if c.name != session_name}
+        # Гигиена памяти: лок, который сейчас держат (async with), не
+        # пострадает — держатель ссылается на сам объект Lock, не на запись
+        # в словаре. defaultdict создаёт новый Lock при следующем обращении —
+        # реассайн обычным dict-литералом убил бы фабрику по умолчанию.
+        for key in [k for k in self._git_locks if k[0] == session_name]:
+            del self._git_locks[key]
 
     def _auth(self, request: web.Request) -> Ctx | None:
         """Bearer-токен → Ctx. Сравнение constant-time (compare_digest), перебор
@@ -314,12 +331,22 @@ class VaultDaemon:
     async def _execute(self, ctx: Ctx, secret: Secret, cmd: list[str]) -> tuple[int, bytes, bytes]:
         """Запустить команду НА ХОСТЕ под секретом — делегат в vault.execute.
         cwd берётся из контекста токена (снят при выдаче, без перерезолва)."""
-        return await run_secret_command(
+        run = functools.partial(
+            run_secret_command,
             cmd, secret,
             cwd=ctx.cwd,
             all_secrets=self.store.load(),
             session_name=ctx.name,
         )
+        if cmd and os.path.basename(cmd[0]) == "git":
+            # Сериализуем ТОЛЬКО git и ТОЛЬКО на (сессия, репозиторий):
+            # параллельный fetch/push в один .git из разных тредов/субагентов
+            # сессии гонится за refs/packed-refs (см. комментарий у
+            # _git_locks). Другие сессии и другие репозитории друг друга не
+            # ждут — ключ включает cwd, а не только имя сессии.
+            async with self._git_locks[(ctx.name, str(ctx.cwd))]:
+                return await run()
+        return await run()
 
 
 __all__ = ["VaultDaemon", "Ctx"]
