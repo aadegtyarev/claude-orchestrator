@@ -405,6 +405,16 @@ class WalletModule:
                 for session in self.core.manager.list_all():
                     if not session.running:
                         continue  # у остановленной env соберётся при старте
+                    if not self.applies_to(session):
+                        continue  # sandbox=off/agent-vm: кошелёк тут и не применялся —
+                        # сравнение «доставлено vs дала бы policy сейчас» ложное
+                        # (delivered всегда пусто, а policy для sessions=["*"] всегда
+                        # непусто), переоткрытие сессии дрифт не устранит.
+                        # session_env уже отсекает этот случай тем же условием —
+                        # без гварда здесь сторож твердит «поменялось», хотя не
+                        # применялось никогда (живой случай: claude-orchestrator
+                        # с --box off получал уведомление на каждом рестарте сервиса,
+                        # т.к. _env_notified сбрасывается в stop()).
                     delivered = self._env_delivered.get(session.name)
                     if delivered is None:
                         continue  # env этой сессии мы не отдавали — сравнивать не с чем
