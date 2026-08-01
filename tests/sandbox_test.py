@@ -192,6 +192,64 @@ def test_real_isolation():
         (home / "leaktest.txt").unlink(missing_ok=True)
 
 
+def test_no_job_control_warning_stderr_still_works():
+    """bwrap --unshare-pid: bash не может стать foreground process group
+    терминала (TTY снаружи pid-namespace) и на КАЖДОМ старте печатает в
+    STDERR «не удаётся задать группу процесса терминала» — ограничение
+    ядра, безвредное (Ctrl-C идёт через сигнальный путь TTY, не через
+    process group), но пугающее в сыром выводе /bashin и /term.
+
+    ⚠️ НЕ путать с sudo-подсказкой того же баннера («To run a command as
+    administrator…») — та печатается через STDOUT (`cat <<-EOF` в
+    /etc/bash.bashrc, читается только т.к. мы запускаем `bash -i`) и этим
+    фиксом сознательно НЕ подавляется: единственный надёжный способ убрать
+    её отсюда — `--norc`, а он заодно отключил бы персональный ~/.bashrc
+    оператора (алиасы, PATH, virtualenv) — функциональная потеря, а не
+    косметика, менять без спроса нельзя. Штатное решение вне нашего кода:
+    `touch ~/.sudo_as_admin_successful` на хосте — тот же файл-маркер, что
+    сам sudo создаёт после первого использования.
+
+    Регресс-контракт: warning не должен попадать в снапшот оболочки, а
+    stderr КОМАНД ОПЕРАТОРА (не самого bash) обязан работать как раньше —
+    иначе оператор перестал бы видеть ошибки компиляции/тестов."""
+    ok, why = sandbox.available()
+    if not ok:
+        print(f"SKIP no_job_control_warning: bwrap недоступен ({why})")
+        return
+    home = Path.home()
+    work = Path(tempfile.mkdtemp(prefix="sbx_jc_", dir=home / "claude-orchestrator-sessions"
+                                  if (home / "claude-orchestrator-sessions").exists() else None))
+    try:
+        wrapper = sandbox.build_argv(
+            home=home, chdir=work, rw_paths=[work], ro_paths=[home / ".local"],
+        )
+        sh = BashSession(work, wrapper)
+        try:
+            marker = "JCDONE"
+            sh.write(f"echo START{marker}; cat /no/such/file/xyz; echo {marker}\n")
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                if marker.encode() in sh.snapshot():
+                    break
+                time.sleep(0.3)
+            out = sh.snapshot().decode(errors="replace")
+            assert "не удаётся задать группу процесса терминала" not in out, (
+                f"job-control warning (STDERR bash) просочился в вывод оболочки:\n{out}")
+            assert "не может управлять заданиями" not in out, (
+                f"job-control warning (STDERR bash) просочился в вывод оболочки:\n{out}")
+            # Регресс-барьер: ошибка ЧУЖОЙ команды (не самого bash) обязана
+            # быть видна — иначе оператор потерял бы диагностику навсегда.
+            assert "No such file or directory" in out or "нет такого файла" in out.lower(), (
+                f"stderr команды оператора пропал вместе с warning'ом:\n{out}")
+            print("OK sandbox: job-control warning (STDERR) подавлен, "
+                  "stderr команд оператора цел")
+        finally:
+            sh.close()
+    finally:
+        import shutil
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def test_available_no_bwrap():
     """Нет bwrap в PATH → (False, «не установлен»), probe не запускается."""
     from unittest import mock
@@ -291,6 +349,7 @@ def main():
     test_prefix_allowlist()
     test_bwrap_claude_json_only_without_config_dir()
     test_real_isolation()
+    test_no_job_control_warning_stderr_still_works()
     test_available_no_bwrap()
     test_available_probe_raises()
     test_available_userns_rejected()
