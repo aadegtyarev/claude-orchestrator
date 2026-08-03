@@ -32,6 +32,41 @@ DEFAULT_HOST_COMMANDS = ("gh", "git", "ssh", "scp")
 # без хостового раунд-трипа. Список намеренно узкий: только то, что ходит в сеть.
 GIT_NETWORK = ("push", "fetch", "pull", "clone", "ls-remote", "send-pack", "fetch-pack")
 
+# SSH-хосты, чьи git-remote'ы (`git@host:...`) переписываем на HTTPS изнутри
+# песочницы (git `url.<base>.insteadOf`, GIT_CONFIG_COUNT/KEY/VALUE в env
+# процесса claude — см. WalletModule.session_env). ~/.ssh намеренно не
+# монтируется в bwrap (файловая изоляция, orchestrator/runners/sandbox.py) —
+# SSH-клоны/встроенные обновители плагинов (`claude plugin update`) внутри
+# сессии иначе не проходят handshake («remote end hung up unexpectedly»).
+# Переписывание на HTTPS уводит их на уже рабочий путь: gh credential helper
+# на ХОСТЕ авторизует HTTPS без единого ключа внутри песочницы — тот же канал,
+# что уже используют сетевые git-подкоманды через git_shim (см. GIT_NETWORK).
+# Список намеренно узкий (только github.com) — расширять по мере надобности,
+# не «все возможные git-хосты» по умолчанию.
+GIT_SSH_HTTPS_REWRITE = {"github.com": "https://github.com/"}
+
+
+def git_ssh_rewrite_env() -> dict[str, str]:
+    """env-довесок (GIT_CONFIG_COUNT/KEY_N/VALUE_N — git 2.31+), переписывающий
+    `git@<host>:...` в HTTPS для хостов из GIT_SSH_HTTPS_REWRITE.
+
+    Через env, а не файл `~/.gitconfig` в приватном $HOME сессии: не требует
+    отдельной атомарной/симлинк-безопасной записи (модель RW-видит session_home
+    и могла бы подложить туда свой конфиг/симлинк), не конфликтует с
+    GIT_CONFIG_NOSYSTEM/GIT_CONFIG_GLOBAL=/dev/null из vault.execute (тот
+    контур — ХОСТОВОЕ исполнение через wallet exec, другой процесс/env), и не
+    может быть случайно перезаписан моделью через собственный `git config`.
+    Применяется общей утилитой GIT_CONFIG_* — git видит их как обычную
+    конфигурацию, не более приоритетную и не менее переопределяемую, чем
+    ~/.gitconfig был бы."""
+    out: dict[str, str] = {}
+    for i, (host, https_base) in enumerate(GIT_SSH_HTTPS_REWRITE.items()):
+        out[f"GIT_CONFIG_KEY_{i}"] = f"url.{https_base}.insteadOf"
+        out[f"GIT_CONFIG_VALUE_{i}"] = f"git@{host}:"
+    if out:
+        out["GIT_CONFIG_COUNT"] = str(len(GIT_SSH_HTTPS_REWRITE))
+    return out
+
 
 def _prints_token(cmd: list[str]) -> bool:
     """gh-команда, печатающая сам токен: `gh auth token` или `… --show-token`.

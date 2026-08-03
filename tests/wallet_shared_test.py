@@ -116,6 +116,14 @@ async def test_wallet_shared():
     assert "Y" not in env                                    # other: сессия не подходит
     print("OK session_env: shared→значение, inject→маркер, host/чужая сессия→нет")
 
+    # SSH→HTTPS переписывание git-remote: безусловный довесок (не из secrets.toml),
+    # доезжает до env сессии, где кошелёк применяется (~/.ssh не смонтирован
+    # в bwrap — иначе SSH-клон/`claude plugin update` внутри падает).
+    assert env["GIT_CONFIG_KEY_0"] == "url.https://github.com/.insteadOf", env
+    assert env["GIT_CONFIG_VALUE_0"] == "git@github.com:", env
+    assert int(env["GIT_CONFIG_COUNT"]) >= 1, env
+    print("OK session_env: GIT_CONFIG_* переписывает git@github.com: → HTTPS")
+
     # redact_output: значения (shared/inject) вымарываются из чат-текста.
     st4 = _store(
         '[secrets.a]\nshared=true\nvalue="SHARED-VAL-123"\nsessions=["*"]\n\n'

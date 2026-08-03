@@ -59,6 +59,7 @@ from vault.secret import (
     Secret,  # noqa: F401 — ре-экспорт для тестов
     _always_denied,  # noqa: F401 — ре-экспорт для тестов (движок решения — vault.verdict)
     _prints_token,  # noqa: F401 — ре-экспорт для тестов (исполнение — vault.daemon)
+    git_ssh_rewrite_env,
     marker,
 )
 # Генератор обёрток общий с CLI claude-box (§5.2): один git-шим на обоих
@@ -346,7 +347,9 @@ class WalletModule:
             значение на хосте, в песочницу значение не попадает;
           * host-passthrough (нет env) → ничего.
         Плюс маркер пути к файлу `<<wallet:имя:file>>` в `$ENV_FILE` (ssh-ключ,
-        сертификат) — для inject-секретов."""
+        сертификат) — для inject-секретов. Плюс безусловный GIT_CONFIG_*
+        довесок (git_ssh_rewrite_env): переписывает `git@github.com:` в HTTPS,
+        т.к. ~/.ssh недоступен под bwrap (см. _env_for)."""
         out = self._env_for(session.name) if self.applies_to(session) else {}
         # Запоминаем ИМЕНА, доехавшие в процесс: env задаётся один раз при старте,
         # и по ним сторож policy поймёт, что живая сессия отстала (см. _watch_policy).
@@ -381,6 +384,12 @@ class WalletModule:
         # (_start_session_proxies) ДО этого вызова. Пусто для сессий без
         # прокси-секретов — обычная сессия ничего нового не получает.
         out.update(self._proxy_env.get(session_name, {}))
+        # SSH→HTTPS переписывание git-remote (github.com и т.п.): ~/.ssh не
+        # монтируется в bwrap, поэтому SSH-клоны/встроенные обновители плагинов
+        # (`claude plugin update`) внутри песочницы не проходят handshake.
+        # Статический список (не из secrets.toml) — безусловно для всех
+        # сессий, где применяется кошелёк (см. GIT_SSH_HTTPS_REWRITE).
+        out.update(git_ssh_rewrite_env())
         return out
 
     async def _watch_policy(self) -> None:

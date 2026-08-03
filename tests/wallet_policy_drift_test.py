@@ -102,9 +102,12 @@ async def test_policy_change_notifies_once():
     sess = _session("ikar")
     mod.core.manager.list_all = lambda: [sess]
 
-    # старт сессии: env зафиксирован (одна переменная)
+    # старт сессии: env зафиксирован (секрет + безусловный GIT_CONFIG_* довесок
+    # SSH→HTTPS переписывания git — он одинаков на каждом session_env() и сам
+    # дрифта не создаёт, но входит в множество имён, которое сравнивает сторож).
     env = mod.session_env(sess)
-    assert set(env) == {"IKAR_LLM_API_KEY"}, env
+    assert set(env) == {"IKAR_LLM_API_KEY", "GIT_CONFIG_COUNT",
+                        "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"}, env
     assert env["IKAR_LLM_API_KEY"] == _VALUE
 
     # policy не менялась → сторож молчит
