@@ -17,9 +17,11 @@ from vault.policy import PolicyEditor, PolicyError  # noqa: E402
 from vault.redact import REDACTED, _redact, _redact_text  # noqa: E402
 from vault.secret import (  # noqa: E402
     DEFAULT_HOST_COMMANDS,
+    GIT_SSH_HTTPS_REWRITE,
     Secret,
     _always_denied,
     _prints_token,
+    git_ssh_rewrite_env,
     marker,
 )
 from vault.store import DEFAULT_SECRETS_TOML, SecretStore  # noqa: E402
@@ -121,6 +123,35 @@ def test_marker():
     print("OK marker: inline и :file")
 
 
+def test_git_ssh_rewrite_env():
+    """SSH→HTTPS переписывание git-remote (~/.ssh не смонтирован в bwrap,
+    'claude plugin update' и обычный SSH-clone иначе не проходят handshake —
+    'remote end hung up unexpectedly'). Проверяем и форму env-переменных
+    (GIT_CONFIG_COUNT/KEY_N/VALUE_N — то, что реально читает git), и что они
+    ДЕЙСТВИТЕЛЬНО заставляют настоящий `git config` увидеть insteadOf."""
+    out = git_ssh_rewrite_env()
+    n = len(GIT_SSH_HTTPS_REWRITE)
+    assert out["GIT_CONFIG_COUNT"] == str(n) and n > 0, out
+    for i, (host, https_base) in enumerate(GIT_SSH_HTTPS_REWRITE.items()):
+        assert out[f"GIT_CONFIG_KEY_{i}"] == f"url.{https_base}.insteadOf", out
+        assert out[f"GIT_CONFIG_VALUE_{i}"] == f"git@{host}:", out
+    # github.com — обязательная запись (главный сценарий жалобы оператора).
+    assert "github.com" in GIT_SSH_HTTPS_REWRITE
+    print("OK git_ssh_rewrite_env: форма GIT_CONFIG_COUNT/KEY/VALUE верна")
+
+    # Живая проверка: настоящий git действительно видит insteadOf через ЭТИ
+    # env-переменные — не полагаемся только на то, что мы верим в формат.
+    env = {**os.environ, **out}
+    r = subprocess.run(
+        ["git", "config", "--get", "url.https://github.com/.insteadOf"],
+        env=env, capture_output=True, text=True, timeout=5,
+    )
+    assert r.returncode == 0 and r.stdout.strip() == "git@github.com:", (
+        f"git не видит insteadOf через GIT_CONFIG_*: rc={r.returncode} "
+        f"stdout={r.stdout!r} stderr={r.stderr!r}")
+    print("OK git_ssh_rewrite_env: настоящий `git config` видит insteadOf")
+
+
 def test_store_load_and_perms():
     tmp = Path(tempfile.mkdtemp(prefix="vault_domain_"))
     f = tmp / "secrets.toml"
@@ -185,6 +216,7 @@ def main():
     test_guard()
     test_redact()
     test_marker()
+    test_git_ssh_rewrite_env()
     test_store_load_and_perms()
     test_store_default_toml_parses()
     test_policy_view_and_edit()

@@ -250,6 +250,45 @@ def test_no_job_control_warning_stderr_still_works():
         shutil.rmtree(work, ignore_errors=True)
 
 
+def test_git_ssh_rewrite_inside_bwrap():
+    """SSH→HTTPS переписывание git-remote реально видно ВНУТРИ bwrap-песочницы,
+    когда её процессу передан GIT_CONFIG_* довесок (см.
+    vault.secret.git_ssh_rewrite_env / WalletModule.session_env) — не просто на
+    хосте (уже проверено в vault_domain_test.py), а именно там, где ~/.ssh
+    недоступен и где переписывание реально нужно.
+
+    Без сетевого клона (дорого/недетерминированно для CI): `git config --get`
+    внутри песочницы — то, что git реально смотрит перед тем как открыть
+    SSH-соединение; этого достаточно, чтобы поймать регресс в передаче env
+    через bwrap (например, если --unshare-* или чистка env когда-нибудь
+    начнёт резать переменные с префиксом GIT_)."""
+    ok, why = sandbox.available()
+    if not ok:
+        print(f"SKIP git_ssh_rewrite_inside_bwrap: bwrap недоступен ({why})")
+        return
+    from vault.secret import git_ssh_rewrite_env
+    home = Path.home()
+    work = Path(tempfile.mkdtemp(prefix="sbx_git_", dir=home / "claude-orchestrator-sessions"
+                                  if (home / "claude-orchestrator-sessions").exists() else None))
+    try:
+        wrapper = sandbox.build_argv(
+            home=home, chdir=work, rw_paths=[work], ro_paths=[home / ".local"],
+        )
+        env = os.environ.copy()
+        env.update(git_ssh_rewrite_env())
+        r = subprocess.run(
+            [*wrapper, "git", "config", "--get", "url.https://github.com/.insteadOf"],
+            env=env, capture_output=True, text=True, timeout=15,
+        )
+        assert r.returncode == 0 and r.stdout.strip() == "git@github.com:", (
+            f"git внутри bwrap не видит insteadOf: rc={r.returncode} "
+            f"stdout={r.stdout!r} stderr={r.stderr!r}")
+        print("OK sandbox: GIT_CONFIG_* доезжает до git внутри bwrap-песочницы")
+    finally:
+        import shutil
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def test_available_no_bwrap():
     """Нет bwrap в PATH → (False, «не установлен»), probe не запускается."""
     from unittest import mock
@@ -350,6 +389,7 @@ def main():
     test_bwrap_claude_json_only_without_config_dir()
     test_real_isolation()
     test_no_job_control_warning_stderr_still_works()
+    test_git_ssh_rewrite_inside_bwrap()
     test_available_no_bwrap()
     test_available_probe_raises()
     test_available_userns_rejected()
