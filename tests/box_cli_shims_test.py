@@ -134,11 +134,23 @@ def test_git_shim_behaviour():
         (["status"], "REALGIT status"),
         (["commit", "-m", "x"], "REALGIT commit -m x"),
         ([], "REALGIT "),
+        # Регресс (живой инцидент): `git -C <dir> push` — модель зовёт так,
+        # чтобы не полагаться на текущий cwd оболочки. `-C`/`-c` — глобальные
+        # флаги git с ОТДЕЛЬНЫМ аргументом-значением перед подкомандой; шим
+        # раньше матчил только $1 буквально, `-C` никогда не совпадал с
+        # push/fetch/…, и вызов молча уходил в локальный git внутри
+        # песочницы — без кредов хоста (fatal: could not read Username).
+        (["-C", "/wt", "push", "origin", "main"], "WALLET exec git -C /wt push origin main"),
+        (["-C", "/wt", "status"], "REALGIT -C /wt status"),
+        (["-c", "http.proxy=x", "fetch"], "WALLET exec git -c http.proxy=x fetch"),
+        (["--git-dir=/x", "push"], "WALLET exec git --git-dir=/x push"),
+        (["-C", "/wt", "-c", "a=b", "push"], "WALLET exec git -C /wt -c a=b push"),
     ):
         out = subprocess.run([str(shim), *args], env=env, capture_output=True,
                              text=True, check=True).stdout.strip()
         assert out == expect.strip(), f"{args}: {out!r} != {expect!r}"
-    print("OK git-шим: сетевые подкоманды → wallet exec, локальные → настоящий git")
+    print("OK git-шим: сетевые подкоманды → wallet exec (в т.ч. после -C/-c/--git-dir), "
+          "локальные → настоящий git")
 
 
 def test_write_shims_permissions():
