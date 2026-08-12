@@ -119,6 +119,25 @@ def test_bwrap_settings_have_no_env_block(tmp_path=None):
     print("OK под bwrap env-блок не добавляется (поведение не меняется)")
 
 
+def test_interactive_tools_denied(tmp_path=None):
+    """Режим плана и вопрос-меню запрещены механически, а не только промптом.
+
+    Инцидент ikar 2026-08-12: модель вошла в план-режим (промпт канала это
+    запрещал словами) и позвала ExitPlanMode. Диалог одобрения плана в
+    headless-PTY не рисуется и в релей разрешений не уходит — PreToolUse
+    прилетел, PostToolUse нет, ход завис навсегда, очередь сообщений
+    оператора перестала разбираться. Запрет в deny превращает это в
+    «tool not allowed» и продолжение текстом.
+    """
+    tmp = Path(tmp_path or "/tmp/orch-guest-env-test-deny")
+    (tmp / ".claude").mkdir(parents=True, exist_ok=True)
+    mgr = _manager("bwrap", {})
+    deny = _write_settings(mgr, tmp)["permissions"]["deny"]
+    for tool in ("AskUserQuestion", "EnterPlanMode", "ExitPlanMode"):
+        assert tool in deny, (tool, deny)
+    print("OK AskUserQuestion и режим плана запрещены в настройках сессии")
+
+
 def test_host_ip_override_wins_over_autodetect():
     """`AGENT_VM_HOST_IP` — ручной путь, когда авто-выбор промахнулся.
 
@@ -153,6 +172,7 @@ def main():
     test_own_proxy_requires_token()
     test_agentvm_puts_claude_env_into_settings()
     test_bwrap_settings_have_no_env_block()
+    test_interactive_tools_denied()
     test_host_ip_override_wins_over_autodetect()
     print("ALL GUEST-ENV OK")
 
