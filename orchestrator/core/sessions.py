@@ -658,8 +658,18 @@ class SessionManager:
         settings_dir.mkdir(exist_ok=True)
         if session.linked_path is None:
             settings["enableAllProjectMcpServers"] = True
-        deny = ["AskUserQuestion"]  # интерактивный вопрос-меню виснет без TUI;
-        # Claude получит «tool not allowed» и переспросит через reply_to_user.
+        # Интерактивные тулы, которые без TUI виснут молча. Claude получает
+        # «tool not allowed» и продолжает текстом через reply_to_user.
+        #   • AskUserQuestion — вопрос-меню, ответить некому;
+        #   • EnterPlanMode/ExitPlanMode — режим плана. ExitPlanMode ждёт
+        #     одобрения плана, а его диалог в headless-PTY НЕ рисуется и в
+        #     релей разрешений НЕ уходит: ход зависает навсегда, очередь
+        #     сообщений оператора не разбирается (инцидент ikar 2026-08-12:
+        #     PreToolUse ExitPlanMode есть, PostToolUse нет, дальше тишина).
+        #     Промпт канала об этом просил и раньше — просьбы недостаточно,
+        #     нужен механический запрет. Сам план оператору всё равно не
+        #     показывается: канал отдаёт только reply_to_user.
+        deny = ["AskUserQuestion", "EnterPlanMode", "ExitPlanMode"]
 
         # Анти-утечка секретов имеет смысл ТОЛЬКО в связке кошелёк + песочница —
         # это единая схема, звенья не работают порознь:
