@@ -748,7 +748,7 @@ async def main_async(argv: Sequence[str]) -> int:
     profile_rw: list[Path] = []
     profile_config_dir: Path | None = None
     if opts.profile is not None:
-        from .profiles import ProfileError, profile_env
+        from .profiles import ProfileError, profile_env, real_config_dir
         if engine == ENGINE_VM:
             # Под VM профиль выбирает УЧЁТКУ (agent-vm сеет креды из $HOME своего
             # процесса, F4), а не изолирует ФС — изоляция там своя, у самой VM.
@@ -774,7 +774,14 @@ async def main_async(argv: Sequence[str]) -> int:
         # Под VM каталог профиля НЕ биндим и config-dir раннеру не отдаём:
         # песочницы bwrap здесь нет, а agent-vm читает профиль на ХОСТЕ сам.
         if engine != ENGINE_VM:
-            profile_config_dir = pdir / ".claude"
+            # `<profile>/.claude` может быть симлинком на учётку оператора
+            # (профиль ВЫБИРАЕТ учётку, а не копирует её). Раннеру отдаём РАСКРЫТЫЙ
+            # путь (claude_config_dir): смонтировать В назначение-симлинк bwrap не
+            # умеет, а бинд цели при env на симлинк дал бы внутри песочницы битую
+            # переменную. Сам бинд учётки раннер сделает по claude_config_dir ниже
+            # (BwrapRunner.wrap добавляет config_dir в RW), поэтому в profile_rw его
+            # НЕ кладём — там только каталог профиля ($HOME). Без симлинка путь прежний.
+            profile_config_dir = real_config_dir(opts.profile)
             profile_rw = [pdir]
 
     # Раннер и preflight строятся НИЖЕ, внутри try/finally: под --wallet --vm
@@ -795,8 +802,9 @@ async def main_async(argv: Sequence[str]) -> int:
     # разрешён/нечего заворачивать/сбой окружения) — честное сообщение + код из
     # WalletError, без трейсбека. Teardown — в finally ниже.
     intercept = None
-    # extra_rw начинается с каталога профиля (RW-бинд src==dst → HOME/CONFIG_DIR
-    # валидны изнутри песочницы); wallet при наличии докидывает свой bundle-каталог.
+    # extra_rw начинается с каталога профиля (RW-бинд src==dst → $HOME валиден
+    # изнутри песочницы); учётку (CLAUDE_CONFIG_DIR) раннер биндит сам по
+    # claude_config_dir. Wallet при наличии докидывает свой bundle-каталог.
     extra_rw: list[Path] = list(profile_rw)
     # Переопределение раннера под --wallet --vm: egress-поля (прокси-секрет) либо
     # inject-env (inject-секрет). None вне этого случая — раннер строится из

@@ -1544,11 +1544,18 @@ class SessionManager:
 
         Каталог профиля создаётся здесь же (ensure_profile идемпотентен): он
         нужен существующим и раннеру (bind), и claude.
+
+        Путь отдаём РАСКРЫТЫЙ (real_config_dir): `<profile>/.claude` разрешено
+        делать симлинком на учётку оператора — профиль тогда ВЫБИРАЕТ учётку, не
+        копируя её. bwrap не умеет монтировать в назначение-симлинк, поэтому и
+        env, и bind обязаны получить цель её собственным путём. Для профиля без
+        симлинка это тождество — прежнее поведение.
         """
         name = self.profile_of(session)
         if name is None:
             return self.config.claude_config_dir
-        return profiles.ensure_profile(name) / ".claude"
+        profiles.ensure_profile(name)
+        return profiles.real_config_dir(name)
 
     def runner_for(self, session: Session | None) -> runner_mod.Runner:
         """Раннер под движок сессии. Кэш по имени движка: раннеры без

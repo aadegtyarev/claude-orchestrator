@@ -148,9 +148,17 @@ def ensure_profile(name: str) -> Path:
         # подменить каталог profiles целиком).
         claude = path / ".claude"
         claude.mkdir(mode=0o700, exist_ok=True)
-        for p in (root, path, claude):
+        for p in (root, path):
             try:
                 p.chmod(0o700)
+            except OSError:
+                pass
+        # `.claude` разрешено быть симлинком на учётку оператора (профиль ВЫБИРАЕТ
+        # учётку, не копируя её). chmod идёт ПО симлинку и молча поменял бы права
+        # ЦЕЛИ (чужого каталога) — не наш, чтобы трогать. Поэтому его не chmod'им.
+        if not claude.is_symlink():
+            try:
+                claude.chmod(0o700)
             except OSError:
                 pass
     return path
@@ -159,6 +167,35 @@ def ensure_profile(name: str) -> Path:
 def config_dir(name: str) -> Path:
     """CLAUDE_CONFIG_DIR профиля: <profile>/.claude (каталог может не существовать)."""
     return profile_dir(name) / ".claude"
+
+
+def real_config_dir(name: str) -> Path:
+    """Каталог учётки профиля С РАСКРЫТЫМИ симлинками — ЕДИНСТВЕННЫЙ путь,
+    который уезжает и в CLAUDE_CONFIG_DIR, и в bind песочницы.
+
+    `<profile>/.claude` разрешено делать симлинком на существующую учётку
+    оператора (`profiles/work/.claude -> ~/.claude`): так профиль ВЫБИРАЕТ
+    учётку, не копируя её гигабайты и не заводя вторую копию токенов. Сам
+    ensure_profile такой симлинк уважает (каталог создаётся, только если его нет).
+
+    Почему именно раскрытый путь. bwrap не умеет монтировать В
+    назначение-симлинк («Unable to mount source on destination»), а держать env
+    и bind на РАЗНЫХ путях (симлинк наружу, цель внутрь) нельзя: тогда внутри
+    песочницы CLAUDE_CONFIG_DIR указывал бы на путь, которого там нет, — claude
+    молча завёл бы пустую учётку. Один раскрытый путь снимает оба случая сразу,
+    а для профиля без симлинка resolve() — тождество, поведение прежнее.
+
+    Граница доверия. Цель симлинка НЕ валидируется — профиль доверяет оператору,
+    что `.claude -> <учётка>` указывает на настоящую учётку. В standalone
+    `claude-box --profile` каталог профиля RW-биндится как $HOME, поэтому МОДЕЛЬ
+    внутри может переписать симлинк и на следующий запуск перенаправить бинд на
+    произвольный каталог хоста (`rm .claude && ln -s ~/.ssh .claude`). Это
+    осознанный риск изолированного лончера: не запускай `--profile` с
+    симлинк-учёткой на модели, которой не доверяешь запись в её собственный HOME.
+    В оркестраторе такого нет — каталог профиля в песочницу не биндится, и модель
+    переписать симлинк не может.
+    """
+    return config_dir(name).resolve()
 
 
 def list_profiles() -> list[str]:
@@ -190,7 +227,8 @@ def remove_profile(name: str) -> Path:
 def profile_env(name: str, *, engine: str) -> tuple[dict[str, str], Path]:
     """Создать профиль и вернуть (env-довесок, каталог профиля) для лончера.
 
-    env: всегда CLAUDE_CONFIG_DIR=<profile>/.claude; под bwrap ещё HOME=<profile>
+    env: всегда CLAUDE_CONFIG_DIR=<раскрытый real_config_dir профиля> (под
+    симлинк-учёткой — путь цели, не сам линк); под bwrap ещё HOME=<profile>
     (изоляция домашки). Под off HOME не трогаем — изоляции $HOME нет, только
     редирект CONFIG_DIR (лончер честно предупреждает про это в stderr).
 
@@ -208,7 +246,8 @@ def profile_env(name: str, *, engine: str) -> tuple[dict[str, str], Path]:
     переезд инфраструктуры.
 
     Каталог профиля возвращается, чтобы лончер RW-биндил его в песочницу тем же
-    путём (src==dst) — тогда HOME/CONFIG_DIR валидны изнутри.
+    путём (src==dst) — тогда HOME/CONFIG_DIR валидны изнутри. Учётку лончер
+    биндит отдельно, по real_config_dir: она может быть симлинком наружу.
     """
     path = ensure_profile(name)
     if engine == "agent-vm":
@@ -219,7 +258,10 @@ def profile_env(name: str, *, engine: str) -> tuple[dict[str, str], Path]:
         env["XDG_STATE_HOME"] = os.environ.get(
             "XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
         return env, path
-    env = {"CLAUDE_CONFIG_DIR": str(path / ".claude")}
+    # Раскрытый путь учётки (real_config_dir): под симлинк-профилем env и bind
+    # обязаны совпадать, иначе внутри песочницы переменная указывала бы в
+    # несуществующий путь. Без симлинка это тот же <profile>/.claude.
+    env = {"CLAUDE_CONFIG_DIR": str(real_config_dir(name))}
     if engine == "bwrap":
         env["HOME"] = str(path)
     return env, path
