@@ -31,6 +31,8 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• <code>/log</code> — скачать полный лог сессии (для отладки)\n"
             "• <code>/usage</code> — расходы и лимиты плана\n"
             "• <code>/model</code> — модель: fable/opus/sonnet/haiku или точное имя\n"
+            "• <code>/profile &lt;имя&gt;</code> — сменить учётку сессии "
+            "(<code>/profile \"\"</code> — без профиля)\n"
             "• <code>/compact</code> — сжать контекст\n"
             "• <code>/clear</code> — очистить контекст (топик остаётся)\n"
             "• <code>/close_session</code> — остановить; продолжение — сообщением\n"
@@ -185,6 +187,16 @@ MESSAGES: dict[str, dict[str, str]] = {
         "model_fail": "❌ Не удалось переключить на {model}: {error}\nМодель осталась прежней.",
         "model_done": "🔀 Модель: {model}. Сессия готова.",
         "model_ctx_lost": "\n⚠️ Прежний контекст восстановить не удалось.",
+        "profile_none": "общая учётка оркестратора",
+        "profile_prompt": (
+            "👤 Текущий профиль: {profile}\n"
+            "Доступные профили: {profiles}\n"
+            "Смени учётку: /profile &lt;имя&gt; (или /profile \"\" — без профиля)."
+        ),
+        "profile_switching": "🔀 Переключаю «{name}» на {profile} (перезапуск, новый диалог)…",
+        "profile_fail": "❌ Не удалось переключить на {profile}: {error}\nПрофиль остался прежним.",
+        "profile_done": "🔀 Профиль: {profile}. Сессия готова.",
+        "profile_ctx_lost": "\n⚠️ Прежний диалог не переносится — учётка сменилась.",
         "skills_none": "Скиллы не найдены.",
         "skills_header": "🧩 Скиллы ({n}). Вызываются просто текстом задачи:",
         "compact_sent": "🗜 Отправил /compact — контекст сессии будет сжат.",
@@ -347,6 +359,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "menu_perms": "Авто-одобрение разрешений (на сессию)",
         "menu_usage": "Расходы и лимиты плана",
         "menu_model": "Модель сессии (fable/opus/sonnet/haiku)",
+        "menu_profile": "Профиль (учётка) сессии",
         "menu_skills": "Список скиллов",
         "menu_compact": "Сжать контекст сессии",
         "menu_clear": "Очистить контекст сессии",
@@ -412,6 +425,8 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• <code>/log</code> — download the full session log (for debugging)\n"
             "• <code>/usage</code> — cost and plan limits\n"
             "• <code>/model</code> — model: fable/opus/sonnet/haiku or an exact name\n"
+            "• <code>/profile &lt;name&gt;</code> — switch the session's account "
+            "(<code>/profile \"\"</code> — no profile)\n"
             "• <code>/compact</code> — compact the context\n"
             "• <code>/clear</code> — fresh context (topic stays)\n"
             "• <code>/close_session</code> — stop; continue by sending a message\n"
@@ -566,6 +581,16 @@ MESSAGES: dict[str, dict[str, str]] = {
         "model_fail": "❌ Failed to switch to {model}: {error}\nModel unchanged.",
         "model_done": "🔀 Model: {model}. Session ready.",
         "model_ctx_lost": "\n⚠️ Previous context could not be restored.",
+        "profile_none": "the orchestrator's shared account",
+        "profile_prompt": (
+            "👤 Current profile: {profile}\n"
+            "Available profiles: {profiles}\n"
+            "Switch account: /profile &lt;name&gt; (or /profile \"\" — no profile)."
+        ),
+        "profile_switching": "🔀 Switching “{name}” to {profile} (restart, new conversation)…",
+        "profile_fail": "❌ Failed to switch to {profile}: {error}\nProfile unchanged.",
+        "profile_done": "🔀 Profile: {profile}. Session ready.",
+        "profile_ctx_lost": "\n⚠️ The previous conversation is not carried over — the account changed.",
         "skills_none": "No skills found.",
         "skills_header": "🧩 Skills ({n}). Invoke them with a plain task message:",
         "compact_sent": "🗜 Sent /compact — the session context will be compacted.",
@@ -721,6 +746,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "menu_perms": "Auto-approve permissions (per session)",
         "menu_usage": "Cost and plan limits",
         "menu_model": "Session model (fable/opus/sonnet/haiku)",
+        "menu_profile": "Session profile (account)",
         "menu_skills": "List skills",
         "menu_compact": "Compact session context",
         "menu_clear": "Clear session context",

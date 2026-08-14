@@ -100,6 +100,7 @@ class TelegramAdapter:
             BotCommand(command="perms", description=self.t("menu_perms")),
             BotCommand(command="usage", description=self.t("menu_usage")),
             BotCommand(command="model", description=self.t("menu_model")),
+            BotCommand(command="profile", description=self.t("menu_profile")),
             BotCommand(command="skills", description=self.t("menu_skills")),
             BotCommand(command="compact", description=self.t("menu_compact")),
             BotCommand(command="clear", description=self.t("menu_clear")),
@@ -452,6 +453,7 @@ class TelegramAdapter:
         dp.message.register(self.cmd_log, Command("log"))
         dp.message.register(self.cmd_usage, Command("usage", "cost"))
         dp.message.register(self.cmd_model, Command("model"))
+        dp.message.register(self.cmd_profile, Command("profile"))
         dp.message.register(self.cmd_skills, Command("skills"))
         dp.message.register(self.cmd_chat_id, Command("chat_id"))
         dp.message.register(self.cmd_bash, Command("bash"))
@@ -1155,6 +1157,48 @@ class TelegramAdapter:
             return
         note = "" if resumed else self.t("model_ctx_lost")
         await status.edit_text(self.t("model_done", model=model) + note)
+
+    async def cmd_profile(self, message: Message, command: CommandObject) -> None:
+        """Профиль сессии: /profile — показать текущий, /profile <имя> — сменить."""
+        if not self._accept(message):
+            return
+        session = self._topic_session(message)
+        if session is None:
+            await message.reply(self.t("only_topic"))
+            return
+        raw = command.args or ""
+        if not raw.strip():
+            # /profile без аргумента — показать текущую учётку и список профилей.
+            names = self.core.list_profiles()
+            profiles_str = ", ".join(names) if names else "—"
+            await message.reply(
+                self.t(
+                    "profile_prompt",
+                    profile=self.core.profile_display(session),
+                    profiles=profiles_str,
+                )
+            )
+            return
+        arg = raw.strip()
+        # Снять кавычки: /profile "" — явный отказ от профиля (как /new --profile "").
+        if len(arg) >= 2 and arg[0] in "\"'" and arg[-1] == arg[0]:
+            arg = arg[1:-1].strip()
+        await self._switch_profile(session, arg, message)
+
+    async def _switch_profile(self, session: Session, profile: str, message: Message) -> None:
+        # message.answer() сам наследует message_thread_id исходного сообщения —
+        # явно передавать нельзя (иначе TypeError: multiple values).
+        label = profile or self.t("profile_none")
+        status = await message.answer(
+            self.t("profile_switching", name=session.title, profile=label)
+        )
+        try:
+            resumed = await self.core.switch_profile(session, profile)
+        except UserError as e:
+            await status.edit_text(str(e))
+            return
+        note = "" if resumed else self.t("profile_ctx_lost")
+        await status.edit_text(self.t("profile_done", profile=label) + note)
 
     async def on_session_button(self, callback: CallbackQuery) -> None:
         """Кнопки в /list: статистика и остановка."""

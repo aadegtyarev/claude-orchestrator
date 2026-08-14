@@ -244,6 +244,7 @@ class WebAdapter:
         r.add_post("/api/sessions/{name}/interrupt", self.h_interrupt)
         r.add_post("/api/sessions/{name}/unblock", self.h_unblock)
         r.add_post("/api/sessions/{name}/model", self.h_model)
+        r.add_post("/api/sessions/{name}/profile", self.h_profile)
         r.add_get("/api/sessions/{name}/bubble", self.h_bubble)
         r.add_get("/api/sessions/{name}/stats", self.h_stats)
         r.add_get("/api/sessions/{name}/usage", self.h_usage)
@@ -503,6 +504,19 @@ class WebAdapter:
             return self._err("model required")
         try:
             resumed = await self.core.switch_model(session, model)
+        except UserError as e:
+            return self._err(str(e))
+        await self._sessions_changed()
+        return web.json_response({"resumed": resumed})
+
+    @with_session
+    async def h_profile(self, request: web.Request, session: Session) -> web.Response:
+        data = await self._json_body(request)
+        if "profile" not in data:
+            return self._err("profile required")
+        profile = str(data.get("profile", "")).strip()
+        try:
+            resumed = await self.core.switch_profile(session, profile)
         except UserError as e:
             return self._err(str(e))
         await self._sessions_changed()

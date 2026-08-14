@@ -532,6 +532,27 @@ class OrchestratorCore:
         await self._notify_state_changed(session)
         return resumed
 
+    async def switch_profile(self, session: Session, profile: str) -> bool:
+        """Сменить профиль (учётку): файлы сессии остаются, меняется учётка.
+
+        Валидацию/нормализацию имени делаем через resolve_profile — те же
+        правила, что у `/new --profile` (traversal, agent-vm, явный отказ "").
+        Плохое имя всплывает точной UserError (profile_bad/profile_vm), а не
+        общим profile_fail.
+        """
+        normalized = self.resolve_profile(
+            profile, self.manager.engine_of(session))
+        label = normalized or self.t("profile_none")
+        # Сессия продолжится (перезапуск Claude в той же папке) — bash не трогаем.
+        await self._teardown_runtime(session, close_bash=False)
+        try:
+            resumed = await self.manager.set_profile(session, normalized)
+        except Exception as e:
+            logger.exception("Сессия %s: ошибка смены профиля", session.name)
+            raise UserError(self.t("profile_fail", profile=label, error=e)) from e
+        await self._notify_state_changed(session)
+        return resumed
+
     def _systemd_unit(self) -> str:
         """Юнит текущего процесса — из cgroup (надёжно для systemd-сервиса);
         override через ORCH_SYSTEMD_UNIT, фолбэк — стандартное имя."""
@@ -665,6 +686,15 @@ class OrchestratorCore:
         if profile == self.config.claude_profile or profile is None:
             return ""
         return self.t("profile_mark", profile=profile)
+
+    def profile_display(self, session: Session) -> str:
+        """Учётка сессии для показа: имя профиля или «общая учётка оркестратора»."""
+        profile = self.manager.profile_of(session)
+        return profile or self.t("profile_none")
+
+    def list_profiles(self) -> list[str]:
+        """Имена существующих профилей (общие с claude-box, отсортированы)."""
+        return profiles.list_profiles()
 
     def box_mark(self, session: Session) -> str:
         """Короткая пометка движка для списка сессий (пусто, если дефолтный)."""

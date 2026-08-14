@@ -1228,6 +1228,43 @@ class SessionManager:
             self.save_state()
             raise
 
+    async def set_profile(self, session: Session, profile: str) -> bool:
+        """Сменить профиль (учётку Claude Code): перезапуск с новым CLAUDE_CONFIG_DIR.
+
+        Файлы сессии НЕ трогаем: cwd (папка проекта) и приватный дом
+        (SESSIONS_DIR/.homes/<имя>) живут по имени сессии, а не по профилю —
+        меняется только учётка (токены/скиллы/транскрипты) и, как следствие,
+        её история. resume по старому UUID в новой учётке не найдёт транскрипт
+        → чистый старт с новым UUID (как /clear), но тот же cwd и тот же дом.
+
+        `profile` — уже валидированное имя или "" (явный отказ от профиля).
+        Возвращает True, если контекст удалось продолжить (на практике при
+        смене учётки — почти всегда False). При ошибке откатывает профиль.
+        """
+        if self.engine_of(session) == "agent-vm":
+            # Гость игнорирует хостовый CLAUDE_CONFIG_DIR: смена профиля была бы
+            # молчаливым no-op — честнее отказать, чем соврать про учётку.
+            raise SessionError("под agent-vm профиля нет — /profile недоступен.")
+        old_profile = session.profile
+        try:
+            async with session.ops:
+                session.profile = profile  # "" = явно без профиля (общая учётка)
+                if not session.running:
+                    return await self._resume_locked(session)
+                # Перезапуск живой сессии: слот её, придерживаем на паузу
+                # между stop и start. finally с самого резерва: упади
+                # _stop_process — слот утёк бы.
+                self._reserve_slot(session.name)
+                try:
+                    await self._stop_process(session, save=False)
+                    return await self._resume_locked(session)
+                finally:
+                    self._release_slot(session.name)
+        except Exception:
+            session.profile = old_profile
+            self.save_state()
+            raise
+
     async def shutdown(self) -> None:
         """Остановка launcher'а: убить процессы, записи сохранить."""
         for session in self.list_all():

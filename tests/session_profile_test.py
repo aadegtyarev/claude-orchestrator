@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from box import profiles  # noqa: E402
 from orchestrator.core.errors import UserError  # noqa: E402
-from orchestrator.core.sessions import Session, SessionManager  # noqa: E402
+from orchestrator.core.sessions import Session, SessionError, SessionManager  # noqa: E402
 
 
 def make_manager(claude_profile=None, claude_config_dir=None) -> SessionManager:
@@ -269,6 +270,89 @@ def test_profile_name_rules_match_claude_box():
     assert profiles.validate_name("work") == "work"
     with pytest.raises(profiles.ProfileError):
         profiles.validate_name("../escape")
+
+
+# ── /profile: смена учётки на живой сессии ─────────────────────────
+
+
+def make_lifecycle_manager(sandbox="bwrap") -> tuple[SessionManager, Session]:
+    """Менеджер с минимумом механики для set_profile (без реального процесса).
+
+    set_profile дёргает _reserve_slot/_release_slot (нужен self._starting),
+    _stop_process/_resume_locked (мокаются в тестах) и save_state (no-op).
+    """
+    mgr = SessionManager.__new__(SessionManager)
+    mgr.config = SimpleNamespace(
+        claude_profile=None,
+        claude_config_dir=Path("/tmp/.claude-bot"),
+        sandbox=sandbox,
+    )
+    mgr._starting = set()
+    mgr.save_state = lambda: None
+    session = Session(
+        name="s", port=0, session_dir=Path("/tmp/s"),
+        claude_session_id="uuid", profile="work",
+    )
+    return mgr, session
+
+
+def test_set_profile_rejects_under_vm():
+    """Под agent-vm профиля нет — честный отказ, сессия не тронута."""
+    mgr, session = make_lifecycle_manager(sandbox="agent-vm")
+    with pytest.raises(SessionError):
+        asyncio.run(mgr.set_profile(session, "other"))
+    assert session.profile == "work"
+
+
+def test_set_profile_switches_stopped_session_without_stop():
+    """Остановленная сессия: просто новый профиль + resume (без stop)."""
+    mgr, session = make_lifecycle_manager()
+    calls: list[str] = []
+
+    async def resume(s: Session) -> bool:
+        calls.append("resume")
+        return False
+
+    mgr._resume_locked = resume
+    assert asyncio.run(mgr.set_profile(session, "other")) is False
+    assert session.profile == "other"
+    assert calls == ["resume"]
+
+
+def test_set_profile_stops_then_resumes_running_session():
+    """Живая сессия: stop → resume, слот придерживается и отпускается."""
+    mgr, session = make_lifecycle_manager()
+    session.process = SimpleNamespace(returncode=None)  # running
+    calls: list[str] = []
+
+    async def stop(s: Session, save: bool) -> None:
+        calls.append("stop")
+
+    async def resume(s: Session) -> bool:
+        calls.append("resume")
+        return False
+
+    mgr._stop_process = stop
+    mgr._resume_locked = resume
+    assert asyncio.run(mgr.set_profile(session, "other")) is False
+    assert session.profile == "other"
+    assert calls == ["stop", "resume"]
+    assert "s" not in mgr._starting  # слот отпущен
+
+
+def test_set_profile_rolls_back_on_error():
+    """Провал старта откатывает профиль и отпускает слот."""
+    mgr, session = make_lifecycle_manager()
+    session.process = SimpleNamespace(returncode=None)  # running
+
+    async def boom(s: Session, save: bool) -> None:
+        raise RuntimeError("no start")
+
+    mgr._stop_process = boom
+    with pytest.raises(RuntimeError):
+        asyncio.run(mgr.set_profile(session, "other"))
+    assert session.profile == "work"  # откат
+    assert "s" not in mgr._starting  # слот отпущен даже при ошибке
 
 
 if __name__ == "__main__":
