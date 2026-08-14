@@ -148,9 +148,17 @@ def ensure_profile(name: str) -> Path:
         # подменить каталог profiles целиком).
         claude = path / ".claude"
         claude.mkdir(mode=0o700, exist_ok=True)
-        for p in (root, path, claude):
+        for p in (root, path):
             try:
                 p.chmod(0o700)
+            except OSError:
+                pass
+        # `.claude` разрешено быть симлинком на учётку оператора (профиль ВЫБИРАЕТ
+        # учётку, не копируя её). chmod идёт ПО симлинку и молча поменял бы права
+        # ЦЕЛИ (чужого каталога) — не наш, чтобы трогать. Поэтому его не chmod'им.
+        if not claude.is_symlink():
+            try:
+                claude.chmod(0o700)
             except OSError:
                 pass
     return path
@@ -176,6 +184,16 @@ def real_config_dir(name: str) -> Path:
     песочницы CLAUDE_CONFIG_DIR указывал бы на путь, которого там нет, — claude
     молча завёл бы пустую учётку. Один раскрытый путь снимает оба случая сразу,
     а для профиля без симлинка resolve() — тождество, поведение прежнее.
+
+    Граница доверия. Цель симлинка НЕ валидируется — профиль доверяет оператору,
+    что `.claude -> <учётка>` указывает на настоящую учётку. В standalone
+    `claude-box --profile` каталог профиля RW-биндится как $HOME, поэтому МОДЕЛЬ
+    внутри может переписать симлинк и на следующий запуск перенаправить бинд на
+    произвольный каталог хоста (`rm .claude && ln -s ~/.ssh .claude`). Это
+    осознанный риск изолированного лончера: не запускай `--profile` с
+    симлинк-учёткой на модели, которой не доверяешь запись в её собственный HOME.
+    В оркестраторе такого нет — каталог профиля в песочницу не биндится, и модель
+    переписать симлинк не может.
     """
     return config_dir(name).resolve()
 
@@ -209,7 +227,8 @@ def remove_profile(name: str) -> Path:
 def profile_env(name: str, *, engine: str) -> tuple[dict[str, str], Path]:
     """Создать профиль и вернуть (env-довесок, каталог профиля) для лончера.
 
-    env: всегда CLAUDE_CONFIG_DIR=<profile>/.claude; под bwrap ещё HOME=<profile>
+    env: всегда CLAUDE_CONFIG_DIR=<раскрытый real_config_dir профиля> (под
+    симлинк-учёткой — путь цели, не сам линк); под bwrap ещё HOME=<profile>
     (изоляция домашки). Под off HOME не трогаем — изоляции $HOME нет, только
     редирект CONFIG_DIR (лончер честно предупреждает про это в stderr).
 

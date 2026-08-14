@@ -160,8 +160,9 @@ def test_symlinked_profile_binds_target_for_bwrap():
     """Регресс: `claude-box --profile` с симлинк-учёткой падал в bwrap
     («Can't bind mount … Unable to mount source on destination»), потому что
     биндился только каталог профиля — внутри песочницы симлинк указывал в
-    несуществующий путь. В argv обязаны быть ОБА RW-бинда: каталог профиля и
-    цель симлинка своим собственным путём."""
+    несуществующий путь. Раннер обязан биндить ЦЕЛЬ симлинка своим собственным
+    путём (через claude_config_dir), а НЕ сам линк; каталог профиля ($HOME) при
+    этом биндится отдельно через extra_rw."""
     with isolated_root() as root:
         account = root / "real-account"
         account.mkdir()
@@ -172,7 +173,7 @@ def test_symlinked_profile_binds_target_for_bwrap():
         real = profiles.real_config_dir("work")
         runner = cli.make_engine_runner(
             "bwrap", cli.repo_root(), claude_config_dir=real)
-        argv = cli.build_argv(runner, ["claude"], Path("/tmp"), extra_rw=[p, real])
+        argv = cli.build_argv(runner, ["claude"], Path("/tmp"), extra_rw=[p])
         joined = " ".join(argv)
         assert f"--bind-try {p} {p}" in joined, "каталог профиля должен быть RW"
         assert f"--bind-try {account} {account}" in joined, (
