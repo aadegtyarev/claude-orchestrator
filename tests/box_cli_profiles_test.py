@@ -124,6 +124,66 @@ def test_ensure_profile_symlink_rejected():
             raise AssertionError("симлинк-профиль должен быть отвергнут")
 
 
+def test_ensure_profile_keeps_symlinked_config_dir():
+    """`<profile>/.claude` — симлинк на существующую учётку: профиль ВЫБИРАЕТ её,
+    а не копирует. ensure_profile обязан такой симлинк уважать (не сносить и не
+    подменять каталогом), иначе повторный запуск увёл бы сессию в пустую учётку."""
+    with isolated_root() as root:
+        account = root / "real-account"
+        (account / "projects").mkdir(parents=True)
+        p = profiles.ensure_profile("work")
+        (p / ".claude").rmdir()
+        (p / ".claude").symlink_to(account)
+
+        assert profiles.ensure_profile("work") == p       # идемпотентно
+        assert (p / ".claude").is_symlink(), "симлинк учётки не должен подменяться"
+        assert (p / ".claude" / "projects").is_dir(), "учётка должна быть видна"
+
+
+def test_real_config_dir_resolves_symlink_for_bind():
+    """real_config_dir даёт РАЗРЕШЁННЫЙ путь учётки: bwrap не умеет монтировать в
+    назначение-симлинк, поэтому в bind должна ехать цель, а не сам линк."""
+    with isolated_root() as root:
+        account = root / "real-account"
+        account.mkdir()
+        p = profiles.ensure_profile("work")
+        # Без симлинка real_config_dir == config_dir (с точностью до resolve).
+        assert profiles.real_config_dir("work") == (p / ".claude").resolve()
+
+        (p / ".claude").rmdir()
+        (p / ".claude").symlink_to(account)
+        assert profiles.real_config_dir("work") == account.resolve()
+        assert profiles.config_dir("work") == p / ".claude"  # env-путь прежний
+
+
+def test_symlinked_profile_binds_target_for_bwrap():
+    """Регресс: `claude-box --profile` с симлинк-учёткой падал в bwrap
+    («Can't bind mount … Unable to mount source on destination»), потому что
+    биндился только каталог профиля — внутри песочницы симлинк указывал в
+    несуществующий путь. В argv обязаны быть ОБА RW-бинда: каталог профиля и
+    цель симлинка своим собственным путём."""
+    with isolated_root() as root:
+        account = root / "real-account"
+        account.mkdir()
+        p = profiles.ensure_profile("work")
+        (p / ".claude").rmdir()
+        (p / ".claude").symlink_to(account)
+
+        real = profiles.real_config_dir("work")
+        runner = cli.make_engine_runner(
+            "bwrap", cli.repo_root(), claude_config_dir=real)
+        argv = cli.build_argv(runner, ["claude"], Path("/tmp"), extra_rw=[p, real])
+        joined = " ".join(argv)
+        assert f"--bind-try {p} {p}" in joined, "каталог профиля должен быть RW"
+        assert f"--bind-try {account} {account}" in joined, (
+            "цель симлинка обязана биндиться своим путём — иначе bwrap падает")
+        # В назначение-симлинк не монтируем (именно это и роняло bwrap).
+        assert f"{p / '.claude'} {p / '.claude'}" not in joined
+        # env и bind — ОДИН путь: иначе внутри песочницы переменная битая.
+        env, _ = profiles.profile_env("work", engine="bwrap")
+        assert env["CLAUDE_CONFIG_DIR"] == str(real)
+
+
 # ── list / rm ────────────────────────────────────────────────────────────────
 def test_list_and_remove_profiles():
     with isolated_root():
@@ -361,6 +421,9 @@ def main() -> None:
     test_profile_dir_traversal_rejected_before_join()
     test_ensure_profile_idempotent_and_private()
     test_ensure_profile_symlink_rejected()
+    test_ensure_profile_keeps_symlinked_config_dir()
+    test_real_config_dir_resolves_symlink_for_bind()
+    test_symlinked_profile_binds_target_for_bwrap()
     test_list_and_remove_profiles()
     test_profile_env_bwrap_sets_home_and_config()
     test_profile_env_off_no_home()

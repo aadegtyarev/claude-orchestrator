@@ -774,8 +774,14 @@ async def main_async(argv: Sequence[str]) -> int:
         # Под VM каталог профиля НЕ биндим и config-dir раннеру не отдаём:
         # песочницы bwrap здесь нет, а agent-vm читает профиль на ХОСТЕ сам.
         if engine != ENGINE_VM:
-            profile_config_dir = pdir / ".claude"
-            profile_rw = [pdir]
+            # `<profile>/.claude` может быть симлинком на учётку оператора
+            # (профиль ВЫБИРАЕТ учётку, а не копирует её). Раннеру и env отдаём
+            # РАСКРЫТЫЙ путь: смонтировать В назначение-симлинк bwrap не умеет,
+            # а бинд цели при env на симлинк дал бы внутри песочницы битую
+            # переменную. Без симлинка это ровно прежний <profile>/.claude.
+            from .profiles import real_config_dir
+            profile_config_dir = real_config_dir(opts.profile)
+            profile_rw = [pdir, profile_config_dir]
 
     # Раннер и preflight строятся НИЖЕ, внутри try/finally: под --wallet --vm
     # раннеру нужны egress-поля, которые отдаёт уже поднятый кошелёк, а его

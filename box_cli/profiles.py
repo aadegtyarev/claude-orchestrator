@@ -22,6 +22,7 @@ from box.profiles import (  # noqa: F401
     profile_dir,
     profile_env,
     profiles_root,
+    real_config_dir,
     remove_profile,
     validate_name,
 )
@@ -35,6 +36,7 @@ __all__ = [
     "profile_dir",
     "profile_env",
     "profiles_root",
+    "real_config_dir",
     "remove_profile",
     "validate_name",
 ]
