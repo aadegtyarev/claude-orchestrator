@@ -795,6 +795,16 @@ async def main_async(argv: Sequence[str]) -> int:
     # Профиль-редирект поверх окружения (CLAUDE_CONFIG_DIR + HOME под bwrap);
     # wallet ниже добавляет свой HTTPS_PROXY/CA — не пересекается с этими ключами.
     env.update(profile_env_extra)
+    # Адрес API профиля (profile.toml → ANTHROPIC_BASE_URL) — ПОСЛЕ наследования
+    # окружения оператора: у профиля своя учётка, и эндпоинт у неё свой (пустой
+    # base_url снимает унаследованный прокси). Подробности — box/profiles.py.
+    if opts.profile is not None:
+        from .profiles import ProfileError as _ProfileError, apply_settings
+        try:
+            apply_settings(env, opts.profile)
+        except _ProfileError as e:
+            sys.stderr.write(f"claude-box: --profile: {e}\n")
+            return e.code
 
     # Кошелёк (--wallet): поднять ДО песочницы прокси-перехват (прокси-секрет) либо
     # демон+шимы (host/inject-секрет) и получить env-довесок (HTTPS_PROXY+CA либо
@@ -994,15 +1004,33 @@ def cmd_init(args: Sequence[str]) -> int:
     return 0
 
 
+def _profile_line(name: str, load_settings) -> str:
+    """Строка профиля для списка: имя и его адрес API (если задан)."""
+    try:
+        base_url = load_settings(name).base_url
+    except Exception as e:  # битый profile.toml — виден, но список не рушит
+        return f"{name}  ← {e}"
+    if base_url is None:
+        return name
+    return f"{name}  → {base_url or 'напрямую (api.anthropic.com)'}"
+
+
 def cmd_profile(args: Sequence[str]) -> int:
-    """`profile` — список профилей; `profile rm <имя>` — удалить каталог профиля."""
-    from .profiles import ProfileError, list_profiles, remove_profile
+    """`profile` — список профилей; `profile rm <имя>` — удалить каталог профиля.
+
+    В списке показываем адрес API профиля (profile.toml): «какой учёткой я
+    работаю» и «куда она ходит» — один вопрос, разные ответы у разных профилей,
+    и молчать про второй значит прятать причину, по которой сессия ведёт себя
+    иначе. Сломанный profile.toml печатаем строкой ошибки рядом с именем, а не
+    роняем весь список: остальные профили тут ни при чём.
+    """
+    from .profiles import ProfileError, list_profiles, load_settings, remove_profile
     if not args:
         names = list_profiles()
         if not names:
             sys.stdout.write("нет профилей (создай: claude-box init <имя>)\n")
         else:
-            sys.stdout.write("\n".join(names) + "\n")
+            sys.stdout.write("\n".join(_profile_line(n, load_settings) for n in names) + "\n")
         return 0
     if args[0] == "rm":
         if len(args) != 2:

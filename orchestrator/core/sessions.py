@@ -878,6 +878,8 @@ class SessionManager:
             from ..runners.agentvm import strip_own_env
             strip_own_env(env)
         env.update(self.config.claude_env)
+        # Адрес API профиля — ПОСЛЕ общих CLAUDE_ENV_*: он их и перебивает.
+        self._apply_profile_env(session, env)
         # Модульные env-вклады (wallet: $NAME для секретов). Env процесса claude
         # наследуют его Bash-тул и сервисы, что он запускает — значит переменная
         # доступна там, где сервис/команда её читает.
@@ -1751,6 +1753,30 @@ class SessionManager:
         if session is None or session.profile is None:
             return self.config.claude_profile
         return session.profile or None
+
+    def _apply_profile_env(self, session: Session, env: dict[str, str]) -> None:
+        """Наложить настройки профиля сессии на окружение claude (адрес API).
+
+        Зовётся ПОСЛЕ `config.claude_env`: общий `CLAUDE_ENV_ANTHROPIC_BASE_URL`
+        описывает машину, а профиль — учётку, и учётка тут главнее. Почему адрес
+        обязан быть на профиле: у Team-учётки managed-настройки организации
+        (`channelsEnabled` и прочие) приходят с эндпоинта настроек прямого
+        api.anthropic.com — локальный прокси-релей его не обслуживает, и канал
+        сессии тихо умирает при живом `/notify` 200 (см. box/profiles.apply_settings
+        и core/channelstate). Сессия без профиля или профиль без profile.toml
+        окружение не трогают — поведение прежнее.
+
+        Битый profile.toml — SessionError (внятный отказ оператору), а не
+        трейсбек: с молча проглоченной ошибкой сессия поднялась бы не на том
+        эндпоинте, и симптом («каналы выключены») на причину не похож.
+        """
+        name = self.profile_of(session)  # под agent-vm профиля нет — вернёт None
+        if not name:
+            return
+        try:
+            profiles.apply_settings(env, name)
+        except profiles.ProfileError as e:
+            raise SessionError(f"профиль «{name}»: {e}") from e
 
     def config_dir_of(self, session: Session | None) -> Path | None:
         """CLAUDE_CONFIG_DIR этой сессии: каталог её профиля или общий из .env.
