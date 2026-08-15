@@ -140,8 +140,8 @@ class WebAdapter:
         intermediate: bool = False,
     ) -> None:
         await self._broadcast({
-            "type": "reply", "session": session.name, "text": text,
-            "html": md_to_html(text), "intermediate": intermediate,
+            "type": "reply", "session": session.name, "intermediate": intermediate,
+            **self._payload(text, core=False),   # ответ модели — markdown
         })
 
     async def deliver_file(
@@ -155,14 +155,22 @@ class WebAdapter:
             "name": path.name, "caption": caption,
         })
 
+    def _payload(self, text: str, *, core: bool = True) -> dict:
+        """Текст для SPA: `html` — что рисуем, `text` — он же без разметки.
+
+        ЕДИНСТВЕННОЕ место рендера в этом адаптере (симметрично
+        TelegramAdapter._render). `core=True` — текст ЯДРА: он уже размечен HTML
+        того же диалекта, что уходит в Telegram, и второй проход через
+        md_to_html экранировал бы его собственные теги — оператор увидел бы
+        «<code>» глазами. `core=False` — текст МОДЕЛИ, это markdown.
+        """
+        return ({"text": self.core.plain(text), "html": text} if core
+                else {"text": text, "html": md_to_html(text)})
+
     async def notify(self, session: Session | None, text: str) -> None:
-        # Текст ЯДРА уже размечен HTML (тот же диалект, что уходит в Telegram):
-        # второй проход через md_to_html экранировал бы его собственные теги, и
-        # оператор увидел бы «<code>» глазами. Разметку модели рендерит
-        # deliver_reply — там текст markdown. Один текст — один рендер.
         await self._broadcast({
             "type": "notice", "session": session.name if session else None,
-            "text": self.core.plain(text), "html": text,
+            **self._payload(text),
         })
 
     async def typing(self, session: Session) -> bool:
@@ -537,14 +545,13 @@ class WebAdapter:
 
     @with_session
     async def h_info(self, request: web.Request, session: Session) -> web.Response:
-        text = self.core.info_text(session)
-        return web.json_response({"text": self.core.plain(text), "html": text})
+        return web.json_response(self._payload(self.core.info_text(session)))
 
     @with_session
     async def h_stats(self, request: web.Request, session: Session) -> web.Response:
         # Блокирующее чтение транскрипта — в поток, event loop не стопорим.
         text = await asyncio.to_thread(self.core.stats_text, session)
-        return web.json_response({"text": self.core.plain(text), "html": text})
+        return web.json_response(self._payload(text))
 
     @with_session
     async def h_usage(self, request: web.Request, session: Session) -> web.Response:
@@ -567,8 +574,13 @@ class WebAdapter:
             items = []
             for ev in self.core.history(session.name):
                 ev = dict(ev)
-                if ev.get("kind") in ("reply", "intermediate", "notice"):
-                    ev["html"] = md_to_html(str(ev.get("text", "")))
+                kind = ev.get("kind")
+                if kind in ("reply", "intermediate", "notice"):
+                    # Тот же выбор рендера, что в живой доставке: заметка —
+                    # текст ЯДРА (уже HTML), ответ модели — markdown. Иначе
+                    # история показывала бы теги, которых в чате не было.
+                    ev.update(self._payload(str(ev.get("text", "")),
+                                            core=kind == "notice"))
                 items.append(ev)
             return items
 
