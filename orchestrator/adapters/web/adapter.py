@@ -156,9 +156,13 @@ class WebAdapter:
         })
 
     async def notify(self, session: Session | None, text: str) -> None:
+        # Текст ЯДРА уже размечен HTML (тот же диалект, что уходит в Telegram):
+        # второй проход через md_to_html экранировал бы его собственные теги, и
+        # оператор увидел бы «<code>» глазами. Разметку модели рендерит
+        # deliver_reply — там текст markdown. Один текст — один рендер.
         await self._broadcast({
             "type": "notice", "session": session.name if session else None,
-            "text": text, "html": md_to_html(text),
+            "text": self.core.plain(text), "html": text,
         })
 
     async def typing(self, session: Session) -> bool:
@@ -533,14 +537,14 @@ class WebAdapter:
 
     @with_session
     async def h_info(self, request: web.Request, session: Session) -> web.Response:
-        # Разметку ядра снимаем: веб печатает нотисы экранированным текстом.
-        return web.json_response({"text": self.core.plain(self.core.info_text(session))})
+        text = self.core.info_text(session)
+        return web.json_response({"text": self.core.plain(text), "html": text})
 
     @with_session
     async def h_stats(self, request: web.Request, session: Session) -> web.Response:
         # Блокирующее чтение транскрипта — в поток, event loop не стопорим.
         text = await asyncio.to_thread(self.core.stats_text, session)
-        return web.json_response({"text": text})
+        return web.json_response({"text": self.core.plain(text), "html": text})
 
     @with_session
     async def h_usage(self, request: web.Request, session: Session) -> web.Response:

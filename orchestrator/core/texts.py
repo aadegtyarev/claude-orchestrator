@@ -166,7 +166,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "stats_stopped_suffix": " (остановлена)",
         "stats_no_transcript": "{header} — {uptime}.\nТранскрипт ещё не создан.",
         "stats_no_transcript_vm": "{header} — {uptime}.\n⚠️ Под SANDBOX=agent-vm статистика недоступна: транскрипт Claude лежит ВНУТРИ microVM, а оркестратор читает его на хосте. Не баг сессии — ограничение режима. Нужны цифры — SANDBOX=bwrap.",
-        "stats_stale_schema": "{header} — {uptime}.\n⚠️ Транскрипт есть, но статистика не читается — похоже, формат Claude Code изменился (обновилась версия?). Числа недоступны, пока не обновлю парсер.\nХвост лога:\n```\n{tail}\n```\n📥 Полный лог для разработчиков: /log",
+        "stats_stale_schema": "{header} — {uptime}.\n⚠️ Транскрипт есть, но статистика не читается — похоже, формат Claude Code изменился (обновилась версия?). Числа недоступны, пока не обновлю парсер.\nХвост лога:\n<pre>{tail}</pre>\n📥 Полный лог для разработчиков: /log",
         "log_caption": "🗒 Полный лог сессии «{name}» (claude.log) — для отладки.",
         "log_empty": "(лог пуст)",
         "stats_body": (
@@ -246,7 +246,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "restarting": "🔄 Перезапускаю оркестратор через systemd. Активные ходы прервутся, сессии резюмнутся; история сохранится. Стартовое уведомление придёт через несколько секунд.",
         "restart_fail": "❌ Не удалось перезапустить: {error}\n(команда работает только под systemd --user)",
         "web_url": "🌐 Локальный веб-интерфейс (с токеном):\n<code>{url}</code>",
-        "web_disabled": "🌐 Веб-интерфейс не запущен (добавь `web` в ADAPTERS).",
+        "web_disabled": "🌐 Веб-интерфейс не запущен (добавь <code>web</code> в ADAPTERS).",
         "clear_done": "🧹 Контекст очищен, сессия готова.",
         "close_done": "⏸ Сессия остановлена, топик сохранён.\nНапиши сюда — продолжу диалог (resume).",
         "delete_confirm": "🗑 Удалить сессию «{title}» полностью — процесс, контекст и этот топик? Действие необратимо.",
@@ -304,8 +304,8 @@ MESSAGES: dict[str, dict[str, str]] = {
             "💀 Сессия «{name}»: Claude завершился (код {code}).\n"
             "Напиши в топик — перезапущу сессию."
         ),
-        "session_died_tail": "Хвост лога:\n```\n{tail}\n```",
-        "idle_closed": "😴 Сессия остановлена по простою (> {hours} ч). Напиши — возобновлю.",
+        "session_died_tail": "Хвост лога:\n<pre>{tail}</pre>",
+        "idle_closed": "😴 Сессия остановлена по простою (&gt; {hours} ч). Напиши — возобновлю.",
         "startup": (
             "🟢 Бот онлайн. Восстановлено сессий: {n} (возобновятся по сообщению).\n"
             "Профиль Claude (CLAUDE_CONFIG_DIR): {config}\n"
@@ -339,10 +339,10 @@ MESSAGES: dict[str, dict[str, str]] = {
         "wallet_ask_reason_disabled": "правка policy выключена (WALLET_POLICY_EDIT=0)",
         # notice в чат: markdown (md_to_html), не HTML-теги.
         "wallet_ask_written": (
-            "🔒 Постоянный грант записан в policy секрета `{secret}`:\n"
-            "`scope.{key} += \"{value}\"`\n"
+            "🔒 Постоянный грант записан в policy секрета <code>{secret}</code>:\n"
+            "<code>scope.{key} += \"{value}\"</code>\n"
             "Такие запросы больше не спрашиваются. Отозвать: "
-            "`/wallet scope {secret} -{value}` (или `vault policy scope {secret} -{value}`)."
+            "<code>/wallet scope {secret} -{value}</code> (или <code>vault policy scope {secret} -{value}</code>)."
         ),
         "wallet_ask_write_failed": (
             "⚠️ Доступ разрешён РАЗОВО, но записать грант в policy НЕ удалось: "
@@ -356,7 +356,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "🔑 Policy кошелька изменилась ({changes}), но эта сессия запущена со "
             "старым окружением: переменные задаются при старте. Переоткрой сессию "
             "(/close_session и сообщение), либо бери секрет по требованию — "
-            "`wallet run <имя>`."
+            "<code>wallet run &lt;имя&gt;</code>."
         ),
         "wallet_disabled": "🔐 Кошелёк не подключён (SANDBOX_BWRAP_WALLET + SANDBOX=bwrap). /wallet недоступен.",
         "sendfile_not_found": "❌ Не удалось отправить: файл не найден: {path}",
@@ -601,7 +601,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "stats_stopped_suffix": " (stopped)",
         "stats_no_transcript": "{header} — {uptime}.\nNo transcript yet.",
         "stats_no_transcript_vm": "{header} — {uptime}.\n⚠️ Stats are unavailable under SANDBOX=agent-vm: the Claude transcript lives INSIDE the microVM while the orchestrator reads it on the host. Not a session bug — a mode limitation. Need numbers — use SANDBOX=bwrap.",
-        "stats_stale_schema": "{header} — {uptime}.\n⚠️ Transcript exists but stats can't be read — the Claude Code format likely changed (new version?). Numbers unavailable until the parser is updated.\nLog tail:\n```\n{tail}\n```\n📥 Full log for developers: /log",
+        "stats_stale_schema": "{header} — {uptime}.\n⚠️ Transcript exists but stats can't be read — the Claude Code format likely changed (new version?). Numbers unavailable until the parser is updated.\nLog tail:\n<pre>{tail}</pre>\n📥 Full log for developers: /log",
         "log_caption": "🗒 Full session log «{name}» (claude.log) — for debugging.",
         "log_empty": "(log empty)",
         "stats_body": (
@@ -681,7 +681,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "restarting": "🔄 Restarting the orchestrator via systemd. Active turns will be interrupted, sessions resume; history is saved. Startup notice arrives in a few seconds.",
         "restart_fail": "❌ Restart failed: {error}\n(command works only under systemd --user)",
         "web_url": "🌐 Local web UI (with token):\n<code>{url}</code>",
-        "web_disabled": "🌐 Web UI is not running (add `web` to ADAPTERS).",
+        "web_disabled": "🌐 Web UI is not running (add <code>web</code> to ADAPTERS).",
         "clear_done": "🧹 Context cleared, session ready.",
         "close_done": "⏸ Session stopped, topic kept.\nSend a message here to continue (resume).",
         "delete_confirm": "🗑 Delete session «{title}» entirely — process, context and this topic? This cannot be undone.",
@@ -739,8 +739,8 @@ MESSAGES: dict[str, dict[str, str]] = {
             "💀 Session “{name}”: Claude exited (code {code}).\n"
             "Send a message to the topic to restart the session."
         ),
-        "session_died_tail": "Log tail:\n```\n{tail}\n```",
-        "idle_closed": "😴 Session stopped after being idle (> {hours} h). Send a message to resume.",
+        "session_died_tail": "Log tail:\n<pre>{tail}</pre>",
+        "idle_closed": "😴 Session stopped after being idle (&gt; {hours} h). Send a message to resume.",
         "startup": (
             "🟢 Bot online. Restored sessions: {n} (resume on message).\n"
             "Claude profile (CLAUDE_CONFIG_DIR): {config}\n"
@@ -770,10 +770,10 @@ MESSAGES: dict[str, dict[str, str]] = {
         ),
         "wallet_ask_reason_disabled": "policy editing is off (WALLET_POLICY_EDIT=0)",
         "wallet_ask_written": (
-            "🔒 Persistent grant written to the policy of secret `{secret}`:\n"
-            "`scope.{key} += \"{value}\"`\n"
+            "🔒 Persistent grant written to the policy of secret <code>{secret}</code>:\n"
+            "<code>scope.{key} += \"{value}\"</code>\n"
             "Such requests are no longer asked. Revoke: "
-            "`/wallet scope {secret} -{value}` (or `vault policy scope {secret} -{value}`)."
+            "<code>/wallet scope {secret} -{value}</code> (or <code>vault policy scope {secret} -{value}</code>)."
         ),
         "wallet_ask_write_failed": (
             "⚠️ Access granted ONCE, but writing the grant to the policy FAILED: "
@@ -784,7 +784,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "🔑 Wallet policy changed ({changes}), but this session started with the "
             "old environment: variables are set at launch. Reopen the session "
             "(/close_session and a message), or fetch the secret on demand — "
-            "`wallet run <name>`."
+            "<code>wallet run &lt;name&gt;</code>."
         ),
         "wallet_disabled": "🔐 Wallet not enabled (SANDBOX_BWRAP_WALLET + SANDBOX=bwrap). /wallet unavailable.",
         "sendfile_not_found": "❌ Cannot send: file not found: {path}",
