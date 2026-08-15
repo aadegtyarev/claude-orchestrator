@@ -1400,7 +1400,9 @@ class OrchestratorCore:
             tail = self.manager.tail_log(session, 12)
             return self.t(
                 "stats_stale_schema", header=header, uptime=uptime,
-                tail=tail or self.t("log_empty"),
+                # Хвост лога — сырой вывод: экранируем, иначе «<» в нём поломал
+                # бы разметку сообщения (тексты ядра уходят как HTML).
+                tail=html.escape(tail) if tail else self.t("log_empty"),
             )
         ctx = stats["context_tokens"]
         window = self.config.context_window
@@ -1962,7 +1964,8 @@ class OrchestratorCore:
         text = self.t("session_died", name=session.title, code=code)
         tail = await asyncio.to_thread(self.manager.tail_log, session)
         if tail:
-            text += "\n\n" + self.t("session_died_tail", tail=tail[:1500])
+            text += "\n\n" + self.t(
+                "session_died_tail", tail=html.escape(tail[:1500]))
         await self.notice(session, text)
 
     async def notify_channel_blocked(self, session: Session) -> None:

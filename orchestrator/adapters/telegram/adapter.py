@@ -178,7 +178,7 @@ class TelegramAdapter:
         except Exception as e:
             logger.warning("Не удалось удалить топик %s: %s", address, e)
             await self._send(
-                self.chat_id, None, self.t("topic_delete_fail", error=e)
+                self.chat_id, None, self.t("topic_delete_fail", error=e), core=True
             )
 
     # ── Transport: доставка ─────────────────────────────────────
@@ -217,7 +217,8 @@ class TelegramAdapter:
         if thread_id is None:
             return
         if path.stat().st_size > FILE_LIMIT:
-            await self._send(self.chat_id, thread_id, self.t("sendfile_too_big", path=path))
+            await self._send(
+                self.chat_id, thread_id, self.t("sendfile_too_big", path=path), core=True)
             return
         kwargs: dict = {"chat_id": self.chat_id, "document": FSInputFile(path)}
         if caption:
@@ -231,7 +232,8 @@ class TelegramAdapter:
             await self.bot.send_document(**kwargs)
         except Exception as e:
             logger.error("Не удалось отправить файл %s: %s", path, e)
-            await self._send(self.chat_id, thread_id, self.t("sendfile_fail", error=e))
+            await self._send(
+                self.chat_id, thread_id, self.t("sendfile_fail", error=e), core=True)
 
     async def notify(self, session: Session | None, text: str) -> None:
         if self.chat_id is None:
@@ -239,7 +241,8 @@ class TelegramAdapter:
         thread_id = self._thread_of(session) if session is not None else None
         if session is not None and thread_id is None:
             return  # сессия невидима для этого адаптера
-        await self._send(self.chat_id, thread_id, text)
+        # notify несёт текст ЯДРА (сторож, релей ошибок, заметки) — он уже HTML.
+        await self._send(self.chat_id, thread_id, text, core=True)
 
     async def typing(self, session: Session) -> bool:
         """Один chat-action «печатает…». False — слать некуда."""
@@ -291,7 +294,6 @@ class TelegramAdapter:
             message_thread_id=thread_id,
             disable_notification=True,
             reply_markup=self._stop_markup(thread_id, unblock_active) if stop_button else None,
-            parse_mode="HTML",
         )
         return str(msg.message_id)
 
@@ -311,7 +313,6 @@ class TelegramAdapter:
                 self._stop_markup(thread_id, unblock_active)
                 if stop_button and thread_id else None
             ),
-            parse_mode="HTML",
         )
 
     async def bubble_finish(self, session: Session, ref: str, *, delete: bool) -> None:
@@ -380,7 +381,6 @@ class TelegramAdapter:
                 chat_id=self.chat_id,
                 text=text,
                 message_thread_id=thread_id,
-                parse_mode="HTML",
                 reply_markup=markup,
             )
             self._perm_msgs[(session.name, request.request_id)] = (
@@ -399,7 +399,6 @@ class TelegramAdapter:
                     chat_id=self.chat_id,
                     text=fallback,
                     message_thread_id=thread_id,
-                    parse_mode="HTML",
                     reply_markup=markup,
                 )
                 self._perm_msgs[(session.name, request.request_id)] = (
@@ -428,7 +427,7 @@ class TelegramAdapter:
             )
             await self._send(
                 self.chat_id, self._thread_of(session),
-                self.t(verdict_key, tool=tool), message_id,
+                self.t(verdict_key, tool=tool), message_id, core=True,
             )
         except Exception as e:
             logger.debug("permission_resolved: %s", e)
@@ -555,38 +554,39 @@ class TelegramAdapter:
             text = self.t("chat_id_current", id=chat_id)
         else:
             text = self.t("chat_id_other", id=chat_id, bound=self.chat_id)
-        await message.reply(text, parse_mode="HTML")
+        await self._reply(message, text)
 
     async def cmd_help(self, message: Message) -> None:
         if not self._accept(message):
             return
-        await message.reply(self.core.help_text(), parse_mode="HTML")
+        await self._reply(message, self.core.help_text())
 
     async def cmd_new(self, message: Message, command: CommandObject) -> None:
         if not self._accept(message):
             return
         if message.message_thread_id is not None:
-            await message.reply(self.t("only_main_chat"))
+            await self._reply(message, self.t("only_main_chat"))
             return
         title, project_path, box, profile = self.core.parse_new_args(command.args or "")
         if not title:
-            await message.reply(self.t("new_usage"))
+            await self._reply(message, self.t("new_usage"))
             return
         title = title[:128]  # предел названия топика в Telegram
-        status = await message.reply(self.t("creating"))
+        status = await self._reply(message, self.t("creating"))
         try:
             session = await self.core.create_session(title, project_path, box, profile)
         except UserError as e:
-            await status.edit_text(self.t("create_fail", error=e))
+            await self._edit(status, self.t("create_fail", error=e))
             return
         except Exception as e:
             logger.exception("Ошибка создания сессии %s", title)
-            await status.edit_text(self.t("create_fail", error=e))
+            await self._edit(status, self.t("create_fail", error=e))
             return
-        # Без parse_mode: имя сессии задаёт пользователь, «<» в нём сломал бы
-        # HTML-разбор уже СОЗДАННОЙ сессии (тексты про изоляцию — тоже простые).
-        await status.edit_text(
-            self.t("created", name=session.title)
+        # Имя сессии задаёт пользователь: «<» в нём сломал бы HTML-разбор уже
+        # СОЗДАННОЙ сессии, поэтому экранируем значение, а не отказываемся от
+        # разметки всего сообщения (у _edit есть и фолбэк на чистый текст).
+        await self._edit(status,
+            self.t("created", name=html.escape(session.title))
             + self.core.box_note(session)
             + self.core.profile_note(session)
         )
@@ -596,7 +596,7 @@ class TelegramAdapter:
             return
         sessions = self.manager.list_all()
         if not sessions:
-            await message.reply(self.t("list_empty"))
+            await self._reply(message, self.t("list_empty"))
             return
         lines, rows = [], []
         status_labels = {
@@ -629,7 +629,7 @@ class TelegramAdapter:
                 row.append(InlineKeyboardButton(
                     text="⏸", callback_data=cbdata.sess_cb("close", thread_id)))
             rows.append(row)
-        await message.reply(
+        await self._reply(message,
             "\n".join(lines),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None,
         )
@@ -639,7 +639,7 @@ class TelegramAdapter:
             return
         # cwd как у /bash: в топике сессии — папка проекта, в главном чате — дом.
         session = self._topic_session(message)
-        await message.reply(self.core.ls_text(command.args, session))
+        await self._reply(message, self.core.ls_text(command.args, session))
 
     async def cmd_bg(self, message: Message, command: CommandObject) -> None:
         """Фоновые процессы/кроны сессии (снимок из последнего Stop-хука)."""
@@ -647,9 +647,9 @@ class TelegramAdapter:
             return
         session = self._topic_session(message)
         if session is None:
-            await message.reply(self.t("bg_no_session"))
+            await self._reply(message, self.t("bg_no_session"))
             return
-        await message.reply(self.core.bg_text(session), parse_mode="HTML")
+        await self._reply(message, self.core.bg_text(session))
 
     async def cmd_wallet(self, message: Message, command: CommandObject) -> None:
         """Policy кошелька: просмотр/правка (значения токенов не показываются)."""
@@ -659,7 +659,7 @@ class TelegramAdapter:
             text = self.core.wallet_command(command.args or "")
         except UserError as e:
             text = str(e)
-        await message.reply(text, parse_mode="HTML")
+        await self._reply(message, text)
 
     async def cmd_restart(self, message: Message) -> None:
         """Перезапуск всего оркестратора (self-restart через systemd) — для
@@ -668,13 +668,13 @@ class TelegramAdapter:
         if not self._accept(message):
             return
         if message.message_thread_id is not None:
-            await message.reply(self.t("only_main_chat"))
+            await self._reply(message, self.t("only_main_chat"))
             return
-        await message.reply(self.t("restarting"))
+        await self._reply(message, self.t("restarting"))
         try:
             await self.core.restart_service()
         except UserError as e:
-            await message.reply(str(e))
+            await self._reply(message, str(e))
 
     async def cmd_web(self, message: Message) -> None:
         """Ссылка на локальный веб-интерфейс с токеном — если веб запущен."""
@@ -682,9 +682,9 @@ class TelegramAdapter:
             return
         url = self.core.web_url()
         if url is None:
-            await message.reply(self.t("web_disabled"))
+            await self._reply(message, self.t("web_disabled"))
             return
-        await message.reply(self.t("web_url", url=url), parse_mode="HTML")
+        await self._reply(message, self.t("web_url", url=url))
 
     async def cmd_skills(self, message: Message) -> None:
         if not self._accept(message):
@@ -693,13 +693,13 @@ class TelegramAdapter:
         skills = await asyncio.to_thread(
             self.core.collect_skills, self._topic_session(message))
         if not skills:
-            await message.reply(self.t("skills_none"))
+            await self._reply(message, self.t("skills_none"))
             return
         lines = [self.t("skills_header", n=len(skills))]
         for name, desc in skills:
             lines.append(f"• {name}" + (f" — {desc}" if desc else ""))
         for chunk in split_text("\n".join(lines)):
-            await message.reply(chunk)
+            await self._reply(message, chunk)
 
     # ── команды топика ──────────────────────────────────────────
 
@@ -713,7 +713,7 @@ class TelegramAdapter:
             return
         cmd = (command.args or "").strip()
         if not cmd:
-            await message.reply(self.t("bash_usage"))
+            await self._reply(message, self.t("bash_usage"))
             return
         session = self._topic_session(message)
         key = self.core.bash_key(session, f"tg{message.message_thread_id or 0}")
@@ -734,7 +734,7 @@ class TelegramAdapter:
         создания нового (правка сообщения пользователя → перезапуск команды).
         """
         if self.core.bash_busy(key):
-            await message.reply(self.t("bash_busy"))
+            await self._reply(message, self.t("bash_busy"))
             return
 
         # Создаём или переиспользуем статус-сообщение.
@@ -744,7 +744,6 @@ class TelegramAdapter:
                 chat_id=self.chat_id,
                 message_id=edit_status_id,
                 text=self.t("bash_running", cmd=cmd),
-                parse_mode="HTML",
             )
             # edit_message_text возвращает Message | True; нам нужен message_id.
             if isinstance(status_msg, bool):
@@ -753,7 +752,7 @@ class TelegramAdapter:
                 status_id = status_msg.message_id
         else:
             # Новая команда — создаём статус-сообщение.
-            status = await message.reply(self.t("bash_running", cmd=cmd))
+            status = await self._reply(message, self.t("bash_running", cmd=cmd))
             status_id = status.message_id
 
         last_edit = ""
@@ -825,11 +824,11 @@ class TelegramAdapter:
                     keep_file = True  # оператору дали путь — файл нужен на месте
                     # Telegram больше не примет, а read_text ниже затянул бы
                     # гигабайты в память процесса. Честно говорим, где файл.
-                    await message.reply(self.t(
+                    await self._reply(message, self.t(
                         "bash_output_too_big",
                         size=f"{size / 1024 / 1024:.0f} MB",
                         path=html.escape(str(out_path)),
-                    ), parse_mode="HTML")
+                    ))
                     return
                 # caption — краткая справка; текст уже в бабле, не дублируем.
                 # Считаем строки потоком: файл может быть на десятки мегабайт.
@@ -890,9 +889,9 @@ class TelegramAdapter:
         key = self.core.bash_key(session, f"tg{message.message_thread_id or 0}")
         text = command.args or ""
         if not self.core.bash_input(key, text):
-            await message.reply(self.t("bash_not_running"))
+            await self._reply(message, self.t("bash_not_running"))
             return
-        await message.reply(self.t("bashin_sent", text=html.escape(text) or "⏎"))
+        await self._reply(message, self.t("bashin_sent", text=html.escape(text) or "⏎"))
 
     async def cmd_perms(self, message: Message, command: CommandObject) -> None:
         """/perms [auto|lock]: авто-одобрение запросов разрешений сессии."""
@@ -902,9 +901,9 @@ class TelegramAdapter:
         try:
             text = self.core.perms_command(session, command.args or "")
         except UserError as e:
-            await message.reply(str(e), parse_mode="HTML")
+            await self._reply(message, str(e))
             return
-        await message.reply(text, parse_mode="HTML")
+        await self._reply(message, text)
 
     async def cmd_term(self, message: Message, command: CommandObject) -> None:
         """/term [on|off]: липкий режим терминала — обычные сообщения уходят в шелл.
@@ -922,9 +921,9 @@ class TelegramAdapter:
         try:
             text = self.core.term_command(session, key, command.args or "")
         except UserError as e:
-            await message.reply(str(e), parse_mode="HTML")
+            await self._reply(message, str(e))
             return
-        await message.reply(text, parse_mode="HTML")
+        await self._reply(message, text)
         # Состояние режима решает, закреплять или откреплять: term_command уже
         # переключил его, осталось отразить в чате.
         if self.core.term.is_on(key):
@@ -985,10 +984,10 @@ class TelegramAdapter:
             return
         session = self._topic_session(message)
         if session is None:
-            await message.reply(self.t("only_topic"))
+            await self._reply(message, self.t("only_topic"))
             return
         await self.core.close_session(session)
-        await message.reply(self.t("close_done"))
+        await self._reply(message, self.t("close_done"))
 
     async def cmd_delete(self, message: Message) -> None:
         """Полностью удалить сессию вместе с топиком — с подтверждением."""
@@ -996,7 +995,7 @@ class TelegramAdapter:
             return
         session = self._topic_session(message)
         if session is None:
-            await message.reply(self.t("only_topic"))
+            await self._reply(message, self.t("only_topic"))
             return
         thread_id = self._thread_of(session) or 0
         markup = InlineKeyboardMarkup(inline_keyboard=[[
@@ -1007,7 +1006,7 @@ class TelegramAdapter:
                 text=self.t("delete_confirm_no"),
                 callback_data=cbdata.delete_cb(thread_id, "no")),
         ]])
-        await message.reply(
+        await self._reply(message,
             self.t("delete_confirm", title=session.title), reply_markup=markup
         )
 
@@ -1042,7 +1041,7 @@ class TelegramAdapter:
     async def _edit_or_pass(self, callback: CallbackQuery, text: str) -> None:
         if isinstance(callback.message, Message):
             try:
-                await callback.message.edit_text(text)
+                await self._edit(callback.message, text)
             except Exception:
                 pass
 
@@ -1052,15 +1051,15 @@ class TelegramAdapter:
             return
         session = self._topic_session(message)
         if session is None:
-            await message.reply(self.t("only_topic"))
+            await self._reply(message, self.t("only_topic"))
             return
-        status = await message.reply(self.t("clear_progress"))
+        status = await self._reply(message, self.t("clear_progress"))
         try:
             await self.core.clear_session(session)
         except UserError as e:
-            await status.edit_text(str(e))
+            await self._edit(status, str(e))
             return
-        await status.edit_text(self.t("clear_done"))
+        await self._edit(status, self.t("clear_done"))
 
     async def cmd_compact(self, message: Message) -> None:
         """/compact — в терминал Claude (проверенный путь: PTY)."""
@@ -1068,14 +1067,14 @@ class TelegramAdapter:
             return
         session = self._topic_session(message)
         if session is None:
-            await message.reply(self.t("only_topic"))
+            await self._reply(message, self.t("only_topic"))
             return
         try:
             await self.core.compact(session)
         except UserError as e:
-            await message.reply(str(e))
+            await self._reply(message, str(e))
             return
-        await message.reply(self.t("compact_sent"))
+        await self._reply(message, self.t("compact_sent"))
 
     async def cmd_info(self, message: Message) -> None:
         """Паспорт сессии: учётка, адрес API, движок, модель, канал."""
@@ -1083,9 +1082,9 @@ class TelegramAdapter:
             return
         session = self._topic_session(message)
         if session is None:
-            await message.reply(self.t("only_topic"))
+            await self._reply(message, self.t("only_topic"))
             return
-        await message.reply(self.core.info_text(session))
+        await self._reply(message, self.core.info_text(session))
 
     async def cmd_stats(self, message: Message) -> None:
         """Контекст и статистика из транскрипта сессии."""
@@ -1093,9 +1092,9 @@ class TelegramAdapter:
             return
         session = self._topic_session(message)
         if session is None:
-            await message.reply(self.t("only_topic"))
+            await self._reply(message, self.t("only_topic"))
             return
-        await message.reply(await asyncio.to_thread(self.core.stats_text, session))
+        await self._reply(message, await asyncio.to_thread(self.core.stats_text, session))
 
     async def cmd_log(self, message: Message) -> None:
         """/log — прислать полный claude.log сессии документом (для отладки)."""
@@ -1103,7 +1102,7 @@ class TelegramAdapter:
             return
         session = self._topic_session(message)
         if session is None:
-            await message.reply(self.t("only_topic"))
+            await self._reply(message, self.t("only_topic"))
             return
         await self.core.send_log(session, self._origin(message))
 
@@ -1113,20 +1112,20 @@ class TelegramAdapter:
             return
         session = self._topic_session(message)
         if session is None:
-            await message.reply(self.t("only_topic"))
+            await self._reply(message, self.t("only_topic"))
             return
         if not await self._ensure_running(session, message):
             return
-        status = await message.reply(self.t("usage_collecting"))
+        status = await self._reply(message, self.t("usage_collecting"))
         try:
             text = await self.core.usage_text(session)
         except UserError as e:
             # usage_text бросает UserError (напр. PTY умер между ensure_running и
             # /cost) — веб-адаптер её ловит, телеграмный раньше нет: «⏳ собираю…»
             # висело вечно.
-            await status.edit_text(str(e))
+            await self._edit(status, str(e))
             return
-        await status.edit_text(text if text else self.t("usage_failed"))
+        await self._edit(status, text if text else self.t("usage_failed"))
 
     async def cmd_model(self, message: Message, command: CommandObject) -> None:
         """Модель сессии: /model — кнопки-синонимы, /model <имя> — установить."""
@@ -1134,7 +1133,7 @@ class TelegramAdapter:
             return
         session = self._topic_session(message)
         if session is None:
-            await message.reply(self.t("only_topic"))
+            await self._reply(message, self.t("only_topic"))
             return
         arg = (command.args or "").strip()
         if arg:
@@ -1146,7 +1145,7 @@ class TelegramAdapter:
             for alias in MODEL_ALIASES
         ]
         model = await asyncio.to_thread(self.core.model_display, session)
-        await message.reply(
+        await self._reply(message,
             self.t("model_prompt", model=model),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[buttons]),
         )
@@ -1168,16 +1167,16 @@ class TelegramAdapter:
     async def _switch_model(self, session: Session, model: str, message: Message) -> None:
         # message.answer() сам наследует message_thread_id исходного сообщения —
         # явно передавать нельзя (иначе TypeError: multiple values).
-        status = await message.answer(
+        status = await self._answer(message,
             self.t("model_switching", name=session.title, model=model)
         )
         try:
             resumed = await self.core.switch_model(session, model)
         except UserError as e:
-            await status.edit_text(str(e))
+            await self._edit(status, str(e))
             return
         note = "" if resumed else self.t("model_ctx_lost")
-        await status.edit_text(self.t("model_done", model=model) + note)
+        await self._edit(status, self.t("model_done", model=model) + note)
 
     async def cmd_profile(self, message: Message, command: CommandObject) -> None:
         """Профиль сессии: /profile — показать текущий, /profile <имя> — сменить."""
@@ -1185,14 +1184,14 @@ class TelegramAdapter:
             return
         session = self._topic_session(message)
         if session is None:
-            await message.reply(self.t("only_topic"))
+            await self._reply(message, self.t("only_topic"))
             return
         raw = command.args or ""
         if not raw.strip():
             # /profile без аргумента — показать текущую учётку и список профилей.
             names = self.core.list_profiles()
             profiles_str = ", ".join(names) if names else "—"
-            await message.reply(
+            await self._reply(message,
                 self.t(
                     "profile_prompt",
                     profile=self.core.profile_display(session),
@@ -1210,7 +1209,7 @@ class TelegramAdapter:
             return
         thread_id = self._thread_of(session) or 0
         self._pending_profile[session.name] = arg
-        await message.reply(
+        await self._reply(message,
             self.t("profile_history_ask", profile=arg or self.t("profile_none")),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text=self.t("profile_history_keep"),
@@ -1243,17 +1242,17 @@ class TelegramAdapter:
         # message.answer() сам наследует message_thread_id исходного сообщения —
         # явно передавать нельзя (иначе TypeError: multiple values).
         label = profile or self.t("profile_none")
-        status = await message.answer(
+        status = await self._answer(message,
             self.t("profile_switching", name=session.title, profile=label)
         )
         try:
             resumed = await self.core.switch_profile(
                 session, profile, keep_history=keep_history)
         except UserError as e:
-            await status.edit_text(str(e))
+            await self._edit(status, str(e))
             return
         note = self.t("profile_history_kept") if resumed else self.t("profile_ctx_lost")
-        await status.edit_text(self.t("profile_done", profile=label) + note)
+        await self._edit(status, self.t("profile_done", profile=label) + note)
 
     async def on_session_button(self, callback: CallbackQuery) -> None:
         """Кнопки в /list: статистика и остановка."""
@@ -1268,7 +1267,7 @@ class TelegramAdapter:
         action = parsed[0]
         if action == "stats":
             await callback.answer()
-            await callback.message.answer(
+            await self._answer(callback.message,
                 await asyncio.to_thread(self.core.stats_text, session)
             )
         elif action == "close":
@@ -1391,7 +1390,7 @@ class TelegramAdapter:
             await self.bot.download(file_id, destination=dest)
         except Exception as e:
             logger.error("Сессия %s: не удалось скачать файл: %s", session.name, e)
-            await message.reply(self.t("file_dl_fail", error=e))
+            await self._reply(message, self.t("file_dl_fail", error=e))
             return
 
         text = self.t("file_received", path=dest)
@@ -1412,25 +1411,25 @@ class TelegramAdapter:
         try:
             await self.core.slash_command(session, cmd)
         except UserError as e:
-            await message.reply(str(e))
+            await self._reply(message, str(e))
             return
-        await message.reply(self.t("slash_sent", cmd=cmd))
+        await self._reply(message, self.t("slash_sent", cmd=cmd))
 
     async def _ensure_running(self, session: Session, message: Message) -> bool:
         """Возобновить остановленную сессию перед пересылкой сообщения."""
         if session.running:
             return True
-        status = await message.reply(self.t("resume_progress"))
+        status = await self._reply(message, self.t("resume_progress"))
         try:
             state = await self.core.ensure_running(session)
         except UserError as e:
-            await status.edit_text(str(e))
+            await self._edit(status, str(e))
             return False
         except Exception as e:
             logger.exception("Сессия %s: ошибка resume", session.name)
-            await status.edit_text(self.t("resume_fail", error=e))
+            await self._edit(status, self.t("resume_fail", error=e))
             return False
-        await status.edit_text(
+        await self._edit(status,
             self.t("resume_ok") if state != "fresh" else self.t("resume_fresh")
         )
         return True
@@ -1440,7 +1439,7 @@ class TelegramAdapter:
             await self.core.user_message(session, text, self._origin(message))
         except UserError as e:
             await self._react(message, "👎")  # не дошло до модели
-            await message.reply(str(e))
+            await self._reply(message, str(e))
             return
         # Push в канал Клода прошёл — сообщение в стеке модели: 👀 → 👍.
         # 👍/👎, не ✅/❌: Telegram запрещает галочку/крестик как реакцию
@@ -1688,7 +1687,7 @@ class TelegramAdapter:
             # подпись обещала одно, а нажатие делало другое.
             if isinstance(callback.message, Message):
                 try:
-                    await callback.message.edit_text(self.t("term_history_empty"))
+                    await self._edit(callback.message, self.t("term_history_empty"))
                 except Exception:
                     pass
             return
@@ -1705,9 +1704,8 @@ class TelegramAdapter:
                 f"<code>{html.escape(cmd[:80])}</code>" for cmd in cmds
             )
             try:
-                await callback.message.edit_text(
+                await self._edit(callback.message,
                     text,
-                    parse_mode="HTML",
                     reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
                 )
             except Exception:
@@ -1750,16 +1748,53 @@ class TelegramAdapter:
 
     # ── отправка ────────────────────────────────────────────────
 
+    async def _reply(self, message: Message, text: str, **kwargs):
+        """Ответить текстом ЯДРА: он размечен HTML — так и отправляем.
+
+        Фолбэк на чистый текст, если разметка не проехала: в текст
+        подставляются значения из внешнего мира (имя сессии, путь, текст
+        ошибки, команда оператора), и «<» в них ломает HTML-разбор. Сообщение
+        важнее оформления — тот же принцип деградации, что в _send.
+        """
+        try:
+            return await message.reply(text, parse_mode="HTML", **kwargs)
+        except Exception as e:
+            logger.warning("HTML-ответ не прошёл, шлю чистым текстом: %s", e)
+            return await message.reply(text, **kwargs)
+
+    async def _answer(self, message: Message, text: str, **kwargs):
+        """Сообщение в топик текстом ЯДРА (см. _reply)."""
+        try:
+            return await message.answer(text, parse_mode="HTML", **kwargs)
+        except Exception as e:
+            logger.warning("HTML-сообщение не прошло, шлю чистым текстом: %s", e)
+            return await message.answer(text, **kwargs)
+
+    async def _edit(self, message: Message, text: str, **kwargs):
+        """Переписать своё сообщение текстом ЯДРА (см. _reply)."""
+        try:
+            return await message.edit_text(text, parse_mode="HTML", **kwargs)
+        except Exception as e:
+            logger.warning("HTML-правка не прошла, шлю чистым текстом: %s", e)
+            return await message.edit_text(text, **kwargs)
+
     async def _send(
-        self, chat_id: int, thread_id: int | None, text: str, reply_to: int | None = None
+        self, chat_id: int, thread_id: int | None, text: str, reply_to: int | None = None,
+        *, core: bool = False,
     ) -> None:
-        """Отправка с разметкой (markdown→HTML), фолбэк — чистый текст.
+        """Отправка с разметкой, фолбэк — чистый текст.
+
+        `core=False` — текст МОДЕЛИ: это markdown, рендерим md_to_html.
+        `core=True` — текст ЯДРА (texts.py и *_text()): он уже размечен HTML
+        телеграм-диалекта, и второй проход через md_to_html экранировал бы его
+        собственные теги — оператор увидел бы «<code>» глазами. Один текст —
+        один рендер, см. _reply/_edit.
 
         Деградация: без reply (исходное сообщение удалено) → без топика
         (топик удалили руками) — финальный ответ не должен теряться.
         """
         for i, plain in enumerate(split_text(text)):
-            hchunk = md_to_html(plain)
+            hchunk = plain if core else md_to_html(plain)
             kwargs: dict = {"chat_id": chat_id}
             if thread_id:
                 kwargs["message_thread_id"] = thread_id
