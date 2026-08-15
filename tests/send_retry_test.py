@@ -70,7 +70,8 @@ async def test_send_retry():
     # 3 отказа подряд, потом успех — ретрай доводит доставку.
     http = _Http(fail_times=3)
     m = _mgr(http)
-    sess = SimpleNamespace(name="s", port=12345, last_activity=0.0, running=True)
+    sess = SimpleNamespace(name="s", port=12345, last_activity=0.0, running=True,
+                           channel_blocked=False)
     await m.send_to_claude(sess, "hi", "ctx")
     assert http.calls == 4, http.calls
     print("OK send_to_claude: ретраит до подъёма channel-сервера")
@@ -78,7 +79,8 @@ async def test_send_retry():
     # Сессия умерла во время ретрая → сразу пробрасываем, не крутимся.
     http2 = _Http(fail_times=99)
     m2 = _mgr(http2)
-    dead = SimpleNamespace(name="s", port=12345, last_activity=0.0, running=False)
+    dead = SimpleNamespace(name="s", port=12345, last_activity=0.0, running=False,
+                           channel_blocked=False)
     try:
         await m2.send_to_claude(dead, "hi", "ctx")
         assert False, "должно было пробросить"
@@ -92,7 +94,8 @@ async def test_send_retry():
     # ConnectionRefused и сообщение молча терялось; теперь ретраим и таймаут.
     http3 = _Http(fail_times=2, exc=asyncio.TimeoutError)
     m3 = _mgr(http3)
-    sess3 = SimpleNamespace(name="s", port=12345, last_activity=0.0, running=True)
+    sess3 = SimpleNamespace(name="s", port=12345, last_activity=0.0, running=True,
+                            channel_blocked=False)
     await m3.send_to_claude(sess3, "hi", "ctx")
     assert http3.calls == 3, http3.calls
     print("OK send_to_claude: ретраит и на таймаут хендшейка (не только refused)")

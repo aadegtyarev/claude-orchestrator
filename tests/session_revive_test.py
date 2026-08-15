@@ -75,7 +75,7 @@ def _core(manager) -> OrchestratorCore:
     return core
 
 
-SESSION = SimpleNamespace(name="ikar", running=True)
+SESSION = SimpleNamespace(name="ikar", running=True, channel_blocked=False)
 ORIGIN = SimpleNamespace(adapter="telegram")
 
 

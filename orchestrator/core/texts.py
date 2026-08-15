@@ -119,6 +119,18 @@ MESSAGES: dict[str, dict[str, str]] = {
         "profile_created": "\n👤 Профиль Claude: {profile}.",
         "profile_created_none": "\n👤 Без профиля Claude: общая учётка оркестратора.",
         "profile_mark": " 👤 {profile}",
+        "channel_blocked": (
+            "⚠️ Канал сессии не загрузился: учётка (профиль {profile}) запрещает "
+            "dev-каналы — Claude Code пишет «Channels are not enabled for your "
+            "org».\n\nСообщения доставляю в обход — печатаю прямо в терминал "
+            "сессии (пометка «⌨️ через терминал»). Работает, но хрупко: ответы "
+            "модели идут обычным путём, а вот запросы разрешений через канал "
+            "не придут.\n\nКак починить по-настоящему: <code>/profile</code> с "
+            "учёткой, где каналы разрешены, либо включить "
+            "<code>channelsEnabled: true</code> в managed settings орга."
+        ),
+        "channel_blocked_mark": " ⌨️ без канала",
+        "bubble_via_pty": "⌨️ через терминал",
         "name_exists": "Сессия «{name}» уже существует.",
         "limit_reached": (
             "Достигнут лимит одновременно запущенных сессий ({limit}). "
@@ -513,6 +525,19 @@ MESSAGES: dict[str, dict[str, str]] = {
         "profile_created": "\n👤 Claude profile: {profile}.",
         "profile_created_none": "\n👤 No Claude profile: the orchestrator's shared account.",
         "profile_mark": " 👤 {profile}",
+        "channel_blocked": (
+            "⚠️ The session's channel did not load: its account (profile "
+            "{profile}) forbids dev channels — Claude Code shows “Channels are "
+            "not enabled for your org”.\n\nMessages are delivered the other way "
+            "round — typed straight into the session terminal (marked "
+            "“⌨️ via terminal”). It works, but it is fragile: the model's "
+            "replies take the normal path, while permission prompts sent over "
+            "the channel will not arrive.\n\nProper fix: <code>/profile</code> "
+            "with an account where channels are allowed, or set "
+            "<code>channelsEnabled: true</code> in the org's managed settings."
+        ),
+        "channel_blocked_mark": " ⌨️ no channel",
+        "bubble_via_pty": "⌨️ via terminal",
         "name_exists": "Session “{name}” already exists.",
         "limit_reached": (
             "Running session limit reached ({limit}). Close one "
