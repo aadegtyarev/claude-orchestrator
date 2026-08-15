@@ -168,3 +168,22 @@ def parse_termhistrun(data: str) -> tuple[int, str] | None:
         return int(thread_raw), digest
     except (IndexError, ValueError):
         return None
+
+
+def profhist_cb(thread_id: int, keep: bool) -> str:
+    """Ответ на вопрос «перенести историю при смене учётки».
+
+    Имя профиля в callback_data НЕ кладём: лимит Telegram — 64 байта, а имя
+    профиля бывает до 64 символов само по себе. Выбранное имя ждёт в памяти
+    адаптера (см. _pending_profile), сюда попадает только да/нет.
+    """
+    return f"profhist:{thread_id}:{'1' if keep else '0'}"
+
+
+def parse_profhist(data: str) -> tuple[int, bool] | None:
+    """(thread_id, переносить ли историю) либо None."""
+    try:
+        _, thread_raw, keep = data.split(":", 2)
+        return int(thread_raw), keep == "1"
+    except (IndexError, ValueError):
+        return None

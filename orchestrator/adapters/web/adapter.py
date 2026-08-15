@@ -519,12 +519,17 @@ class WebAdapter:
         if "profile" not in data:
             return self._err("profile required")
         profile = str(data.get("profile", "")).strip()
+        # keep_history — перенести транскрипт диалога в новую учётку. Умолчание
+        # False: копия переписки в чужую учётку — решение оператора (в SPA
+        # спрашивается), а не молчаливое поведение API.
+        keep_history = bool(data.get("keep_history"))
         try:
-            resumed = await self.core.switch_profile(session, profile)
+            resumed = await self.core.switch_profile(
+                session, profile, keep_history=keep_history)
         except UserError as e:
             return self._err(str(e))
         await self._sessions_changed()
-        return web.json_response({"resumed": resumed})
+        return web.json_response({"resumed": resumed, "kept_history": keep_history})
 
     @with_session
     async def h_info(self, request: web.Request, session: Session) -> web.Response:

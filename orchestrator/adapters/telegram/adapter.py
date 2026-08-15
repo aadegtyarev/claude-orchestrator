@@ -57,6 +57,10 @@ class TelegramAdapter:
         self.bot = Bot(token=config.telegram_bot_token)
         self.dp = Dispatcher()
         self.chat_id = config.telegram_chat_id
+        # Имя профиля, выбранное в /profile, пока оператор отвечает на вопрос
+        # про историю (имя сессии -> имя профиля). Только в памяти: кнопка
+        # переживает рестарт бота лишь визуально, и это честнее, чем угадывать.
+        self._pending_profile: dict[str, str] = {}
         self.t = core.t
         self._poll_task: asyncio.Task | None = None
         # (имя сессии, request_id) -> (message_id, исходный текст) — чтобы
@@ -470,6 +474,7 @@ class TelegramAdapter:
         dp.callback_query.register(self.on_esc_button, F.data.startswith("esc:"))
         dp.callback_query.register(self.on_bg_button, F.data.startswith("bg:"))
         dp.callback_query.register(self.on_model_button, F.data.startswith("model:"))
+        dp.callback_query.register(self.on_profhist_button, F.data.startswith("profhist:"))
         dp.callback_query.register(self.on_session_button, F.data.startswith("sess:"))
         dp.callback_query.register(self.on_perm_button, F.data.startswith("perm:"))
         dp.callback_query.register(self.on_delete_button, F.data.startswith("del:"))
@@ -1199,9 +1204,42 @@ class TelegramAdapter:
         # Снять кавычки: /profile "" — явный отказ от профиля (как /new --profile "").
         if len(arg) >= 2 and arg[0] in "\"'" and arg[-1] == arg[0]:
             arg = arg[1:-1].strip()
-        await self._switch_profile(session, arg, message)
+        # Переносить нечего (диалога ещё нет) — не задаём пустой вопрос.
+        if not await asyncio.to_thread(self.core.can_keep_history, session):
+            await self._switch_profile(session, arg, message)
+            return
+        thread_id = self._thread_of(session) or 0
+        self._pending_profile[session.name] = arg
+        await message.reply(
+            self.t("profile_history_ask", profile=arg or self.t("profile_none")),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text=self.t("profile_history_keep"),
+                                     callback_data=cbdata.profhist_cb(thread_id, True)),
+                InlineKeyboardButton(text=self.t("profile_history_fresh"),
+                                     callback_data=cbdata.profhist_cb(thread_id, False)),
+            ]]),
+        )
 
-    async def _switch_profile(self, session: Session, profile: str, message: Message) -> None:
+    async def on_profhist_button(self, callback: CallbackQuery) -> None:
+        """Ответ на вопрос про историю: меняем учётку с переносом или без."""
+        if not self._user_allowed(callback.from_user):
+            await callback.answer()
+            return
+        parsed = cbdata.parse_profhist(callback.data or "")
+        session = self._session_by_thread(parsed[0]) if parsed else None
+        # Выбранное имя живёт в памяти: после рестарта бота кнопка устарела —
+        # честно говорим об этом, а не меняем учётку на угаданную.
+        profile = self._pending_profile.pop(session.name, None) if session else None
+        if parsed is None or session is None or profile is None:
+            await callback.answer(self.t("profile_history_stale"))
+            return
+        await callback.answer()
+        if isinstance(callback.message, Message):
+            await self._switch_profile(session, profile, callback.message,
+                                       keep_history=parsed[1])
+
+    async def _switch_profile(self, session: Session, profile: str, message: Message,
+                              *, keep_history: bool = False) -> None:
         # message.answer() сам наследует message_thread_id исходного сообщения —
         # явно передавать нельзя (иначе TypeError: multiple values).
         label = profile or self.t("profile_none")
@@ -1209,11 +1247,12 @@ class TelegramAdapter:
             self.t("profile_switching", name=session.title, profile=label)
         )
         try:
-            resumed = await self.core.switch_profile(session, profile)
+            resumed = await self.core.switch_profile(
+                session, profile, keep_history=keep_history)
         except UserError as e:
             await status.edit_text(str(e))
             return
-        note = "" if resumed else self.t("profile_ctx_lost")
+        note = self.t("profile_history_kept") if resumed else self.t("profile_ctx_lost")
         await status.edit_text(self.t("profile_done", profile=label) + note)
 
     async def on_session_button(self, callback: CallbackQuery) -> None:

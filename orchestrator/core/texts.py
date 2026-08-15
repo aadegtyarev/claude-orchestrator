@@ -228,6 +228,15 @@ MESSAGES: dict[str, dict[str, str]] = {
         "profile_fail": "❌ Не удалось переключить на {profile}: {error}\nПрофиль остался прежним.",
         "profile_done": "🔀 Профиль: {profile}. Сессия готова.",
         "profile_ctx_lost": "\n⚠️ Прежний диалог не переносится — учётка сменилась.",
+        "profile_history_ask": (
+            "👤 Смена учётки на {profile}.\n"
+            "Перенести историю диалога? Транскрипт будет СКОПИРОВАН в новую "
+            "учётку — переписка окажется в двух местах."
+        ),
+        "profile_history_keep": "📜 Перенести историю",
+        "profile_history_fresh": "🆕 Чистый лист",
+        "profile_history_stale": "Кнопка устарела — повтори команду /profile с именем профиля.",
+        "profile_history_kept": "\n📜 Диалог перенесён в новую учётку.",
         "skills_none": "Скиллы не найдены.",
         "skills_header": "🧩 Скиллы ({n}). Вызываются просто текстом задачи:",
         "compact_sent": "🗜 Отправил /compact — контекст сессии будет сжат.",
@@ -654,6 +663,15 @@ MESSAGES: dict[str, dict[str, str]] = {
         "profile_fail": "❌ Failed to switch to {profile}: {error}\nProfile unchanged.",
         "profile_done": "🔀 Profile: {profile}. Session ready.",
         "profile_ctx_lost": "\n⚠️ The previous conversation is not carried over — the account changed.",
+        "profile_history_ask": (
+            "👤 Switching the account to {profile}.\n"
+            "Carry the dialog history over? The transcript will be COPIED into "
+            "the new account — the conversation ends up in two places."
+        ),
+        "profile_history_keep": "📜 Carry history over",
+        "profile_history_fresh": "🆕 Fresh start",
+        "profile_history_stale": "Button expired — repeat /profile with the profile name.",
+        "profile_history_kept": "\n📜 The dialog was carried over to the new account.",
         "skills_none": "No skills found.",
         "skills_header": "🧩 Skills ({n}). Invoke them with a plain task message:",
         "compact_sent": "🗜 Sent /compact — the session context will be compacted.",
