@@ -11,6 +11,9 @@ CLAUDE_CONFIG_DIR=<profile>/.claude валидны и снаружи, и изн�
 Это забота Слоя-CLI (box_cli), не автономного пакета box/: здесь только stdlib,
 никакого orchestrator — box_cli докидывает env-редирект + RW-бинд поверх Engine.
 
+Кроме учётки профиль несёт СВОЙ адрес API (`profile.toml`, ключ `base_url`) —
+см. раздел «настройки профиля» ниже.
+
 БЕЗОПАСНОСТЬ. Имя профиля идёт в path-join, поэтому валидируется СТРОГО и ДО
 любого пути (validate_name): allowlist [A-Za-z0-9._-], без пустого/`.`/`..`/`/`/
 ведущего `-`, длина ≤ 64. Так `../`, абсолютный путь, `~`, `foo/bar` отвергаются —
@@ -24,8 +27,17 @@ import contextlib
 import os
 import re
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, MutableMapping
+
+try:
+    import tomllib  # stdlib с 3.11
+except ModuleNotFoundError:  # Python 3.10
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]
+    except ModuleNotFoundError:  # без парсера настройки профиля недоступны
+        tomllib = None  # type: ignore[assignment]
 
 # Разрешённый набор символов имени. Полное совпадение (fullmatch) само по себе
 # режет `/`, `~`, пробелы, абсолютный путь; пустое/`.`/`..`/ведущий `-`/длину
@@ -222,6 +234,100 @@ def remove_profile(name: str) -> Path:
         else:
             shutil.rmtree(path)
     return path
+
+
+# ── настройки профиля (profile.toml) ─────────────────────────────────────────
+# Имя файла настроек внутри каталога профиля и переменная, которой он управляет.
+SETTINGS_NAME = "profile.toml"
+BASE_URL_VAR = "ANTHROPIC_BASE_URL"
+# Список ключей закрытый: неизвестный ключ — почти всегда опечатка, а промолчать
+# здесь значит увести учётку не на тот эндпоинт (см. load_settings).
+_SETTINGS_KEYS = ("base_url",)
+
+
+@dataclass(frozen=True)
+class ProfileSettings:
+    """Настройки профиля из `profile.toml`.
+
+    base_url: None — ключа нет, окружение не трогаем (поведение как раньше);
+    "" — ходить НАПРЯМУЮ (снять унаследованный ANTHROPIC_BASE_URL);
+    строка — этот адрес API для сессий профиля.
+    """
+
+    base_url: str | None = None
+
+
+def settings_path(name: str) -> Path:
+    """Путь `profile.toml` профиля <name> (файла может не быть)."""
+    return profile_dir(name) / SETTINGS_NAME
+
+
+def load_settings(name: str) -> ProfileSettings:
+    """Прочитать `profile.toml` профиля. Файла нет — пустые настройки.
+
+    Мусор в файле — ЧЕСТНЫЙ отказ, а не тихий игнор: опечатка в `base_url`
+    иначе молча оставила бы сессию на прежнем адресе, и разбираться пришлось бы
+    по симптому, который на адрес совсем не похож (см. apply_settings).
+    """
+    path = settings_path(name)
+    if not path.is_file():
+        return ProfileSettings()
+    if tomllib is None:  # Python 3.10 без tomli
+        raise ProfileError(
+            f"{path}: нет TOML-парсера (Python 3.10 без tomli) — настройки "
+            "профиля прочитать нечем; поставь tomli или Python ≥ 3.11.", code=1)
+    with _fs_errors(f"не удалось прочитать {path}"):
+        raw = path.read_bytes()
+    try:
+        data = tomllib.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+        raise ProfileError(f"{path}: не разобрать TOML: {e}") from e
+    unknown = sorted(set(data) - set(_SETTINGS_KEYS))
+    if unknown:
+        raise ProfileError(
+            f"{path}: неизвестные ключи: {', '.join(unknown)}; "
+            f"допустимо: {', '.join(_SETTINGS_KEYS)}.")
+    base = data.get("base_url")
+    if base is None:
+        return ProfileSettings()
+    if not isinstance(base, str):
+        raise ProfileError(f"{path}: base_url должен быть строкой.")
+    base = base.strip()
+    if base and "://" not in base:
+        raise ProfileError(
+            f"{path}: base_url «{base}» — ожидался URL со схемой "
+            "(https://api.anthropic.com); пустая строка = ходить напрямую.")
+    return ProfileSettings(base_url=base)
+
+
+def apply_settings(env: MutableMapping[str, str], name: str) -> None:
+    """Наложить настройки профиля на окружение claude (на месте).
+
+    Зачем это вообще есть. Адрес API — свойство УЧЁТКИ, а не машины. Учётка
+    Team берёт managed-настройки своей организации (`channelsEnabled`,
+    `enabledPlugins`, объявления, policy-limits) с эндпоинта настроек — и он
+    живёт только на прямом api.anthropic.com. Локальный прокси-релей обслуживает
+    один `/v1/messages`, всё остальное отдаёт 404, поэтому под таким адресом
+    орг-настройки до клиента НЕ доезжают: Claude Code честно считает каналы
+    выключенными и рисует «Channels are not enabled for your org», хотя админ их
+    включил. Проверено живьём 15.08.2026 на одних и тех же кредах Team-учётки:
+    прямой адрес — сообщение из канала приходит в сессию; тот же запуск через
+    прокси — /ping 200, /notify 200 и тишина (ровно баг из core/channelstate).
+
+    Один общий `CLAUDE_ENV_ANTHROPIC_BASE_URL` на весь оркестратор такой выбор
+    выразить не мог: личной учётке прокси нужен, командной — противопоказан.
+    Поэтому адрес переехал к профилю, а `base_url = ""` умеет СНЯТЬ
+    унаследованную переменную — иначе от глобального прокси было бы не отписаться.
+
+    Профиль без `profile.toml` окружение не трогает — прежнее поведение.
+    """
+    settings = load_settings(name)
+    if settings.base_url is None:
+        return
+    if settings.base_url:
+        env[BASE_URL_VAR] = settings.base_url
+    else:
+        env.pop(BASE_URL_VAR, None)
 
 
 def profile_env(name: str, *, engine: str) -> tuple[dict[str, str], Path]:

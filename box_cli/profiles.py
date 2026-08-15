@@ -14,29 +14,41 @@
 from __future__ import annotations
 
 from box.profiles import (  # noqa: F401
+    BASE_URL_VAR,
     MAX_NAME_LEN,
     ProfileError,
+    ProfileSettings,
+    SETTINGS_NAME,
+    apply_settings,
     config_dir,
     ensure_profile,
     list_profiles,
+    load_settings,
     profile_dir,
     profile_env,
     profiles_root,
     real_config_dir,
     remove_profile,
+    settings_path,
     validate_name,
 )
 
 __all__ = [
+    "BASE_URL_VAR",
     "MAX_NAME_LEN",
     "ProfileError",
+    "ProfileSettings",
+    "SETTINGS_NAME",
+    "apply_settings",
     "config_dir",
     "ensure_profile",
     "list_profiles",
+    "load_settings",
     "profile_dir",
     "profile_env",
     "profiles_root",
     "real_config_dir",
     "remove_profile",
+    "settings_path",
     "validate_name",
 ]
