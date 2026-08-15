@@ -338,6 +338,9 @@ class WebAdapter:
             "box": self.core.box_mark(session).strip(),
             # Учётка сессии, если она не дефолтная (пусто = как в .env).
             "profile": self.core.profile_mark(session).strip(),
+            # Пометка «dev-канал не загрузился» (пусто = штатно): сообщения
+            # доставляются в обход, через терминал сессии.
+            "channel": self.core.channel_mark(session).strip(),
         }
 
     def _sessions_info(self) -> list[dict]:

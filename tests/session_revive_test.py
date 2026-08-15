@@ -28,6 +28,7 @@ os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123:fake")
 import aiohttp  # noqa: E402
 
 from orchestrator.core.app import OrchestratorCore, UserError  # noqa: E402
+from orchestrator.core.sessions import SessionError  # noqa: E402
 
 
 def _conn_error() -> aiohttp.ClientConnectorError:
@@ -75,7 +76,7 @@ def _core(manager) -> OrchestratorCore:
     return core
 
 
-SESSION = SimpleNamespace(name="ikar", running=True)
+SESSION = SimpleNamespace(name="ikar", running=True, channel_blocked=False)
 ORIGIN = SimpleNamespace(adapter="telegram")
 
 
@@ -105,6 +106,22 @@ async def test_revive_happens_once_then_honest_error():
     print("OK повторный сбой: ровно один переподъём, затем честная ошибка")
 
 
+async def test_dead_pty_revives_too():
+    """Второй вход в сессию — терминал — лечится тем же переподъёмом.
+
+    При заблокированном канале доставка идёт не по HTTP, а вставкой в PTY, и
+    мёртвый терминал приходит как SessionError, а не ClientConnectorError.
+    Раньше эта ветка мимо revive отдавала оператору сырую ошибку.
+    """
+    mgr = _Manager(fail_times=1,
+                   exc_factory=lambda: SessionError("Терминал сессии недоступен: EIO"))
+    core = _core(mgr)
+    await core.user_message(SESSION, "привет", ORIGIN)
+    assert mgr.revived == 1, f"переподъём не сделан: {mgr.revived}"
+    assert mgr.sent == ["привет"], f"сообщение не доехало: {mgr.sent}"
+    print("OK мёртвый терминал: сессия переподнята, сообщение доставлено")
+
+
 async def test_non_network_failure_does_not_revive():
     """Не-сетевой сбой отправки лечится не переподъёмом — сессию не трогаем."""
     mgr = _Manager(fail_times=1, exc_factory=lambda: RuntimeError("boom"))
@@ -122,6 +139,7 @@ async def test_non_network_failure_does_not_revive():
 def main() -> None:
     asyncio.run(test_dead_channel_revives_and_delivers())
     asyncio.run(test_revive_happens_once_then_honest_error())
+    asyncio.run(test_dead_pty_revives_too())
     asyncio.run(test_non_network_failure_does_not_revive())
     print("ALL SESSION-REVIVE OK")
 

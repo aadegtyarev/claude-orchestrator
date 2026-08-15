@@ -144,6 +144,7 @@ class OrchestratorCore:
         self.session_hooks: list[Callable[[Session], Awaitable[None]]] = []
         manager.on_dead = self.notify_session_dead
         manager.on_docker_launch = self.notify_docker_launch
+        manager.on_channel_blocked = self.notify_channel_blocked
 
     def t(self, key: str, **kwargs) -> str:
         return self._texts[key].format(**kwargs)
@@ -687,6 +688,12 @@ class OrchestratorCore:
             return ""
         return self.t("profile_mark", profile=profile)
 
+    def channel_mark(self, session: Session) -> str:
+        """Пометка «канал не загрузился» для списка сессий (пусто, если всё в
+        порядке). Сессия при этом рабочая — но доставка идёт через терминал, и
+        оператор должен видеть, что режим не штатный."""
+        return self.t("channel_blocked_mark") if session.channel_blocked else ""
+
     def profile_display(self, session: Session) -> str:
         """Учётка сессии для показа: имя профиля или «общая учётка оркестратора»."""
         profile = self.manager.profile_of(session)
@@ -738,16 +745,19 @@ class OrchestratorCore:
                 await self.manager.send_to_claude(
                     session, text, self.context_id(session, origin)
                 )
-            except aiohttp.ClientConnectorError:
-                # Канал сессии не отвечает, хотя процесс числится живым (типовой
-                # случай: claude жив, а его channel-сервер умер/не поднялся —
-                # например после рестарта оркестратора). Раньше это всплывало
-                # оператору сырым «Cannot connect to host 127.0.0.1:PORT», хотя
-                # чинится тривиально — переподнять сессию. Делаем это САМИ и
-                # ровно один раз: молча пересобираем сессию и повторяем отправку;
-                # не помогло — отдаём честную ошибку прежним путём.
+            except (aiohttp.ClientConnectorError, SessionError):
+                # Вход в сессию не отвечает, хотя процесс числится живым.
+                # Типовой случай: claude жив, а его channel-сервер умер/не
+                # поднялся — например после рестарта оркестратора. Раньше это
+                # всплывало оператору сырым «Cannot connect to host
+                # 127.0.0.1:PORT», хотя чинится тривиально — переподнять сессию.
+                # Делаем это САМИ и ровно один раз: молча пересобираем сессию и
+                # повторяем отправку; не помогло — отдаём честную ошибку прежним
+                # путём. SessionError ловим ради второго входа: при
+                # заблокированном канале доставка идёт в PTY, и мёртвый терминал
+                # приходит именно так — тому пути нужно то же самолечение.
                 logger.warning(
-                    "Сессия %s: канал не отвечает — переподнимаю и повторяю отправку",
+                    "Сессия %s: вход не отвечает — переподнимаю и повторяю отправку",
                     session.name)
                 await self.manager.revive(session)
                 await self._notify_state_changed(session)
@@ -765,7 +775,10 @@ class OrchestratorCore:
         self._record(session, "user", text=text, via=origin.adapter)
         self.tools.forget(session.name)  # новый ход — сброс bg-состояния
         snippet = html.escape(shorten(text, 28))
-        await self.bubbles.append(session.name, f"📨 {snippet}")
+        # Канал заблокирован — сообщение ушло не push'ем, а в терминал сессии;
+        # помечаем прямо в бабле, чтобы нештатный путь был виден на каждом ходе.
+        via = f" ({self.t('bubble_via_pty')})" if session.channel_blocked else ""
+        await self.bubbles.append(session.name, f"📨 {snippet}{via}")
         self.turns.start(session.name)
 
     async def request_report(self, session: Session, origin: Origin) -> None:
@@ -1868,6 +1881,15 @@ class OrchestratorCore:
         if tail:
             text += "\n\n" + self.t("session_died_tail", tail=tail[:1500])
         await self.notice(session, text)
+
+    async def notify_channel_blocked(self, session: Session) -> None:
+        """Колбэк SessionManager: dev-канал сессии не загрузился (орг-политика
+        учётки). Сессия рабочая, но push в неё не доходит — доставляем через её
+        терминал. Молчать нельзя: раньше это выглядело как «модель думает»."""
+        await self.notice(
+            session,
+            self.t("channel_blocked", profile=self.profile_display(session)),
+        )
 
     async def notify_docker_launch(self, name: str, summary: str) -> None:
         """Колбэк docker-прокси: модель запустила контейнер — подсветить в бабле."""

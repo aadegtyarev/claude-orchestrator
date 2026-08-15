@@ -602,7 +602,11 @@ class TelegramAdapter:
             line = f"{status} — {s.title}"
             if s.model:
                 line += f" [{s.model}]"
-            line += self.core.box_mark(s) + self.core.profile_mark(s)
+            line += (
+                self.core.box_mark(s)
+                + self.core.profile_mark(s)
+                + self.core.channel_mark(s)
+            )
             if s.running:
                 uptime = self.core.fmt_duration(time.time() - s.started_at)
                 line += ", " + self.t("uptime", uptime=uptime)

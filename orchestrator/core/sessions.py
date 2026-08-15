@@ -20,6 +20,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import shutil
 import socket
 import sys
@@ -35,6 +36,12 @@ from . import hookscript
 from . import resources
 from . import transcript
 from .ansi import strip_ansi
+from .channelstate import (
+    BLOCKED as CHANNEL_BLOCKED,
+    SCAN_BYTES,
+    UNKNOWN,
+    channel_state,
+)
 from .proctree import proc_tree_signals
 from .slug import slugify  # реэкспорт: адаптеры и тесты ждут sessions.slugify
 from .. import runners as runner_mod
@@ -77,6 +84,15 @@ RESUME_GRACE = 5.0
 # процесса claude, но channel-сервер (MCP-подпроцесс) на порту ещё не слушает →
 # ConnectionRefused. Короткий ретрай закрывает стартовое окно (обычно 1-3с).
 SEND_RETRY_TIMEOUT = 20.0
+# Пауза между вставкой текста (bracketed paste) и Enter при доставке через
+# терминал: TUI обрабатывает вставку асинхронно, приклеенный Enter иногда
+# приходит раньше, чем текст осел в поле ввода.
+PASTE_ENTER_DELAY = 0.4
+# Открывающая/закрывающая скобка тега <channel …> в тексте сообщения. Нужна,
+# чтобы содержимое не могло разорвать конверт при доставке через терминал
+# (см. SessionManager.channel_envelope). Пробелы после `<` тоже ловим: разметку
+# читает модель, а не парсер, и `< /channel>` она поймёт как закрытие.
+_CHANNEL_TAG_RE = re.compile(r"<(?=\s*/?\s*channel\b)", re.IGNORECASE)
 
 
 class SessionError(Exception):
@@ -124,6 +140,17 @@ class Session:
     # запросе или /perms auto). Только в памяти: после рестарта снова спросит —
     # осознанно не персистим (модель получает carta blanca на хосте сессии).
     auto_allow: bool = False
+    # Загрузился ли dev-канал у ЭТОГО процесса Claude. None = ещё не смотрели.
+    # True = Claude нарисовал баннер «Channels are not enabled for your org»
+    # (орг-политика учётки режет --dangerously-load-development-channels): push
+    # через channel-сервер уходит в никуда, доставка идёт через PTY (см.
+    # SessionManager.send_to_claude). Только в памяти: свойство ЗАПУЩЕННОГО
+    # процесса, определяется заново при каждом старте.
+    channel_blocked: bool | None = None
+    # Смещение в claude.log, с которого начинается вывод ТЕКУЩЕГО процесса
+    # (лог накопительный и переживает рестарты). Нужно, чтобы не принять
+    # баннеры прошлого запуска за состояние нынешнего.
+    log_offset: int = 0
     started_at: float = field(default_factory=time.time)
     last_activity: float = field(default_factory=time.time)
     process: asyncio.subprocess.Process | None = None
@@ -142,6 +169,10 @@ class Session:
     bg_seen: set = field(default_factory=set)
     # Сериализация операций жизненного цикла этой сессии.
     ops: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Сериализация вставок в терминал (paste_into_pty). Отдельно от ops: вставка
+    # держит лок ~0.4с (пауза перед Enter), а ops берут короткие операции
+    # жизненного цикла — общий лок заставил бы их ждать доставку сообщения.
+    paste: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def __post_init__(self):
         if not self.title:
@@ -181,6 +212,10 @@ class SessionManager:
         self.on_dead: Callable[[Session, int], Awaitable[None]] | None = None
         # Подсветка запуска docker в бабле (session_name, summary); ставит ядро.
         self.on_docker_launch: Callable[[str, str], Awaitable[None]] | None = None
+        # «Канал сессии не загрузился» (session); ставит ядро — сказать оператору.
+        # Без этого сессия молча числилась бы живой и рабочей, а сообщения
+        # уходили бы в никуда (см. probe_channel).
+        self.on_channel_blocked: Callable[[Session], Awaitable[None]] | None = None
         # Модули дописывают env для процесса claude (напр. wallet: $NAME для
         # секретов — маркер/значение). Синхронные, session -> {ИМЯ: значение}.
         self.env_hooks: list[Callable[[Session], dict[str, str]]] = []
@@ -873,8 +908,17 @@ class SessionManager:
         else:
             session_arg += ["--permission-mode", self.config.permission_mode]
 
-        self._rotate_log(session.session_dir / "claude.log")
-        session.log_file = open(session.session_dir / "claude.log", "ab")
+        log_path = session.session_dir / "claude.log"
+        self._rotate_log(log_path)
+        # Состояние канала — свойство ИМЕННО этого процесса: сбрасываем и
+        # запоминаем, с какого места в накопительном логе начинается его вывод
+        # (иначе баннеры прошлого запуска сойдут за нынешние).
+        session.channel_blocked = None
+        try:
+            session.log_offset = log_path.stat().st_size
+        except OSError:
+            session.log_offset = 0
+        session.log_file = open(log_path, "ab")
         # box-драйвер отдаёт вывод claude через колбэк — пишем его в лог сессии.
         # Захватываем конкретный log_file (не session.log_file): при рестарте
         # сессии там окажется новый файл, а этот драйвер владеет прежним PTY и
@@ -959,6 +1003,65 @@ class SessionManager:
         except OSError as e:
             logger.warning("Ротация лога %s не удалась: %s", path, e)
 
+    async def _report_channel_blocked(self, session: Session) -> None:
+        """Сказать оператору, что канал не загрузился. Сбой колбэка не должен
+        валить старт сессии — она рабочая, просто доставка идёт через терминал."""
+        if self.on_channel_blocked is None:
+            return
+        try:
+            await self.on_channel_blocked(session)
+        except Exception:
+            logger.exception("on_channel_blocked для сессии %s", session.name)
+
+    def probe_channel(self, session: Session) -> bool | None:
+        """Загрузился ли dev-канал у текущего процесса. Пишет session.channel_blocked.
+
+        Смотрим НАЧАЛО вывода этого процесса — от log_offset и не дальше
+        SCAN_BYTES: `Channels (experimental) …` — канал жив, `Channels are not
+        enabled for your org …` — отбит орг-политикой учётки. Ни того, ни
+        другого (баннер ещё не нарисован) — оставляем None и не трогаем прежний
+        вердикт: неизвестность не должна выключать нормальную доставку.
+
+        Именно начало, а не хвост: баннер печатается на старте, а дальше в лог
+        наматывается беседа — и цитата баннера в разговоре неотличима от него
+        самого (см. channelstate). На проде на этом и погорели: сессия с живым
+        каналом получила «заблокирован», потому что обсуждала текст баннера.
+
+        Синхронная (файловый ввод-вывод) — зовётся через asyncio.to_thread.
+        """
+        log_path = session.session_dir / "claude.log"
+        try:
+            with open(log_path, "rb") as fh:
+                fh.seek(session.log_offset)
+                raw = fh.read(SCAN_BYTES)
+        except OSError as e:
+            logger.debug("probe_channel(%s): лог недоступен: %s", session.name, e)
+            return session.channel_blocked
+        state = channel_state(raw)
+        if state == UNKNOWN:
+            # Окно набралось целиком, а баннера в нём нет — детектор ослеп, и
+            # молчать об этом нельзя: вердикт останется None, доставка пойдёт по
+            # HTTP, и если канал на самом деле отбит — вернётся ровно тот баг,
+            # который всё это чинит (200 в никуда, сессия немая). На живых логах
+            # баннер лежит в первых ~4 КБ вывода, так что сюда мы попадём только
+            # при небывало шумном старте — но тогда это будет видно.
+            if len(raw) >= SCAN_BYTES:
+                logger.warning(
+                    "Сессия %s: в первых %d КБ вывода нет баннера каналов — "
+                    "состояние канала неизвестно, доставляю как обычно (HTTP)",
+                    session.name, SCAN_BYTES // 1024,
+                )
+            return session.channel_blocked
+        blocked = state == CHANNEL_BLOCKED
+        if blocked and not session.channel_blocked:
+            logger.warning(
+                "Сессия %s: dev-канал не загружен (орг-политика учётки) — "
+                "push не доходит, доставляю сообщения через терминал",
+                session.name,
+            )
+        session.channel_blocked = blocked
+        return blocked
+
     async def _wait_ready(self, session: Session) -> None:
         """Готовность = channel-сервер отвечает на /ping (его поднял Claude)."""
         loop = asyncio.get_running_loop()
@@ -991,6 +1094,12 @@ class SessionManager:
                         # ушло бы спурьёзным сообщением от лица пользователя.
                         if session.dialog_answerer is not None:
                             session.dialog_answerer.stop()
+                        # /ping отвечает channel-сервер, а он поднимается
+                        # обычным --mcp-config и жив даже когда САМ канал
+                        # отбит орг-политикой учётки. Смотрим лог: заблокирован
+                        # ли канал у этого процесса (см. probe_channel).
+                        if await asyncio.to_thread(self.probe_channel, session):
+                            await self._report_channel_blocked(session)
                         return
             except (aiohttp.ClientError, asyncio.TimeoutError):
                 pass
@@ -1361,6 +1470,17 @@ class SessionManager:
 
     async def send_to_claude(self, session: Session, text: str, context_id: str) -> None:
         session.last_activity = time.time()
+        # Канал отбит орг-политикой учётки — push через channel-сервер вернёт
+        # 200 и растворится (см. channelstate). Единственный оставшийся вход в
+        # сессию — её терминал, им и доставляем.
+        if session.channel_blocked is None:
+            # На момент готовности (/ping) баннер мог быть ещё не нарисован —
+            # доспрашиваем лог при первом же сообщении, пока вердикта нет.
+            if await asyncio.to_thread(self.probe_channel, session):
+                await self._report_channel_blocked(session)
+        if session.channel_blocked:
+            await self.paste_into_pty(session, self.channel_envelope(session, text, context_id))
+            return
         http = self._http_session()
         loop = asyncio.get_running_loop()
         deadline = loop.time() + SEND_RETRY_TIMEOUT
@@ -1480,11 +1600,18 @@ class SessionManager:
             resp.raise_for_status()
 
     def _send_raw(self, session: Session, data: bytes) -> None:
-        """Записать сырые байты (управляющие коды) прямо в PTY claude."""
+        """Записать сырые байты (управляющие коды) прямо в PTY claude.
+
+        Дописываем хвост в цикле: PTY принимает не весь буфер за раз, и длинная
+        вставка (сообщение оператора через paste_into_pty) обрезалась бы. Для
+        однобайтовых управляющих кодов (Esc, Ctrl+B) цикл — no-op.
+        """
         if session.pty_master is None or not session.running:
             raise SessionError("Сессия не запущена.")
         try:
-            os.write(session.pty_master, data)
+            while data:
+                n = os.write(session.pty_master, data)
+                data = data[n:]
         except OSError as e:
             raise SessionError(f"Терминал сессии недоступен: {e}") from e
 
@@ -1505,6 +1632,60 @@ class SessionManager:
         ход продолжается, не блокируясь на ней. Эквивалент нажатия Ctrl+B в
         терминале сессии."""
         self._send_raw(session, b"\x02")
+
+    @staticmethod
+    def channel_envelope(session: Session, text: str, context_id: str) -> str:
+        """Сообщение оператора в том же конверте, в каком его отдаёт канал.
+
+        Claude Code показывает push-уведомление канала модели как
+        `<channel source="channel-<имя>" context_id="…">текст</channel>` — это
+        описано в instructions канала (channel_server.INSTRUCTIONS), и модель по
+        нему знает, с каким context_id звать reply_to_user. При доставке через
+        терминал (канал заблокирован орг-политикой) конверт обязан быть тем же,
+        иначе модель ответит в чат «мимо» — с пустым или чужим context_id.
+
+        Текст обезвреживаем. У настоящего канала такой заботы не нужно: там
+        `content` и `context_id` — раздельные поля JSON, конверт рисует сам
+        Claude Code, и содержимое до разметки не дотягивается. Здесь мы клеим
+        строку, поэтому сообщение с `</channel>` внутри (хоть в пересланной
+        цитате, хоть в куске лога) закрыло бы конверт и открыло следующий — с
+        любым чужим context_id, то есть ответ ушёл бы не в тот чат. Правка
+        МИНИМАЛЬНАЯ: `<` экранируется только там, где начинается тег
+        `channel`/`/channel`; прочие угловые скобки (код, диффы, HTML) остаются
+        как есть, чтобы модель видела текст оператора неискажённым.
+        """
+        return (
+            f'<channel source="channel-{session.name}" '
+            f'context_id="{_CHANNEL_TAG_RE.sub("&lt;", context_id)}">'
+            f'{_CHANNEL_TAG_RE.sub("&lt;", text)}</channel>'
+        )
+
+    async def paste_into_pty(self, session: Session, text: str) -> None:
+        """Вставить произвольный (в т.ч. многострочный) текст в терминал Claude
+        и отправить его.
+
+        Не `type_into_pty`: тот режет всё непечатное, включая переводы строк, —
+        для слэш-команды это правильно, а сообщение оператора многострочно.
+        Шлём в режиме bracketed paste (`ESC[200~ … ESC[201~`): TUI Claude Code
+        его понимает и не принимает внутренние `\\n` за Enter (иначе первая
+        строка ушла бы сообщением, а остальные — отдельными).
+
+        Enter отбиваем ОТДЕЛЬНОЙ записью после паузы: TUI обрабатывает вставку
+        асинхронно, и приклеенный к ней `\\r` иногда приходит раньше, чем текст
+        осел в поле ввода (уходило пустое сообщение).
+
+        Вся пара «вставка + Enter» держит `session.paste`: без лока два
+        одновременных сообщения (оператор шлёт второе, не дождавшись; телеграм и
+        веб разом) записались бы как payload1, payload2, enter1, enter2 — оба
+        текста слиплись бы в поле ввода до первого Enter, а второй Enter ушёл бы
+        по пустому вводу.
+        """
+        clean = "".join(ch for ch in text if ch == "\n" or ch.isprintable())
+        payload = b"\x1b[200~" + clean.encode() + b"\x1b[201~"
+        async with session.paste:
+            self._send_raw(session, payload)
+            await asyncio.sleep(PASTE_ENTER_DELAY)
+            self._send_raw(session, b"\r")
 
     def type_into_pty(self, session: Session, text: str) -> None:
         """Напечатать команду прямо в терминал Claude (слэш-команды CC)."""

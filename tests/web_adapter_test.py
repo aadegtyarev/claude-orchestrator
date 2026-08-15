@@ -58,6 +58,10 @@ def make_env(tmp: Path):
             # Пометка нестандартной учётки (`--profile`); у фейка её нет.
             return ""
 
+        def channel_mark(self, s):
+            # Пометка «dev-канал не загрузился»; у фейка канал в порядке.
+            return ""
+
         def box_choices(self):
             return ["bwrap", "off"]
 
