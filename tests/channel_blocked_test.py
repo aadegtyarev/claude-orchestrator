@@ -70,12 +70,12 @@ def test_channel_state():
     print("OK детектор: живой/заблокированный канал, перенос строки, последний баннер")
 
 
-def _session(tmp: Path, **kw):
-    log = tmp / "claude.log"
+def _session(tmp_path: Path, **kw):
+    log = tmp_path / "claude.log"
     session = SimpleNamespace(
         name="ikar",
         port=33941,
-        session_dir=tmp,
+        session_dir=tmp_path,
         channel_blocked=None,
         log_offset=0,
         last_activity=0.0,
@@ -87,10 +87,10 @@ def _session(tmp: Path, **kw):
     return session, log
 
 
-def test_probe_reads_only_current_process(tmp: Path):
+def test_probe_reads_only_current_process(tmp_path: Path):
     """Баннеры прошлого запуска не должны становиться вердиктом нынешнего."""
     mgr = SessionManager.__new__(SessionManager)
-    session, log = _session(tmp)
+    session, log = _session(tmp_path)
 
     # Прошлый процесс работал с живым каналом, нынешний — уже без.
     log.write_bytes(BANNER_OK)
@@ -100,7 +100,7 @@ def test_probe_reads_only_current_process(tmp: Path):
     assert session.channel_blocked is True
 
     # И наоборот: прошлый упирался в блок, нынешний поднял канал.
-    session2, log2 = _session(tmp)
+    session2, log2 = _session(tmp_path)
     log2.write_bytes(BANNER_BLOCKED)
     session2.log_offset = log2.stat().st_size
     with open(log2, "ab") as fh:
@@ -110,10 +110,10 @@ def test_probe_reads_only_current_process(tmp: Path):
     print("OK probe_channel: смотрит только вывод текущего процесса (log_offset)")
 
 
-def test_probe_unknown_keeps_verdict(tmp: Path):
+def test_probe_unknown_keeps_verdict(tmp_path: Path):
     """Баннера ещё нет — прежний вердикт не трогаем (неизвестность не лечим)."""
     mgr = SessionManager.__new__(SessionManager)
-    session, log = _session(tmp, channel_blocked=True)
+    session, log = _session(tmp_path, channel_blocked=True)
     log.write_bytes(b"no banner here yet")
     assert mgr.probe_channel(session) is True, "вердикт не должен сбрасываться"
 
@@ -122,7 +122,7 @@ def test_probe_unknown_keeps_verdict(tmp: Path):
     print("OK probe_channel: без баннера прежний вердикт сохраняется")
 
     # Лога вовсе нет (сессия только создана) — не падаем.
-    session2, _ = _session(tmp / "nope")
+    session2, _ = _session(tmp_path / "nope")
     assert mgr.probe_channel(session2) is None
     print("OK probe_channel: отсутствующий лог не роняет пробу")
 
@@ -145,13 +145,13 @@ def _mgr_with_pty(http, writes: list[bytes]):
     return mgr
 
 
-async def test_blocked_delivers_via_pty(tmp: Path):
+async def test_blocked_delivers_via_pty(tmp_path: Path):
     """Канал заблокирован → печатаем в PTY в конверте канала, HTTP не трогаем."""
     sessions.PASTE_ENTER_DELAY = 0.0  # тест не должен ждать
     writes: list[bytes] = []
     http = _FakeHttp()
     mgr = _mgr_with_pty(http, writes)
-    session, _ = _session(tmp, channel_blocked=True)
+    session, _ = _session(tmp_path, channel_blocked=True)
 
     await mgr.send_to_claude(session, "первая строка\nвторая строка", "telegram:x:1:2:3")
 
@@ -188,12 +188,12 @@ class _OkHttp:
         return _CM()
 
 
-async def test_healthy_channel_uses_http(tmp: Path):
+async def test_healthy_channel_uses_http(tmp_path: Path):
     """Живой канал — прежний путь: HTTP push, в PTY ничего не пишем."""
     writes: list[bytes] = []
     http = _OkHttp()
     mgr = _mgr_with_pty(http, writes)
-    session, _ = _session(tmp, channel_blocked=False)
+    session, _ = _session(tmp_path, channel_blocked=False)
 
     await mgr.send_to_claude(session, "привет", "ctx")
 
@@ -202,7 +202,7 @@ async def test_healthy_channel_uses_http(tmp: Path):
     print("OK живой канал: доставка как прежде, по HTTP")
 
 
-async def test_unknown_probes_before_sending(tmp: Path):
+async def test_unknown_probes_before_sending(tmp_path: Path):
     """Вердикта ещё нет → доспрашиваем лог прямо перед отправкой."""
     sessions.PASTE_ENTER_DELAY = 0.0
     writes: list[bytes] = []
@@ -210,7 +210,7 @@ async def test_unknown_probes_before_sending(tmp: Path):
     mgr = _mgr_with_pty(http, writes)
     reported: list[str] = []
     mgr._report_channel_blocked = lambda s: reported.append(s.name) or asyncio.sleep(0)
-    session, log = _session(tmp)
+    session, log = _session(tmp_path)
     log.write_bytes(BANNER_BLOCKED)
 
     await mgr.send_to_claude(session, "привет", "ctx")
@@ -226,12 +226,12 @@ def main():
 
     test_channel_state()
     with tempfile.TemporaryDirectory() as raw:
-        tmp = Path(raw)
-        test_probe_reads_only_current_process(tmp)
-        test_probe_unknown_keeps_verdict(tmp)
-        asyncio.run(test_blocked_delivers_via_pty(tmp))
-        asyncio.run(test_healthy_channel_uses_http(tmp))
-        asyncio.run(test_unknown_probes_before_sending(tmp))
+        tmp_path = Path(raw)
+        test_probe_reads_only_current_process(tmp_path)
+        test_probe_unknown_keeps_verdict(tmp_path)
+        asyncio.run(test_blocked_delivers_via_pty(tmp_path))
+        asyncio.run(test_healthy_channel_uses_http(tmp_path))
+        asyncio.run(test_unknown_probes_before_sending(tmp_path))
     print("ALL CHANNEL-BLOCKED OK")
 
 
