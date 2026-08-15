@@ -246,6 +246,7 @@ class WebAdapter:
         r.add_post("/api/sessions/{name}/model", self.h_model)
         r.add_post("/api/sessions/{name}/profile", self.h_profile)
         r.add_get("/api/sessions/{name}/bubble", self.h_bubble)
+        r.add_get("/api/sessions/{name}/info", self.h_info)
         r.add_get("/api/sessions/{name}/stats", self.h_stats)
         r.add_get("/api/sessions/{name}/usage", self.h_usage)
         r.add_get("/api/sessions/{name}/history", self.h_history)
@@ -524,6 +525,11 @@ class WebAdapter:
             return self._err(str(e))
         await self._sessions_changed()
         return web.json_response({"resumed": resumed})
+
+    @with_session
+    async def h_info(self, request: web.Request, session: Session) -> web.Response:
+        # Разметку ядра снимаем: веб печатает нотисы экранированным текстом.
+        return web.json_response({"text": self.core.plain(self.core.info_text(session))})
 
     @with_session
     async def h_stats(self, request: web.Request, session: Session) -> web.Response:

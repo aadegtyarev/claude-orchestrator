@@ -1293,6 +1293,74 @@ class OrchestratorCore:
         model = (stats or self.manager.read_stats(session) or {}).get("model", "")
         return model or session.model or self.t("default_model")
 
+    @staticmethod
+    def plain(text: str) -> str:
+        """Тот же текст без HTML-разметки — для интерфейсов, где её нет.
+
+        Тексты ядра размечены под Telegram (<b>, <code>), а веб печатает нотисы
+        экранированным текстом: без снятия тегов оператор увидел бы «<b>» глазами.
+        Одна функция в ядре вместо копии регулярки в каждом адаптере.
+        """
+        return html.unescape(re.sub(r"<[^>]+>", "", text))
+
+    @staticmethod
+    def _tilde(path: Path | str) -> str:
+        """Путь для показа: ~/… вместо полного (короче и без имени юзера)."""
+        text = str(path)
+        home = str(Path.home())
+        return "~" + text[len(home):] if text == home or text.startswith(home + "/") else text
+
+    def info_text(self, session: Session) -> str:
+        """Паспорт сессии: под какой учёткой, через какой адрес API и в каком
+        движке она РАБОТАЕТ.
+
+        Зачем отдельная команда. Настройки сессии размазаны по трём источникам
+        (`.env`, `profile.toml` профиля, флаги `/new`), а живая сессия к тому же
+        могла подняться ДО правки любого из них — по интерфейсу это было не
+        видно вообще никак. Живой случай 15.08.2026: сессия молча ходила через
+        прокси-релей, из-за чего до учётки Team не доезжали managed-настройки
+        организации и умирал dev-канал; в `/list` и `/stats` не было ни одного
+        поля, по которому это можно было заметить. Адрес API поэтому берётся из
+        окружения ЖИВОГО процесса (см. SessionManager.api_base_url), а не из
+        конфига — иначе команда показывала бы намерение вместо факта.
+
+        Блокирующего I/O здесь нет (чтение /proc — из памяти ядра), так что
+        поток не нужен.
+        """
+        engine = self.manager.engine_of(session)
+        vm = engine == "agent-vm"
+        base_url, live = self.manager.api_base_url(session)
+        # Под agent-vm учётка живёт в госте: показывать хостовый каталог
+        # значило бы соврать (гость его игнорирует, замер F4).
+        account = self.t("info_account_vm") if vm else self._tilde(
+            self.manager.config_dir_of(session) or Path.home() / ".claude")
+        if session.channel_blocked is None:
+            channel = self.t("info_channel_ok" if session.running
+                             else "info_channel_unknown")
+        else:
+            channel = self.t("info_channel_blocked" if session.channel_blocked
+                             else "info_channel_ok")
+        return self.t(
+            "info_body",
+            header=f"{session.title}" + (
+                "" if session.running else self.t("stats_stopped_suffix")),
+            profile=self.profile_display(session),
+            account=account,
+            api=base_url or self.t("info_api_direct"),
+            api_src="" if live else self.t("info_api_config"),
+            sandbox=self.box_name(engine),
+            wallet=self.t("stats_wallet_on" if "wallet" in self.config.modules
+                          and engine == "bwrap" else "stats_wallet_off"),
+            model=session.model or self.config.default_model
+            or self.t("info_default"),
+            effort=self.config.default_effort or self.t("info_default"),
+            perms=self.config.permission_mode,
+            perms_auto=(" · " + self.t("perms_auto_yes")) if session.auto_allow else "",
+            channel=channel,
+            cwd=self._tilde(self.manager.effective_cwd(session)),
+            uptime=self.fmt_duration(time.time() - session.started_at),
+        )
+
     def stats_text(self, session: Session) -> str:
         """Блокирующее чтение транскрипта — вызывать через asyncio.to_thread."""
         stats = self.manager.read_stats(session)

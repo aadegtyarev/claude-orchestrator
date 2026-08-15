@@ -1754,6 +1754,35 @@ class SessionManager:
             return self.config.claude_profile
         return session.profile or None
 
+    def api_base_url(self, session: Session) -> tuple[str | None, bool]:
+        """Адрес API сессии: (значение или None = прямой api.anthropic.com, живое ли).
+
+        Второй элемент True — прочитано из окружения ЗАПУЩЕННОГО процесса, а не
+        посчитано из конфига. Разница существенная: `.env` и `profile.toml`
+        правят на живой машине, и сессия, поднятая до правки, работает со
+        СТАРЫМ значением. Показывать в такой ситуации конфиг — врать оператору
+        ровно там, где он пришёл проверить факт (см. историю с прокси, из-за
+        которого молча отваливались орг-настройки и канал).
+
+        Под agent-vm процесс claude живёт в госте, и хостовый /proc про него
+        ничего не знает — там честно считаем из конфига (False).
+        """
+        proc = session.process
+        if proc is not None and proc.returncode is None and self.engine_of(session) != "agent-vm":
+            try:
+                raw = Path(f"/proc/{proc.pid}/environ").read_bytes()
+            except OSError:
+                raw = b""
+            for item in raw.split(b"\0"):
+                key, sep, value = item.partition(b"=")
+                if sep and key.decode(errors="replace") == "ANTHROPIC_BASE_URL":
+                    return value.decode(errors="replace") or None, True
+            if raw:
+                return None, True  # процесс есть, переменной нет = прямой адрес
+        env = dict(self.config.claude_env)
+        self._apply_profile_env(session, env)
+        return env.get("ANTHROPIC_BASE_URL") or None, False
+
     def _apply_profile_env(self, session: Session, env: dict[str, str]) -> None:
         """Наложить настройки профиля сессии на окружение claude (адрес API).
 
