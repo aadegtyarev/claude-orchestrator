@@ -1339,27 +1339,96 @@ class SessionManager:
             self.save_state()
             raise
 
-    async def set_profile(self, session: Session, profile: str) -> bool:
+    def transcript_of(self, session: Session, config_dir: Path | None = None) -> Path:
+        """Файл транскрипта ЭТОЙ сессии в указанной учётке (по умолчанию — своей).
+
+        Транскрипт Claude Code — обычный `<config>/projects/<кодированный
+        cwd>/<uuid>.jsonl`; путь считает box.transcript_path тем же кодом, что
+        и /stats, чтобы источник истины был один.
+        """
+        return box_transcript.transcript_path(
+            box_transcript.resolve_config_dir(
+                self.config_dir_of(session) if config_dir is None else config_dir),
+            self.effective_cwd(session), session.claude_session_id)
+
+    def has_transcript(self, session: Session) -> bool:
+        """Есть ли что переносить: транскрипт текущего диалога в текущей учётке."""
+        try:
+            return self.transcript_of(session).is_file()
+        except OSError:
+            return False
+
+    def copy_transcript(self, session: Session, src_dir: Path | None,
+                        dst_dir: Path | None) -> bool:
+        """Перенести транскрипт текущего диалога в другую учётку. True — перенесли.
+
+        Смена учётки иначе означает потерю диалога: `--resume <uuid>` ищет файл
+        в НОВОМ каталоге, там его нет — Claude Code стартует с чистого листа, и
+        переписка остаётся в прежней учётке. Но транскрипт самодостаточен
+        (jsonl с сообщениями, путь считается из cwd, а cwd не менялся), поэтому
+        копия в новую учётку возвращает resume к жизни — проверено живьём
+        15.08.2026 на сессии ikar: 3 МБ диалога развернулись в другой учётке
+        целиком.
+
+        Осознанная граница: это КОПИЯ переписки в другую учётку, а не ссылка.
+        Решение принимает оператор (см. вопрос при /profile), а не мы за него —
+        рабочий диалог не обязан оказываться в личной учётке и наоборот.
+
+        Ошибка копирования — не повод валить смену профиля: сессия рабочая и
+        без истории, поэтому логируем и возвращаем False (будет чистый старт).
+        """
+        src = self.transcript_of(session, src_dir)
+        dst = self.transcript_of(session, dst_dir)
+        if src == dst or not src.is_file():
+            return src == dst and src.is_file()
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            dst.chmod(0o600)  # переписка: права как у оригинала Claude Code
+        except OSError as e:
+            logger.warning(
+                "Сессия %s: не удалось перенести транскрипт %s → %s: %s",
+                session.name, src, dst, e)
+            return False
+        logger.info(
+            "Сессия %s: транскрипт перенесён в новую учётку (%.1f МБ): %s",
+            session.name, dst.stat().st_size / 1024 / 1024, dst)
+        return True
+
+    async def set_profile(self, session: Session, profile: str,
+                          keep_history: bool = False) -> bool:
         """Сменить профиль (учётку Claude Code): перезапуск с новым CLAUDE_CONFIG_DIR.
 
         Файлы сессии НЕ трогаем: cwd (папка проекта) и приватный дом
         (SESSIONS_DIR/.homes/<имя>) живут по имени сессии, а не по профилю —
         меняется только учётка (токены/скиллы/транскрипты) и, как следствие,
-        её история. resume по старому UUID в новой учётке не найдёт транскрипт
-        → чистый старт с новым UUID (как /clear), но тот же cwd и тот же дом.
+        её история.
+
+        `keep_history` — перенести транскрипт текущего диалога в новую учётку
+        (copy_transcript). Без него resume по старому UUID не найдёт транскрипт
+        в новом каталоге → чистый старт с новым UUID (как /clear), но тот же cwd
+        и тот же дом. С ним — тот же диалог продолжается под другой учёткой.
+        Умолчание False: перенос копирует переписку в ЧУЖУЮ учётку, и это
+        решение оператора, а не наше (спрашивается при /profile).
 
         `profile` — уже валидированное имя или "" (явный отказ от профиля).
-        Возвращает True, если контекст удалось продолжить (на практике при
-        смене учётки — почти всегда False). При ошибке откатывает профиль.
+        Возвращает True, если контекст удалось продолжить. При ошибке
+        откатывает профиль.
         """
         if self.engine_of(session) == "agent-vm":
             # Гость игнорирует хостовый CLAUDE_CONFIG_DIR: смена профиля была бы
             # молчаливым no-op — честнее отказать, чем соврать про учётку.
             raise SessionError("под agent-vm профиля нет — /profile недоступен.")
         old_profile = session.profile
+        old_dir = self.config_dir_of(session)
         try:
             async with session.ops:
                 session.profile = profile  # "" = явно без профиля (общая учётка)
+                # Перенос диалога — ДО подъёма: `--resume` ищет транскрипт уже в
+                # новой учётке, и если он там есть, resume проходит и UUID
+                # диалога остаётся прежним (иначе _resume_started сгенерит новый).
+                if keep_history:
+                    self.copy_transcript(session, old_dir, self.config_dir_of(session))
                 if not session.running:
                     return await self._resume_locked(session)
                 # Перезапуск живой сессии: слот её, придерживаем на паузу

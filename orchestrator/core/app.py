@@ -533,13 +533,27 @@ class OrchestratorCore:
         await self._notify_state_changed(session)
         return resumed
 
-    async def switch_profile(self, session: Session, profile: str) -> bool:
+    def can_keep_history(self, session: Session) -> bool:
+        """Есть ли у сессии диалог, который можно перенести в другую учётку.
+
+        Нужен адаптерам, чтобы не задавать пустой вопрос: переносить нечего —
+        меняем учётку молча. Вопрос без вариантов хуже, чем его отсутствие.
+        """
+        return self.manager.has_transcript(session)
+
+    async def switch_profile(self, session: Session, profile: str,
+                             keep_history: bool = False) -> bool:
         """Сменить профиль (учётку): файлы сессии остаются, меняется учётка.
 
         Валидацию/нормализацию имени делаем через resolve_profile — те же
         правила, что у `/new --profile` (traversal, agent-vm, явный отказ "").
         Плохое имя всплывает точной UserError (profile_bad/profile_vm), а не
         общим profile_fail.
+
+        `keep_history` — перенести транскрипт диалога в новую учётку, чтобы
+        сессия продолжилась, а не начала с чистого листа (см.
+        SessionManager.copy_transcript). Умолчание False: это копия переписки в
+        ЧУЖУЮ учётку, и решает оператор.
         """
         normalized = self.resolve_profile(
             profile, self.manager.engine_of(session))
@@ -547,7 +561,8 @@ class OrchestratorCore:
         # Сессия продолжится (перезапуск Claude в той же папке) — bash не трогаем.
         await self._teardown_runtime(session, close_bash=False)
         try:
-            resumed = await self.manager.set_profile(session, normalized)
+            resumed = await self.manager.set_profile(
+                session, normalized, keep_history=keep_history)
         except Exception as e:
             logger.exception("Сессия %s: ошибка смены профиля", session.name)
             raise UserError(self.t("profile_fail", profile=label, error=e)) from e
