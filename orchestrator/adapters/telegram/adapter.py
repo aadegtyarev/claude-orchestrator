@@ -288,9 +288,9 @@ class TelegramAdapter:
         thread_id = self._thread_of(session)
         if thread_id is None:
             return None
-        msg = await self.bot.send_message(
+        msg = await self._deliver(
+            self.bot.send_message, html_text,
             chat_id=self.chat_id,
-            text=html_text,
             message_thread_id=thread_id,
             disable_notification=True,
             reply_markup=self._stop_markup(thread_id, unblock_active) if stop_button else None,
@@ -305,10 +305,10 @@ class TelegramAdapter:
             return
         thread_id = self._thread_of(session)
         # reply_markup нужен и при edit — иначе Telegram снимает кнопку.
-        await self.bot.edit_message_text(
+        await self._deliver(
+            self.bot.edit_message_text, html_text,
             chat_id=self.chat_id,
             message_id=int(ref),
-            text=html_text,
             reply_markup=(
                 self._stop_markup(thread_id, unblock_active)
                 if stop_button and thread_id else None
@@ -377,9 +377,9 @@ class TelegramAdapter:
                     thread_id, request.request_id, "allow_always"))])
         markup = InlineKeyboardMarkup(inline_keyboard=rows)
         try:
-            msg = await self.bot.send_message(
+            msg = await self._deliver(
+                self.bot.send_message, text,
                 chat_id=self.chat_id,
-                text=text,
                 message_thread_id=thread_id,
                 reply_markup=markup,
             )
@@ -395,9 +395,9 @@ class TelegramAdapter:
             # символам), а кнопки остаются рабочими.
             fallback = self.t("perm_request_fallback", tool=html.escape(request.tool))
             try:
-                msg = await self.bot.send_message(
+                msg = await self._deliver(
+                    self.bot.send_message, fallback,
                     chat_id=self.chat_id,
-                    text=fallback,
                     message_thread_id=thread_id,
                     reply_markup=markup,
                 )
@@ -740,10 +740,10 @@ class TelegramAdapter:
         # Создаём или переиспользуем статус-сообщение.
         if edit_status_id is not None:
             # Обновляем существующее — правка сообщения переисполняет команду.
-            status_msg = await self.bot.edit_message_text(
+            status_msg = await self._deliver(
+                self.bot.edit_message_text, self.t("bash_running", cmd=cmd),
                 chat_id=self.chat_id,
                 message_id=edit_status_id,
-                text=self.t("bash_running", cmd=cmd),
             )
             # edit_message_text возвращает Message | True; нам нужен message_id.
             if isinstance(status_msg, bool):
@@ -775,11 +775,10 @@ class TelegramAdapter:
             nonlocal last_edit, output_file
             if shown != last_edit:
                 try:
-                    await self.bot.edit_message_text(
+                    await self._deliver(
+                        self.bot.edit_message_text, shown,
                         chat_id=self.chat_id,
                         message_id=status_id,
-                        text=shown,
-                        parse_mode="HTML",
                         reply_markup=markup,
                     )
                     last_edit = shown
@@ -793,10 +792,11 @@ class TelegramAdapter:
         try:
             await self.core.run_bash(key, session, cmd, on_update)
         except UserError as e:
-            await self.bot.edit_message_text(
+            # Текст UserError приходит из texts.py — он размечен HTML.
+            await self._deliver(
+                self.bot.edit_message_text, str(e),
                 chat_id=self.chat_id,
                 message_id=status_id,
-                text=str(e),
                 reply_markup=self._term_keyboard(thread_id, running=False),
             )
 
@@ -951,8 +951,8 @@ class TelegramAdapter:
         if thread_id:
             kwargs["message_thread_id"] = thread_id
         try:
-            msg = await self.bot.send_message(
-                text=text, parse_mode="HTML", reply_markup=markup, **kwargs)
+            msg = await self._deliver(
+                self.bot.send_message, text, reply_markup=markup, **kwargs)
             # Предыдущий закреп (если был) чистим — нужен один.
             await self._term_unpin(key)
             self._term_pins[key] = msg.message_id
@@ -1655,10 +1655,10 @@ class TelegramAdapter:
         # обратная связь, что у команды /term off, должна остаться в чате.
         if isinstance(callback.message, Message):
             try:
-                await self.bot.send_message(
+                await self._deliver(
+                    self.bot.send_message, self.t("term_off"),
                     chat_id=callback.message.chat.id,
                     message_thread_id=thread_id or None,
-                    text=self.t("term_off"), parse_mode="HTML",
                 )
             except Exception as e:
                 logger.warning("Не удалось отправить term_off в чат: %s", e)
@@ -1748,35 +1748,63 @@ class TelegramAdapter:
 
     # ── отправка ────────────────────────────────────────────────
 
-    async def _reply(self, message: Message, text: str, **kwargs):
-        """Ответить текстом ЯДРА: он размечен HTML — так и отправляем.
+    def _render(self, text: str, *, core: bool) -> str:
+        """ЕДИНСТВЕННОЕ место, где текст превращается в разметку Telegram.
 
-        Фолбэк на чистый текст, если разметка не проехала: в текст
-        подставляются значения из внешнего мира (имя сессии, путь, текст
-        ошибки, команда оператора), и «<» в них ломает HTML-разбор. Сообщение
-        важнее оформления — тот же принцип деградации, что в _send.
+        `core=True` — текст ЯДРА (texts.py, `*_text()`, бабл, permission): он уже
+        размечен HTML, и трогать его нельзя — второй проход экранировал бы его
+        собственные теги, и оператор увидел бы «<code>» глазами.
+        `core=False` — текст МОДЕЛИ: это markdown, его рендерит md_to_html.
+
+        Разметка выбирается ровно здесь, а наружу всё уходит через _deliver и
+        _send — чтобы «забыть parse_mode» было негде (сторожит textrender_test).
+        """
+        return text if core else md_to_html(text)
+
+    @staticmethod
+    def _markup_error(e: Exception) -> bool:
+        """Сообщение отвергнуто ИМЕННО из-за разметки?
+
+        Различать обязательно: на «message is not modified» (частый случай при
+        обновлении бабла) фолбэк на чистый текст СРАБОТАЛ бы — текст-то другой,
+        без тегов, — и красиво отрисованный бабл заменился бы сырым HTML.
+        Падаем в фолбэк только на ошибках разбора сущностей.
+        """
+        msg = str(e).lower()
+        return any(s in msg for s in ("can't parse", "unsupported start tag",
+                                      "unclosed", "entit", "tag"))
+
+    async def _deliver(self, send, text: str, *, core: bool = True, **kwargs):
+        """ЕДИНСТВЕННЫЙ выход наружу: рендер → HTML → фолбэк на чистый текст.
+
+        `send` — метод Bot API (bot.send_message, bot.edit_message_text,
+        message.reply/answer/edit_text): что именно вызвать, решает место
+        отправки, а КАК отрисовать — только здесь.
+
+        Фолбэк нужен потому, что в тексты подставляются значения из внешнего
+        мира (имя сессии, путь, текст ошибки, вывод команды), и «<» в них ломает
+        разбор: сообщение важнее оформления. Прочие ошибки не глотаем.
         """
         try:
-            return await message.reply(text, parse_mode="HTML", **kwargs)
+            return await send(text=self._render(text, core=core),
+                              parse_mode="HTML", **kwargs)
         except Exception as e:
-            logger.warning("HTML-ответ не прошёл, шлю чистым текстом: %s", e)
-            return await message.reply(text, **kwargs)
+            if not self._markup_error(e):
+                raise
+            logger.warning("Разметка не прошла (%s) — шлю чистым текстом", e)
+            return await send(text=text, **kwargs)
+
+    async def _reply(self, message: Message, text: str, **kwargs):
+        """Ответ на сообщение текстом ЯДРА (см. _deliver)."""
+        return await self._deliver(message.reply, text, **kwargs)
 
     async def _answer(self, message: Message, text: str, **kwargs):
-        """Сообщение в топик текстом ЯДРА (см. _reply)."""
-        try:
-            return await message.answer(text, parse_mode="HTML", **kwargs)
-        except Exception as e:
-            logger.warning("HTML-сообщение не прошло, шлю чистым текстом: %s", e)
-            return await message.answer(text, **kwargs)
+        """Сообщение в топик текстом ЯДРА (см. _deliver)."""
+        return await self._deliver(message.answer, text, **kwargs)
 
     async def _edit(self, message: Message, text: str, **kwargs):
-        """Переписать своё сообщение текстом ЯДРА (см. _reply)."""
-        try:
-            return await message.edit_text(text, parse_mode="HTML", **kwargs)
-        except Exception as e:
-            logger.warning("HTML-правка не прошла, шлю чистым текстом: %s", e)
-            return await message.edit_text(text, **kwargs)
+        """Переписать своё сообщение текстом ЯДРА (см. _deliver)."""
+        return await self._deliver(message.edit_text, text, **kwargs)
 
     async def _send(
         self, chat_id: int, thread_id: int | None, text: str, reply_to: int | None = None,
@@ -1794,7 +1822,7 @@ class TelegramAdapter:
         (топик удалили руками) — финальный ответ не должен теряться.
         """
         for i, plain in enumerate(split_text(text)):
-            hchunk = plain if core else md_to_html(plain)
+            hchunk = self._render(plain, core=core)
             kwargs: dict = {"chat_id": chat_id}
             if thread_id:
                 kwargs["message_thread_id"] = thread_id
@@ -1812,6 +1840,7 @@ class TelegramAdapter:
                         use_html = False
                 if not sent:
                     try:
+                        # plain-fallback: разметка не проехала, спасаем сам текст
                         await self.bot.send_message(text=plain, **kwargs)
                         sent = True
                     except Exception:
