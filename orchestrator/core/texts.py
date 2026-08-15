@@ -26,6 +26,7 @@ MESSAGES: dict[str, dict[str, str]] = {
             "В топике сессии:\n"
             "• текст — отправить Claude (остановленная сессия возобновится сама)\n"
             "• фото/файл — сохранится в папку сессии, Claude получит путь\n"
+            "• <code>/info</code> — настройки сессии: учётка, адрес API, движок, канал\n"
             "• <code>/stats</code> — контекст и статистика\n"
             "• <code>/perms [auto|lock]</code> — авто-одобрение разрешений на сессию\n"
             "• <code>/log</code> — скачать полный лог сессии (для отладки)\n"
@@ -181,6 +182,24 @@ MESSAGES: dict[str, dict[str, str]] = {
         ),
         "stats_wallet_on": "✅ вкл",
         "stats_wallet_off": "⏸ выкл",
+        "info_body": (
+            "🪪 <b>{header}</b>\n"
+            "Учётка: {profile} → <code>{account}</code>\n"
+            "Адрес API: {api}{api_src}\n"
+            "Изоляция: {sandbox} · Кошелёк: {wallet}\n"
+            "Модель: {model} · Effort: {effort}\n"
+            "Пермиссии: {perms}{perms_auto}\n"
+            "Канал: {channel}\n"
+            "Каталог: <code>{cwd}</code>\n"
+            "Аптайм: {uptime}"
+        ),
+        "info_api_direct": "прямой api.anthropic.com",
+        "info_api_config": " (из конфига — сессия не запущена)",
+        "info_account_vm": "внутри microVM (гость держит учётку у себя)",
+        "info_channel_ok": "✅ живой",
+        "info_channel_blocked": "⌨️ не загрузился — доставка через терминал",
+        "info_channel_unknown": "— (сессия не запущена)",
+        "info_default": "по умолчанию",
         "usage_collecting": "💰 Собираю расходы и лимиты…",
         "usage_failed": "Не удалось разобрать вывод /cost (возможно, другая версия Claude Code). Данные — в claude.log.",
         "usage_title": "💰 Расходы и лимиты — {name}",
@@ -367,6 +386,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "menu_ls": "Показать файлы",
         "menu_bg": "Фоновые процессы сессии",
         "menu_wallet": "Кошелёк: policy секретов",
+        "menu_info": "Настройки сессии: учётка, адрес API, движок",
         "menu_stats": "Контекст и статистика сессии",
         "menu_perms": "Авто-одобрение разрешений (на сессию)",
         "menu_usage": "Расходы и лимиты плана",
@@ -588,6 +608,24 @@ MESSAGES: dict[str, dict[str, str]] = {
         ),
         "stats_wallet_on": "✅ on",
         "stats_wallet_off": "⏸ off",
+        "info_body": (
+            "🪪 <b>{header}</b>\n"
+            "Account: {profile} → <code>{account}</code>\n"
+            "API endpoint: {api}{api_src}\n"
+            "Isolation: {sandbox} · Wallet: {wallet}\n"
+            "Model: {model} · Effort: {effort}\n"
+            "Permissions: {perms}{perms_auto}\n"
+            "Channel: {channel}\n"
+            "Directory: <code>{cwd}</code>\n"
+            "Uptime: {uptime}"
+        ),
+        "info_api_direct": "direct api.anthropic.com",
+        "info_api_config": " (from config — session not running)",
+        "info_account_vm": "inside the microVM (the guest keeps its own account)",
+        "info_channel_ok": "✅ live",
+        "info_channel_blocked": "⌨️ did not load — delivery via terminal",
+        "info_channel_unknown": "— (session not running)",
+        "info_default": "default",
         "usage_collecting": "💰 Collecting cost and limits…",
         "usage_failed": "Could not parse /cost output (maybe a different Claude Code version). See claude.log.",
         "usage_title": "💰 Cost and limits — {name}",
@@ -767,6 +805,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "menu_ls": "List files",
         "menu_bg": "Session background processes",
         "menu_wallet": "Wallet: secrets policy",
+        "menu_info": "Session setup: account, API endpoint, engine",
         "menu_stats": "Session context and stats",
         "menu_perms": "Auto-approve permissions (per session)",
         "menu_usage": "Cost and plan limits",

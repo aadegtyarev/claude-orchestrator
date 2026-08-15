@@ -96,6 +96,7 @@ class TelegramAdapter:
             BotCommand(command="wallet", description=self.t("menu_wallet")),
             BotCommand(command="orchestrator_restart", description=self.t("menu_restart")),
             BotCommand(command="orchestrator_web", description=self.t("menu_web")),
+            BotCommand(command="info", description=self.t("menu_info")),
             BotCommand(command="stats", description=self.t("menu_stats")),
             BotCommand(command="perms", description=self.t("menu_perms")),
             BotCommand(command="usage", description=self.t("menu_usage")),
@@ -449,6 +450,7 @@ class TelegramAdapter:
         dp.message.register(self.cmd_delete, Command("delete_session"))
         dp.message.register(self.cmd_compact, Command("compact"))
         dp.message.register(self.cmd_clear, Command("clear"))
+        dp.message.register(self.cmd_info, Command("info"))
         dp.message.register(self.cmd_stats, Command("stats"))
         dp.message.register(self.cmd_log, Command("log"))
         dp.message.register(self.cmd_usage, Command("usage", "cost"))
@@ -1069,6 +1071,16 @@ class TelegramAdapter:
             await message.reply(str(e))
             return
         await message.reply(self.t("compact_sent"))
+
+    async def cmd_info(self, message: Message) -> None:
+        """Паспорт сессии: учётка, адрес API, движок, модель, канал."""
+        if not self._accept(message):
+            return
+        session = self._topic_session(message)
+        if session is None:
+            await message.reply(self.t("only_topic"))
+            return
+        await message.reply(self.core.info_text(session))
 
     async def cmd_stats(self, message: Message) -> None:
         """Контекст и статистика из транскрипта сессии."""

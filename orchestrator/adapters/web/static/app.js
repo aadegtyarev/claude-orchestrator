@@ -495,6 +495,14 @@ function applyBoxes(boxes) {
   });
 }
 
+$("btn-info").onclick = async () => {
+  if (!current) return;
+  try {
+    const r = await apiJson(sesUrl("/info"));
+    addMsg("notice", esc(r.text));
+  } catch (e) { addMsg("notice", "⚠ " + esc(e.message)); }
+};
+
 $("btn-stats").onclick = async () => {
   if (!current) return;
   try {
