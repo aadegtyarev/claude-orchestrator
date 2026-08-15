@@ -70,6 +70,31 @@ def test_channel_state():
     print("OK детектор: живой/заблокированный канал, перенос строки, последний баннер")
 
 
+def test_conversation_is_not_a_banner():
+    """Разговор ПРО баннер — не баннер.
+
+    Поймано на живом проде: сессия claude-orchestrator с исправным каналом
+    получила вердикт «заблокирован», потому что несколькими экранами выше
+    правила документацию, где эта фраза описана. В логе лежит вся беседа, так
+    что цитата обязана отличаться от настоящей плашки — отсюда матч по ПОЛНОЙ
+    формулировке (и просмотр окна старта, см. probe_channel).
+    """
+    for quote in (
+        # Кусок из docs/ORCHESTRATOR.md — ровно то, обо что споткнулся прод.
+        "способами: `/profile` с учёткой, где каналы разрешены, либо "
+        "`channelsEnabled: true` в managed settings орга.",
+        # Оператор пересказывает симптом своими словами.
+        "у сессии channels are not enabled, что делать?",
+        # Половинка фразы в обсуждении настроек орга.
+        "надо выставить channelsEnabled: true в managed settings",
+    ):
+        assert channel_state(quote.encode()) == UNKNOWN, quote
+    # И цитата не должна перебивать настоящий баннер, который был на старте.
+    log = BANNER_OK + ("…" + "х" * 5000).encode() + quote.encode()
+    assert channel_state(log) == OK
+    print("OK детектор: цитата баннера в беседе не считается баннером")
+
+
 def _session(tmp_path: Path, **kw):
     log = tmp_path / "claude.log"
     session = SimpleNamespace(
@@ -108,6 +133,26 @@ def test_probe_reads_only_current_process(tmp_path: Path):
     assert mgr.probe_channel(session2) is False
     assert session2.channel_blocked is False
     print("OK probe_channel: смотрит только вывод текущего процесса (log_offset)")
+
+
+def test_probe_looks_at_startup_window(tmp_path: Path):
+    """Вердикт берётся из НАЧАЛА вывода процесса, а не из хвоста лога.
+
+    Баннер печатается на старте, дальше наматывается беседа — и если смотреть
+    хвост, то разговор про баннер (или свежий кусок документации) перебьёт
+    настоящую плашку. На проде так и вышло.
+    """
+    mgr = SessionManager.__new__(SessionManager)
+    session, log = _session(tmp_path)
+    quote = "…в managed settings орга: channelsEnabled: true — вот это место"
+    with open(log, "wb") as fh:
+        fh.write(BANNER_OK)
+        fh.write(("х" * 300_000).encode())  # беседа длиннее окна старта
+        fh.write(BANNER_BLOCKED)            # цитата баннера в самом хвосте
+        fh.write(quote.encode())
+
+    assert mgr.probe_channel(session) is False, "хвост не должен решать за старт"
+    print("OK probe_channel: вердикт из окна старта, хвост беседы не мешает")
 
 
 def test_probe_unknown_keeps_verdict(tmp_path: Path):
@@ -225,9 +270,11 @@ def main():
     import tempfile
 
     test_channel_state()
+    test_conversation_is_not_a_banner()
     with tempfile.TemporaryDirectory() as raw:
         tmp_path = Path(raw)
         test_probe_reads_only_current_process(tmp_path)
+        test_probe_looks_at_startup_window(tmp_path)
         test_probe_unknown_keeps_verdict(tmp_path)
         asyncio.run(test_blocked_delivers_via_pty(tmp_path))
         asyncio.run(test_healthy_channel_uses_http(tmp_path))

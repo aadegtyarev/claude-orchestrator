@@ -1006,20 +1006,24 @@ class SessionManager:
     def probe_channel(self, session: Session) -> bool | None:
         """Загрузился ли dev-канал у текущего процесса. Пишет session.channel_blocked.
 
-        Смотрим хвост claude.log начиная с log_offset (вывод ЭТОГО процесса):
-        `Channels (experimental) …` — канал жив, `Channels are not enabled for
-        your org …` — отбит орг-политикой учётки. Ни того, ни другого (баннер
-        ещё не нарисован) — оставляем None и не трогаем прежний вердикт:
-        неизвестность не должна выключать нормальную доставку.
+        Смотрим НАЧАЛО вывода этого процесса — от log_offset и не дальше
+        SCAN_BYTES: `Channels (experimental) …` — канал жив, `Channels are not
+        enabled for your org …` — отбит орг-политикой учётки. Ни того, ни
+        другого (баннер ещё не нарисован) — оставляем None и не трогаем прежний
+        вердикт: неизвестность не должна выключать нормальную доставку.
+
+        Именно начало, а не хвост: баннер печатается на старте, а дальше в лог
+        наматывается беседа — и цитата баннера в разговоре неотличима от него
+        самого (см. channelstate). На проде на этом и погорели: сессия с живым
+        каналом получила «заблокирован», потому что обсуждала текст баннера.
 
         Синхронная (файловый ввод-вывод) — зовётся через asyncio.to_thread.
         """
         log_path = session.session_dir / "claude.log"
         try:
             with open(log_path, "rb") as fh:
-                size = fh.seek(0, os.SEEK_END)
-                fh.seek(max(session.log_offset, size - SCAN_BYTES))
-                raw = fh.read()
+                fh.seek(session.log_offset)
+                raw = fh.read(SCAN_BYTES)
         except OSError as e:
             logger.debug("probe_channel(%s): лог недоступен: %s", session.name, e)
             return session.channel_blocked

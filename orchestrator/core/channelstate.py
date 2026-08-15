@@ -18,11 +18,23 @@ claude.log = 0 байт.
 Здесь — чистая функция «что говорит лог». Что с этим делать (заметка оператору +
 доставка через PTY) решают SessionManager и ядро.
 
-Матчим по тексту со СНЯТЫМИ пробелами: TUI переносит статус-строку и рвёт её
-управляющими последовательностями, поэтому пробелы внутри баннера ненадёжны.
-Берём два самых характерных куска каждого баннера и смотрим, чей ПОСЛЕДНИЙ
-в просмотренном куске лога — лог накопительный, и в нём могут лежать кадры
-предыдущего процесса сессии.
+ГЛАВНАЯ ловушка этого детектора — лог хранит не только рамку TUI, но и ВСЮ
+беседу. Стоит модели или оператору упомянуть баннер (а в этом репозитории он
+описан в docs/, и я сам вписал его туда при разработке) — цитата в логе
+неотличима от настоящего баннера. На живом проде это и случилось: сессия
+claude-orchestrator с исправным каналом получила вердикт «заблокирован», потому
+что несколькими экранами выше обсуждала текст баннера. Отсюда две защиты:
+
+  • матчим фразу ЦЕЛИКОМ, а не куски: «Channels are not enabled for your org»
+    рядом с «channelsEnabled: true in managed settings». Обрывок вроде
+    «channelsEnabled: true» встречается в разговоре сплошь и рядом, полная
+    формулировка — практически нет;
+  • смотрим ОКНО СТАРТА процесса, а не хвост лога. Баннер — стартовый артефакт,
+    он печатается сразу за приветственной рамкой; беседа же наматывается
+    мегабайтами позже (в проде цитата лежала в 4.5 МБ от баннера).
+
+Матчим по тексту со снятыми пробелами: TUI переносит статус-строку и рвёт её
+управляющими последовательностями, так что пробелы внутри баннера ненадёжны.
 """
 
 from __future__ import annotations
@@ -35,18 +47,27 @@ OK = "ok"            # канал загружен: баннер «Channels (exp
 BLOCKED = "blocked"  # канал отбит орг-политикой
 UNKNOWN = "unknown"  # ни одного баннера не видно — не гадаем
 
-# Сколько хвоста лога смотреть. Статус-строка перерисовывается на каждом кадре
-# TUI, так что свежий баннер всегда близко к концу; окно нужно лишь чтобы не
-# втягивать десятки МБ.
+# Сколько байт от начала вывода процесса считать «окном старта». Баннер идёт
+# сразу за приветственной рамкой; запас нужен на то, что рамка целиком состоит
+# из управляющих последовательностей и весит куда больше, чем выглядит.
 SCAN_BYTES = 256 * 1024
 
 _WS_RE = re.compile(rb"\s+")
-# Куски баннера «Channels are not enabled for your org · have an administrator
-# set channelsEnabled: true in managed settings».
-_BLOCKED_RE = re.compile(rb"notenabledforyourorg|channelsEnabled:true", re.IGNORECASE)
-# Куски баннера «Channels (experimental) messages from server:channel-<имя>
-# inject directly in this session · restart without …».
-_OK_RE = re.compile(rb"Channels\(experimental\)|injectdirectlyinthissession", re.IGNORECASE)
+# Баннер «Channels are not enabled for your org · have an administrator set
+# channelsEnabled: true in managed settings» — обе половины подряд. Между ними
+# TUI ставит разделитель (·), иногда с переносом, поэтому щель до 8 символов.
+_BLOCKED_RE = re.compile(
+    rb"Channelsarenotenabledforyourorg.{0,8}"
+    rb"haveanadministratorsetchannelsEnabled:trueinmanagedsettings",
+    re.IGNORECASE | re.DOTALL,
+)
+# Баннер «Channels (experimental) messages from server:channel-<имя> inject
+# directly in this session · restart without …».
+_OK_RE = re.compile(
+    rb"Channels\(experimental\)messagesfromserver:channel-[\w.-]+"
+    rb"injectdirectlyinthissession",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def _last(pattern: re.Pattern[bytes], text: bytes) -> int:
@@ -58,7 +79,11 @@ def _last(pattern: re.Pattern[bytes], text: bytes) -> int:
 
 
 def channel_state(raw: bytes) -> str:
-    """OK | BLOCKED | UNKNOWN по куску claude.log (сырые байты с ANSI)."""
+    """OK | BLOCKED | UNKNOWN по окну старта claude.log (сырые байты с ANSI).
+
+    `raw` — вывод С НАЧАЛА текущего процесса (см. SCAN_BYTES): вызывающий
+    обязан отрезать предыдущие запуски, иначе вердикт будет про чужой процесс.
+    """
     text = _WS_RE.sub(b"", strip_ansi(raw))
     blocked = _last(_BLOCKED_RE, text)
     ok = _last(_OK_RE, text)
