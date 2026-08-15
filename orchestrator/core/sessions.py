@@ -20,6 +20,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import shutil
 import socket
 import sys
@@ -87,6 +88,11 @@ SEND_RETRY_TIMEOUT = 20.0
 # терминал: TUI обрабатывает вставку асинхронно, приклеенный Enter иногда
 # приходит раньше, чем текст осел в поле ввода.
 PASTE_ENTER_DELAY = 0.4
+# Открывающая/закрывающая скобка тега <channel …> в тексте сообщения. Нужна,
+# чтобы содержимое не могло разорвать конверт при доставке через терминал
+# (см. SessionManager.channel_envelope). Пробелы после `<` тоже ловим: разметку
+# читает модель, а не парсер, и `< /channel>` она поймёт как закрытие.
+_CHANNEL_TAG_RE = re.compile(r"<(?=\s*/?\s*channel\b)", re.IGNORECASE)
 
 
 class SessionError(Exception):
@@ -163,6 +169,10 @@ class Session:
     bg_seen: set = field(default_factory=set)
     # Сериализация операций жизненного цикла этой сессии.
     ops: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Сериализация вставок в терминал (paste_into_pty). Отдельно от ops: вставка
+    # держит лок ~0.4с (пауза перед Enter), а ops берут короткие операции
+    # жизненного цикла — общий лок заставил бы их ждать доставку сообщения.
+    paste: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def __post_init__(self):
         if not self.title:
@@ -1029,6 +1039,18 @@ class SessionManager:
             return session.channel_blocked
         state = channel_state(raw)
         if state == UNKNOWN:
+            # Окно набралось целиком, а баннера в нём нет — детектор ослеп, и
+            # молчать об этом нельзя: вердикт останется None, доставка пойдёт по
+            # HTTP, и если канал на самом деле отбит — вернётся ровно тот баг,
+            # который всё это чинит (200 в никуда, сессия немая). На живых логах
+            # баннер лежит в первых ~4 КБ вывода, так что сюда мы попадём только
+            # при небывало шумном старте — но тогда это будет видно.
+            if len(raw) >= SCAN_BYTES:
+                logger.warning(
+                    "Сессия %s: в первых %d КБ вывода нет баннера каналов — "
+                    "состояние канала неизвестно, доставляю как обычно (HTTP)",
+                    session.name, SCAN_BYTES // 1024,
+                )
             return session.channel_blocked
         blocked = state == CHANNEL_BLOCKED
         if blocked and not session.channel_blocked:
@@ -1621,10 +1643,21 @@ class SessionManager:
         нему знает, с каким context_id звать reply_to_user. При доставке через
         терминал (канал заблокирован орг-политикой) конверт обязан быть тем же,
         иначе модель ответит в чат «мимо» — с пустым или чужим context_id.
+
+        Текст обезвреживаем. У настоящего канала такой заботы не нужно: там
+        `content` и `context_id` — раздельные поля JSON, конверт рисует сам
+        Claude Code, и содержимое до разметки не дотягивается. Здесь мы клеим
+        строку, поэтому сообщение с `</channel>` внутри (хоть в пересланной
+        цитате, хоть в куске лога) закрыло бы конверт и открыло следующий — с
+        любым чужим context_id, то есть ответ ушёл бы не в тот чат. Правка
+        МИНИМАЛЬНАЯ: `<` экранируется только там, где начинается тег
+        `channel`/`/channel`; прочие угловые скобки (код, диффы, HTML) остаются
+        как есть, чтобы модель видела текст оператора неискажённым.
         """
         return (
             f'<channel source="channel-{session.name}" '
-            f'context_id="{context_id}">{text}</channel>'
+            f'context_id="{_CHANNEL_TAG_RE.sub("&lt;", context_id)}">'
+            f'{_CHANNEL_TAG_RE.sub("&lt;", text)}</channel>'
         )
 
     async def paste_into_pty(self, session: Session, text: str) -> None:
@@ -1640,12 +1673,19 @@ class SessionManager:
         Enter отбиваем ОТДЕЛЬНОЙ записью после паузы: TUI обрабатывает вставку
         асинхронно, и приклеенный к ней `\\r` иногда приходит раньше, чем текст
         осел в поле ввода (уходило пустое сообщение).
+
+        Вся пара «вставка + Enter» держит `session.paste`: без лока два
+        одновременных сообщения (оператор шлёт второе, не дождавшись; телеграм и
+        веб разом) записались бы как payload1, payload2, enter1, enter2 — оба
+        текста слиплись бы в поле ввода до первого Enter, а второй Enter ушёл бы
+        по пустому вводу.
         """
         clean = "".join(ch for ch in text if ch == "\n" or ch.isprintable())
         payload = b"\x1b[200~" + clean.encode() + b"\x1b[201~"
-        self._send_raw(session, payload)
-        await asyncio.sleep(PASTE_ENTER_DELAY)
-        self._send_raw(session, b"\r")
+        async with session.paste:
+            self._send_raw(session, payload)
+            await asyncio.sleep(PASTE_ENTER_DELAY)
+            self._send_raw(session, b"\r")
 
     def type_into_pty(self, session: Session, text: str) -> None:
         """Напечатать команду прямо в терминал Claude (слэш-команды CC)."""

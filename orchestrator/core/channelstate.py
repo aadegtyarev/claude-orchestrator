@@ -55,9 +55,12 @@ SCAN_BYTES = 256 * 1024
 _WS_RE = re.compile(rb"\s+")
 # Баннер «Channels are not enabled for your org · have an administrator set
 # channelsEnabled: true in managed settings» — обе половины подряд. Между ними
-# TUI ставит разделитель (·), иногда с переносом, поэтому щель до 8 символов.
+# TUI ставит разделитель (·), иногда с переносом и остатками управляющих
+# последовательностей, которые strip_ansi не разбирает (DCS, 8-битный CSI).
+# На живых логах щель = 2 байта (сам «·»); держим 32 с запасом — обе половины
+# длинные и дословные, лишнего этот зазор не притянет.
 _BLOCKED_RE = re.compile(
-    rb"Channelsarenotenabledforyourorg.{0,8}"
+    rb"Channelsarenotenabledforyourorg.{0,32}"
     rb"haveanadministratorsetchannelsEnabled:trueinmanagedsettings",
     re.IGNORECASE | re.DOTALL,
 )
