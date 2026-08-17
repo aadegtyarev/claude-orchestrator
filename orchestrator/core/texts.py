@@ -22,6 +22,8 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• <code>/orchestrator_web</code> — ссылка на локальный веб-интерфейс с токеном\n"
             "• <code>/bash &lt;cmd&gt;</code> — терминал на ХОСТЕ (полный доступ: systemctl и т.п.)\n"
             "• <code>/skills</code> — список скиллов\n"
+            "• <code>/login</code> — вход в учётку Claude Code (когда протухла: "
+            "сессии живы, но модель не видит сообщений)\n"
             "• <code>/chat_id</code> — ID чата и привязка бота\n\n"
             "В топике сессии:\n"
             "• текст — отправить Claude (остановленная сессия возобновится сама)\n"
@@ -372,6 +374,23 @@ MESSAGES: dict[str, dict[str, str]] = {
         "api_error_quota": "⛔ Недельный/месячный лимит бэкенда исчерпан (сброс {reset}). Модель ретраит запросы по кругу и продвигается медленно/рывками — это не зависание. До сброса смени бэкенд/модель (/model) или подожди.",
         "api_error_quota_noreset": "⛔ Лимит бэкенда исчерпан — модель ретраит по кругу и продвигается рывками (не зависание). Смени бэкенд/модель (/model) или подожди сброса.",
         "api_retrying": "🔄 API-ретрай {attempt}/{total}",
+        # ── учётка Claude Code (/login) ──
+        "login_expired": "⛔ <b>Учётка Claude Code протухла.</b> Сессия жива, но отвечает сама («Login expired · Please run /login») за 0 с: модель сообщений НЕ видит, они теряются молча.\n\nВойти прямо отсюда: /login — пришлю ссылку, вернёшь код. Учётка общая на профиль: один вход чинит все его сессии, перезапускать их не нужно.",
+        "login_eaten": "⛔ Учётка протухла — это сообщение модель не увидит (его съест «Login expired»). Войти: /login",
+        "login_url": "🔑 <b>Вход в учётку Claude Code</b> (учётка: {profile})\n\n1. Открой <a href=\"{url}\">страницу входа</a> и подтверди вход.\n2. Пришли код со страницы сюда одним сообщением — передам его процессу входа.\n\nЖду код 15 минут. Отменить: /login cancel",
+        "login_ok": "✅ Вход выполнен: {account}\nСессии на этой учётке ожили без перезапуска: {peers}",
+        "login_fail": "❌ Код не принят — учётка так и не залогинена. Попробуй заново: /login",
+        "login_start_fail": "❌ Не удалось начать вход: {error}",
+        "login_no_flow": "Активного входа нет — начни с /login.",
+        "login_cancelled": "Вход отменён.",
+        "login_nothing_to_cancel": "Отменять нечего — вход не начат.",
+        "login_unknown_arg": "Не знаю аргумент «{arg}». Есть: /login, /login console, /login force, /login cancel, /login status.",
+        "login_status_ok": "🔓 Учётка жива: {account}",
+        "login_force_hint": "\nВойти заново под другой учёткой: /login force",
+        "login_status_out": "⛔ Учётка протухла — войти: /login",
+        "login_status_unknown": "🤷 Не удалось узнать статус учётки: <code>claude auth status</code> не ответил.",
+        "login_code_taken": "🔑 Код принял, завершаю вход…",
+        "login_btn": "🔑 Войти",
         "session_restart_loop": "🔁 Claude перезапустился ({count} раз с начала хода) — похоже, краш-луп. Можно /close_session и стартануть заново.",
         "sess_closed": "«{name}» остановлена.",
         "perm_request": "🔐 <b>Запрос разрешения</b>\n{tool}: {desc}\n<pre>{preview}</pre>",
@@ -401,6 +420,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "menu_usage": "Расходы и лимиты плана",
         "menu_model": "Модель сессии (fable/opus/sonnet/haiku)",
         "menu_profile": "Профиль (учётка) сессии",
+        "menu_login": "Вход в учётку Claude Code (когда протухла)",
         "menu_skills": "Список скиллов",
         "menu_compact": "Сжать контекст сессии",
         "menu_clear": "Очистить контекст сессии",
@@ -457,6 +477,8 @@ MESSAGES: dict[str, dict[str, str]] = {
             "• <code>/orchestrator_web</code> — link to the local web UI with its token\n"
             "• <code>/bash &lt;cmd&gt;</code> — terminal on the HOST (full access: systemctl etc.)\n"
             "• <code>/skills</code> — list skills\n"
+            "• <code>/login</code> — log in to the Claude Code account (when it "
+            "expires: sessions stay alive but the model never sees messages)\n"
             "• <code>/chat_id</code> — chat ID and bot binding\n\n"
             "In a session topic:\n"
             "• text — send to Claude (a stopped session resumes automatically)\n"
@@ -800,6 +822,23 @@ MESSAGES: dict[str, dict[str, str]] = {
         "api_error_quota": "⛔ Backend weekly/monthly limit exhausted (resets {reset}). The model keeps retrying and advances slowly/in bursts — this is NOT a hang. Switch backend/model (/model) or wait for the reset.",
         "api_error_quota_noreset": "⛔ Backend limit exhausted — the model keeps retrying and advances in bursts (not a hang). Switch backend/model (/model) or wait for the reset.",
         "api_retrying": "🔄 API retry {attempt}/{total}",
+        # ── Claude Code account (/login) ──
+        "login_expired": "⛔ <b>Claude Code login expired.</b> The session is alive but answers by itself («Login expired · Please run /login») in 0 s: the model never sees your messages and they are lost silently.\n\nLog in right here: /login — I'll send the link, you send back the code. The account is shared per profile: one login fixes every session on it, no restarts needed.",
+        "login_eaten": "⛔ Login expired — the model won't see this message («Login expired» eats it). Log in: /login",
+        "login_url": "🔑 <b>Claude Code login</b> (account: {profile})\n\n1. Open the <a href=\"{url}\">sign-in page</a> and confirm.\n2. Send the code from that page here as one message — I'll pass it to the login process.\n\nWaiting for the code for 15 minutes. Cancel: /login cancel",
+        "login_ok": "✅ Logged in: {account}\nSessions on this account are back without a restart: {peers}",
+        "login_fail": "❌ Code rejected — still not logged in. Try again: /login",
+        "login_start_fail": "❌ Could not start the login: {error}",
+        "login_no_flow": "No login in progress — start with /login.",
+        "login_cancelled": "Login cancelled.",
+        "login_nothing_to_cancel": "Nothing to cancel — no login in progress.",
+        "login_unknown_arg": "Unknown argument “{arg}”. Available: /login, /login console, /login force, /login cancel, /login status.",
+        "login_status_ok": "🔓 Account is live: {account}",
+        "login_force_hint": "\nLog in again (e.g. under a different account): /login force",
+        "login_status_out": "⛔ Login expired — log in: /login",
+        "login_status_unknown": "🤷 Could not read the account status: <code>claude auth status</code> did not answer.",
+        "login_code_taken": "🔑 Code received, finishing the login…",
+        "login_btn": "🔑 Log in",
         "session_restart_loop": "🔁 Claude restarted ({count} times this turn) — looks like a crash loop. Try /close_session and start fresh.",
         "sess_closed": "“{name}” stopped.",
         "perm_request": "🔐 <b>Permission request</b>\n{tool}: {desc}\n<pre>{preview}</pre>",
@@ -829,6 +868,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "menu_usage": "Cost and plan limits",
         "menu_model": "Session model (fable/opus/sonnet/haiku)",
         "menu_profile": "Session profile (account)",
+        "menu_login": "Log in to the Claude Code account (when expired)",
         "menu_skills": "List skills",
         "menu_compact": "Compact session context",
         "menu_clear": "Clear session context",

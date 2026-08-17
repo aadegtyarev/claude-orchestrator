@@ -49,7 +49,7 @@ class _Mgr:
         return None
 
 
-def _sup(mgr, sends, tool_inflight=None):
+def _sup(mgr, sends, tool_inflight=None, auth_expired=None):
     async def send(session, text):
         sends.append(text)
 
@@ -57,7 +57,8 @@ def _sup(mgr, sends, tool_inflight=None):
         return False  # typing-цикл гаснет сразу, он не под тестом
 
     return TurnSupervisor(
-        mgr, t=lambda k, **kw: k, send=send, typing=typing, tool_inflight=tool_inflight
+        mgr, t=lambda k, **kw: k, send=send, typing=typing, tool_inflight=tool_inflight,
+        auth_expired=auth_expired,
     )
 
 
@@ -186,6 +187,64 @@ async def test_error_relay_surfaces_api_error_once(tmp_path):
     print("OK error-relay: повтор той же ошибки в COOLDOWN задушен (дедуп)")
 
 
+async def test_error_relay_surfaces_expired_login(tmp_path):
+    """Баннер протухшей учётки + подтверждение `auth status` → заметка в топик.
+
+    Ровно тот отказ, из-за которого сессия выглядит мёртвой: claude отвечает
+    сам за 0 с, модель сообщений не видит, а в чат раньше не приходило ничего.
+    """
+    _fast_intervals()
+    log = tmp_path / "claude.log"
+    log.write_bytes(b"")
+    session = SimpleNamespace(name="s", session_dir=tmp_path)
+    sends: list = []
+    asked: list = []
+
+    async def expired(sess):
+        asked.append(sess.name)
+        return True
+
+    sup = _sup(_Mgr(session), sends, auth_expired=expired)
+    task = asyncio.create_task(sup._error_relay_loop("s"))
+    await asyncio.sleep(0.05)
+    with open(log, "ab") as f:
+        # Дословно из лога noos: TUI рисует баннер позиционированием курсора,
+        # пробелы между словами теряются.
+        f.write("\n●Loginexpired·Pleaserun/login✻Churned for 0s\n".encode())
+    fired = await _wait(lambda: sends)
+    task.cancel()
+    assert fired and sends == ["login_expired"], sends
+    assert asked == ["s"], asked
+    print("OK error-relay: баннер учётки + подтверждение → login_expired")
+
+
+async def test_error_relay_login_banner_without_confirmation_is_silent(tmp_path):
+    """Тот же баннер, но `auth status` говорит «залогинен» → молчим.
+
+    Строку «Login expired · Please run /login» модель может процитировать в
+    ответе (например обсуждая эту самую фичу). Тревога «вы разлогинены» на
+    рабочей учётке дороже задержки — поэтому баннер только повод спросить.
+    """
+    _fast_intervals()
+    log = tmp_path / "claude.log"
+    log.write_bytes(b"")
+    session = SimpleNamespace(name="s", session_dir=tmp_path)
+    sends: list = []
+
+    async def not_expired(sess):
+        return False
+
+    sup = _sup(_Mgr(session), sends, auth_expired=not_expired)
+    task = asyncio.create_task(sup._error_relay_loop("s"))
+    await asyncio.sleep(0.05)
+    with open(log, "ab") as f:
+        f.write("\nВ ответе модели: «Login expired · Please run /login»\n".encode())
+    await asyncio.sleep(0.15)
+    task.cancel()
+    assert sends == [], sends
+    print("OK error-relay: без подтверждения `auth status` — ни слова")
+
+
 def main():
     import tempfile
 
@@ -196,6 +255,8 @@ def main():
         test_watchdog_silent_while_busy,
         test_watchdog_silent_while_tool_inflight,
         test_error_relay_surfaces_api_error_once,
+        test_error_relay_surfaces_expired_login,
+        test_error_relay_login_banner_without_confirmation_is_silent,
     ):
         d = Path(tempfile.mkdtemp())
         asyncio.run(fn(d))

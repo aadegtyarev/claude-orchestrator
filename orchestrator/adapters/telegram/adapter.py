@@ -106,6 +106,7 @@ class TelegramAdapter:
             BotCommand(command="usage", description=self.t("menu_usage")),
             BotCommand(command="model", description=self.t("menu_model")),
             BotCommand(command="profile", description=self.t("menu_profile")),
+            BotCommand(command="login", description=self.t("menu_login")),
             BotCommand(command="skills", description=self.t("menu_skills")),
             BotCommand(command="compact", description=self.t("menu_compact")),
             BotCommand(command="clear", description=self.t("menu_clear")),
@@ -459,6 +460,7 @@ class TelegramAdapter:
         dp.message.register(self.cmd_usage, Command("usage", "cost"))
         dp.message.register(self.cmd_model, Command("model"))
         dp.message.register(self.cmd_profile, Command("profile"))
+        dp.message.register(self.cmd_login, Command("login"))
         dp.message.register(self.cmd_skills, Command("skills"))
         dp.message.register(self.cmd_chat_id, Command("chat_id"))
         dp.message.register(self.cmd_bash, Command("bash"))
@@ -1178,6 +1180,47 @@ class TelegramAdapter:
         note = "" if resumed else self.t("model_ctx_lost")
         await self._edit(status, self.t("model_done", model=model) + note)
 
+    async def cmd_login(self, message: Message, command: CommandObject) -> None:
+        """/login [console|force|cancel|status] — вход в учётку Claude Code.
+
+        Работает и в топике сессии (учётка этой сессии), и в главном чате
+        (учётка по умолчанию). Ссылку присылаем сюда же, код оператор шлёт
+        обычным сообщением — его ловит on_text (см. _maybe_login_code).
+        """
+        if not self._accept(message):
+            return
+        session = self._topic_session(message)
+        try:
+            text = await self.core.login_command(session, command.args or "")
+        except UserError as e:
+            await self._reply(message, str(e))
+            return
+        # Без превью: развёрнутая карточка claude.com только мешает, а ссылка
+        # и так кликабельна.
+        await self._reply(message, text, disable_web_page_preview=True)
+
+    async def _maybe_login_code(self, message: Message, session) -> bool:
+        """Идёт вход и сообщение похоже на код — отдать его процессу входа.
+
+        True = сообщение обработано здесь и дальше по обычному пути (шелл/claude)
+        НЕ идёт. Само сообщение удаляем: код авторизации — секрет, ему не место
+        в истории чата.
+        """
+        text = message.text or ""
+        if not self.core.login_active(session) or not self.core.is_login_code(session, text):
+            return False
+        try:
+            await message.delete()
+        except Exception as e:  # нет прав на удаление — не повод срывать вход
+            logger.debug("Не удалось удалить сообщение с кодом: %s", e)
+        await self._answer(message, self.t("login_code_taken"))
+        try:
+            result = await self.core.login_code(session, text)
+        except UserError as e:
+            result = str(e)
+        await self._answer(message, result)
+        return True
+
     async def cmd_profile(self, message: Message, command: CommandObject) -> None:
         """Профиль сессии: /profile — показать текущий, /profile <имя> — сменить."""
         if not self._accept(message):
@@ -1298,6 +1341,11 @@ class TelegramAdapter:
         await self._react(message, "👀")
         session = self._topic_session(message)
         if not message.text:
+            return
+
+        # Код авторизации, если сейчас идёт /login. Проверяем ПЕРВЫМ: в липком
+        # режиме терминала код иначе уехал бы в шелл, а не процессу входа.
+        if await self._maybe_login_code(message, session):
             return
 
         # Липкий режим терминала: обычные сообщения → шелл, `>` → claude.

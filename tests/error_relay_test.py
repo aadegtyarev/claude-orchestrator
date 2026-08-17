@@ -119,6 +119,25 @@ def main():
     assert q2["quota"] is None and q2["api_error"][1] == "ratelimit"
     print("OK detect: лимит-баннер (quota+дата сброса), 429 не ложно-quota")
 
+    # ── баннер протухшей учётки (живой лог noos, 2026-08-17) ──
+    # TUI рисует строку позиционированием курсора: после снятия ANSI пробелы
+    # между словами теряются как попало — матчим «экран без пробелов».
+    for raw in (
+        "●Loginexpired·Pleaserun/login✻Churned for 0s",
+        "●Login expired · Please run /login",
+        "❯ ← for agents  99  Not logged in · Run /login",
+        "●Invalid API key · Please run /login",
+    ):
+        assert _detect_log_signals(raw.encode())["login"], raw
+    # Проза про эту самую фичу баннером не считается: нет «·» + «/login» подряд.
+    for raw in (
+        "Сессия отвечала «Login expired», это надо было ловить",
+        "если учётка протухла — оператор запускает /login руками",
+        "API Error: 429 rate limit exceeded",
+    ):
+        assert not _detect_log_signals(raw.encode())["login"], raw
+    print("OK detect: баннер учётки (со слипшимися пробелами), проза не ловится")
+
     print("ALL ERROR-RELAY OK")
 
 
