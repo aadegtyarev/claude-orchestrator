@@ -61,6 +61,23 @@ _STATS_RE = re.compile(
 # в TUI), ввод заблокирован и глаголов-спиннера нет — для человека это такой же
 # «тупняк», как долгий ход. Показываем явным пульсом, чтобы было видно ЧТО идёт.
 _COMPACTING_RE = re.compile(rb"Compacting conversation", re.IGNORECASE)
+# Протухшая учётка Claude Code — самый тихий вид поломки: сессия жива, но на
+# КАЖДОЕ сообщение отвечает сама за 0 с баннером «Login expired · Please run
+# /login» (варианты: «Not logged in · Run /login», «Invalid API key · Please
+# run /login»), без тулов и без reply_to_user. Каналу ретранслировать нечего,
+# вотчдогу нечего ловить (лог растёт, процесс жив) — в чат не приходит ничего,
+# сообщения оператора съедаются молча (живой случай: сессия noos 2026-08-17).
+#
+# Матчим по «экрану без пробелов» (тот же приём, что в box.dialog): TUI
+# позиционирует курсор, и после снятия ANSI пробелы между словами пропадают —
+# в логе noos банер выглядит как «●Loginexpired·Pleaserun/login». Требуем
+# баннер ЦЕЛИКОМ, вместе с «·» и «/login»: проза модели такого не даёт, а
+# окончательный гейт от ложной тревоги — `claude auth status` (см. turn.py).
+_LOGIN_BANNER_RE = re.compile(
+    rb"(?:loginexpired|notloggedin|invalidapikey)\xc2\xb7(?:please)?run/login",
+    re.IGNORECASE,
+)
+_SPACE_RE = re.compile(rb"\s+")
 
 
 def classify_api_error(code: bytes, detail: bytes) -> str:
@@ -79,16 +96,27 @@ def classify_api_error(code: bytes, detail: bytes) -> str:
     return "generic"
 
 
-def detect_log_signals(chunk: bytes) -> dict:
-    """Разобрать кусок claude.log на три класса сигналов.
+def has_login_banner(chunk: bytes) -> bool:
+    """Есть ли в куске баннер протухшей учётки («Login expired · … /login»).
 
-    Возвращает {api_error, retry, restarts}:
+    Пробелы выкидываем перед матчем: TUI рисует строку позиционированием
+    курсора, и после strip_ansi слова слипаются непредсказуемо.
+    """
+    return bool(_LOGIN_BANNER_RE.search(_SPACE_RE.sub(b"", chunk)))
+
+
+def detect_log_signals(chunk: bytes) -> dict:
+    """Разобрать кусок claude.log на классы сигналов.
+
+    Возвращает {api_error, retry, restarts, pulse, quota, tokens, login}:
       • api_error — (code, klass) баннера «API Error: <код>» либо None;
       • retry — (attempt, total) из «attempt K/M», последний в куске, либо None;
-      • restarts — сколько баннеров рестарта.
+      • restarts — сколько баннеров рестарта;
+      • login — виден баннер протухшей учётки (подтверждать `auth status`).
     """
     out: dict = {
         "api_error": None, "retry": None, "restarts": 0, "pulse": None, "quota": None,
+        "login": has_login_banner(chunk),
     }
     m = API_ERR_BANNER_RE.search(chunk)
     if m:

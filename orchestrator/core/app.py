@@ -32,6 +32,7 @@ import aiohttp
 
 from box import profiles
 
+from . import auth
 from . import bashshell
 from .bashshell import BashShellManager
 from .bubble import BubbleManager
@@ -113,7 +114,17 @@ class OrchestratorCore:
         self.turns = TurnSupervisor(
             manager, self.t, self.notice, self._typing_any, self.bubbles.set_status,
             tool_inflight=self.tools.inflight,
+            auth_expired=self._auth_expired,
         )
+        # Учётка Claude Code: статус профиля и вход из чата (core/auth.py).
+        # Учётка общая на профиль, поэтому и вход, и «протухла» — по профилю,
+        # а не по сессии: один /login чинит все сессии профиля разом.
+        self.logins = auth.LoginManager(config.claude_bin)
+        # Профили, про которые ТОЧНО известно, что учётка протухла (по ответу
+        # `claude auth status`). Пока флаг стоит, каждое сообщение в сессии
+        # такого профиля помечается «не дойдёт до модели» — иначе оно молча
+        # съедается TUI (см. auth.py). Снимается успешным входом/статусом.
+        self._logged_out: set[str] = set()
         # Постоянные bash-терминалы (мимо Claude Code): ключ — см. bash_key.
         self.bash = BashShellManager()
         # Топики, работающие как терминал (/term on): обычные сообщения там
@@ -220,6 +231,12 @@ class OrchestratorCore:
         # Прибираем постоянные bash-оболочки, иначе они осиротеют и переживут
         # процесс. В потоке — proc.wait(timeout) блокирующий.
         await asyncio.to_thread(self.bash.close_all)
+        # Незавершённый вход (ждали код и не дождались) — тоже процесс: без
+        # этого он пережил бы оркестратор и остался висеть на PTY.
+        try:
+            await self.logins.close_all()
+        except Exception:
+            logger.exception("Не удалось прибрать процессы входа в учётку")
         for tr in self._transports():
             try:
                 await tr.stop()
@@ -794,6 +811,12 @@ class OrchestratorCore:
         # помечаем прямо в бабле, чтобы нештатный путь был виден на каждом ходе.
         via = f" ({self.t('bubble_via_pty')})" if session.channel_blocked else ""
         await self.bubbles.append(session.name, f"📨 {snippet}{via}")
+        # Учётка профиля точно протухла (последний `auth status` сказал прямо):
+        # push прошёл, но TUI ответит на него сам «Login expired» и модель
+        # сообщения не увидит. Помечаем КАЖДОЕ такое сообщение: молчаливая
+        # потеря — ровно то, из-за чего сессия выглядит мёртвой.
+        if self.auth_known_out(session):
+            await self.notice(session, self.t("login_eaten"))
         self.turns.start(session.name)
 
     async def request_report(self, session: Session, origin: Origin) -> None:
@@ -2004,6 +2027,144 @@ class OrchestratorCore:
             ),
             "Стартовое уведомление", warn=True,
         )
+
+    # ── учётка Claude Code (/login) ─────────────────────────────
+
+    def auth_dir(self, session: Session | None) -> Path:
+        """Каталог учётки (CLAUDE_CONFIG_DIR) сессии или профиля по умолчанию."""
+        return self.manager.config_dir_of(session) or Path.home() / ".claude"
+
+    def auth_peers(self, session: Session | None) -> list[Session]:
+        """Живые сессии на той же учётке — их чинит/ломает один и тот же вход."""
+        target = self.auth_dir(session)
+        return [
+            s for s in self.manager.list_all()
+            if s.running and self.auth_dir(s) == target
+        ]
+
+    def auth_known_out(self, session: Session | None) -> bool:
+        """Известно ли ТОЧНО, что учётка этого профиля протухла (по auth status).
+
+        Зовётся на КАЖДОМ сообщении, поэтому сначала дешёвая проверка «есть ли
+        вообще протухшие учётки» — в норме множество пусто и путь профиля даже
+        не считается. getattr-фолбэк — ради ядер, собранных в тестах через
+        __new__ (тот же приём, что у sessions.runner_for).
+        """
+        if not getattr(self, "_logged_out", None):
+            return False
+        return auth.LoginManager.key(self.auth_dir(session)) in self._logged_out
+
+    async def auth_status(self, session: Session | None) -> dict:
+        """Статус учётки профиля + запомнить «протухла/жива» для пометок.
+
+        Пустой ответ («не смогли узнать») состояние НЕ меняет: молчание
+        `auth status` — не доказательство разлогина.
+        """
+        status = await self.logins.status(self.auth_dir(session))
+        key = auth.LoginManager.key(self.auth_dir(session))
+        if auth.logged_out(status):
+            self._logged_out.add(key)
+        elif status.get("loggedIn") is True:
+            self._logged_out.discard(key)
+        return status
+
+    async def _auth_expired(self, session: Session) -> bool:
+        """Колбэк релея: баннер «Login expired» в логе — учётка правда протухла?"""
+        return auth.logged_out(await self.auth_status(session))
+
+    async def login_command(self, session: Session | None, args: str = "") -> str:
+        """`/login [console|force|cancel|status]` — одна точка входа для адаптеров.
+
+        Голый `/login` при живой учётке не лезет логиниться, а показывает, кто
+        залогинен (и как войти заново): «войти» на рабочей учётке — почти всегда
+        промах пальцем, а не намерение, и лишний OAuth-раунд там не нужен.
+        """
+        arg = (args or "").strip().lower()
+        if arg in ("cancel", "отмена"):
+            return await self.login_cancel(session)
+        if arg in ("status", "статус"):
+            return await self.auth_status_text(session)
+        if arg not in ("", "console", "force"):
+            raise UserError(self.t("login_unknown_arg", arg=arg))
+        if arg == "" and not self.login_active(session):
+            status = await self.auth_status(session)
+            if status.get("loggedIn") is True:
+                return self.t(
+                    "login_status_ok", account=auth.account_line(status) or "—"
+                ) + self.t("login_force_hint")
+        return await self.login_start(session, console=arg == "console")
+
+    async def login_start(self, session: Session | None, console: bool = False) -> str:
+        """Начать (или перевыдать) вход → текст со ссылкой для оператора.
+
+        Процесс остаётся ждать код: его принесёт login_code.
+        """
+        try:
+            flow = await self.logins.start(self.auth_dir(session), console=console)
+        except auth.AuthError as e:
+            raise UserError(self.t("login_start_fail", error=str(e) or "—")) from e
+        return self.t(
+            "login_url",
+            profile=self.profile_display(session) if session else self.t("profile_none"),
+            # Ссылка едет в HTML-атрибут: без экранирования «&» в query-строке
+            # Telegram отдаёт can't parse entities и сообщение не уходит вовсе.
+            url=html.escape(flow.url or "", quote=True),
+        )
+
+    async def login_code(self, session: Session | None, code: str) -> str:
+        """Отдать код процессу входа → человеческий итог (и снять пометки).
+
+        Успех подтверждаем не текстом CLI, а `auth status`: он же и снимает
+        флаг «протухла» со всего профиля. Сессии перезапускать не нужно —
+        claude перечитывает обновлённую учётку сам.
+        """
+        config_dir = self.auth_dir(session)
+        try:
+            status = await self.logins.submit(config_dir, code)
+        except auth.AuthError as e:
+            raise UserError(self.t("login_no_flow", error=str(e) or "—")) from e
+        key = auth.LoginManager.key(config_dir)
+        if status.get("loggedIn") is True:
+            self._logged_out.discard(key)
+            peers = ", ".join(s.name for s in self.auth_peers(session))
+            return self.t(
+                "login_ok", account=auth.account_line(status) or "—",
+                peers=peers or "—",
+            )
+        if auth.logged_out(status):
+            self._logged_out.add(key)
+        return self.t("login_fail")
+
+    async def login_cancel(self, session: Session | None) -> str:
+        """Отменить незавершённый вход (процесс убить, ссылку забыть)."""
+        if not await self.logins.cancel(self.auth_dir(session)):
+            return self.t("login_nothing_to_cancel")
+        return self.t("login_cancelled")
+
+    def is_login_code(self, session: Session | None, text: str) -> bool:
+        """Похоже ли сообщение на код авторизации (см. auth.looks_like_code).
+
+        Адаптеру нужен именно признак, а не «первое сообщение после /login»:
+        пока идёт вход, оператор вполне может написать что-то модели, и такое
+        сообщение обязано уйти по обычному пути. Сверяем со `state` из выданной
+        ссылки — тогда признак точный, а не «на глаз».
+        """
+        flow = self.logins.get(self.auth_dir(session))
+        return auth.looks_like_code(text, flow.state if flow else None)
+
+    def login_active(self, session: Session | None) -> bool:
+        """Идёт ли сейчас вход по этому профилю (ждём код от оператора)."""
+        flow = self.logins.get(self.auth_dir(session))
+        return flow is not None and not flow.expired()
+
+    async def auth_status_text(self, session: Session | None) -> str:
+        """Текст `/login` без аргументов, когда вход не нужен: кто залогинен."""
+        status = await self.auth_status(session)
+        if status.get("loggedIn") is True:
+            return self.t("login_status_ok", account=auth.account_line(status) or "—")
+        if auth.logged_out(status):
+            return self.t("login_status_out")
+        return self.t("login_status_unknown")
 
     # ── форматирование ──────────────────────────────────────────
 

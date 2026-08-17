@@ -54,6 +54,11 @@ ERROR_RELAY_REPEAT = 600.0
 RETRY_SURFACE_INTERVAL = 30.0
 
 
+async def _false() -> bool:
+    """Заглушка проверки учётки для сборок без неё (тесты, урезанные ядра)."""
+    return False
+
+
 def read_log_delta(path: Path, offset: int) -> tuple[bytes, int]:
     """Прочитать приращение лога с offset: (сырой delta, новый offset=size).
 
@@ -81,11 +86,16 @@ class TurnSupervisor:
         typing: Callable[["Session"], Awaitable[bool]],
         status: Callable[..., Awaitable[None]] | None = None,
         tool_inflight: Callable[[str], bool] | None = None,
+        auth_expired: Callable[["Session"], Awaitable[bool]] | None = None,
     ):
         self.manager = manager
         self.t = t
         self._send = send
         self._typing_action = typing
+        # Подтверждение «учётка действительно протухла» (claude auth status).
+        # Баннер из лога — только повод спросить: текст TUI встречается и в
+        # прозе модели, а тревога «вы разлогинены» на ровном месте хуже молчания.
+        self._auth_expired = auth_expired or (lambda session: _false())
         # Идёт ли СЕЙЧАС foreground-тул (PreToolUse без PostToolUse) — сигнал
         # «жив, даже если CPU дерева на миг замер» (напр. Bash `sleep`/сетевое
         # ожидание). Заменяет has_kids из /proc, который под bwrap структурно
@@ -236,11 +246,15 @@ class TurnSupervisor:
         if session is None:
             return
         log = session.session_dir / "claude.log"
-        await asyncio.sleep(WATCHDOG_GRACE)
+        # Точку отсчёта берём СРАЗУ (до паузы), а читаем — после: иначе всё, что
+        # TUI напечатал в первые WATCHDOG_GRACE секунд, выпадало из первой
+        # дельты. Мимо проскакивал ровно самый быстрый сигнал — баннер
+        # протухшей учётки, который появляется мгновенно и ход на этом кончается.
         try:
             offset = log.stat().st_size  # всё, что уже в логе до хода, — не наше
         except OSError:
             return
+        await asyncio.sleep(WATCHDOG_GRACE)
         last_surfaced = -ERROR_RELAY_COOLDOWN
         last_sig: str | None = None
         last_sig_at = -ERROR_RELAY_REPEAT
@@ -249,6 +263,7 @@ class TurnSupervisor:
         restart_count = 0
         last_restart_at = -ERROR_RELAY_COOLDOWN
         last_quota_at = -ERROR_RELAY_REPEAT
+        last_login_at = -ERROR_RELAY_REPEAT
         loop_time = asyncio.get_running_loop().time
 
         async def _surf(text: str) -> None:
@@ -294,6 +309,22 @@ class TurnSupervisor:
                     self.t("api_error_quota", reset=reset) if reset
                     else self.t("api_error_quota_noreset")
                 )
+
+            # 0в. Протухшая учётка. Самый тихий отказ: claude жив и отвечает на
+            #     каждое сообщение сам («Login expired · Please run /login») за
+            #     0 с — ни тула, ни reply_to_user, в чат не долетает ничего, а
+            #     сообщения оператора съедаются. Баннер в логе — только повод
+            #     спросить `claude auth status`: его текст встречается и в прозе
+            #     модели, и ложная тревога «вы разлогинены» дороже задержки.
+            if sig["login"] and now - last_login_at >= ERROR_RELAY_REPEAT:
+                try:
+                    expired = await self._auth_expired(session)
+                except Exception as e:  # релей не должен падать на проверке
+                    expired = False
+                    logger.debug("error_relay: проверка учётки: %s", e)
+                if expired:
+                    last_login_at = now
+                    await _surf(self.t("login_expired"))
 
             # 1. Ошибка API (с дедупом: раз в COOLDOWN, та же — раз в REPEAT).
             if sig["api_error"]:
