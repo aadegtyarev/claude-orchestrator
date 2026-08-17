@@ -165,6 +165,10 @@ class Session:
     # что модель оставила крутиться в фоне; см. app.handle_stop_event / bg_text.
     background_tasks: list = field(default_factory=list)
     session_crons: list = field(default_factory=list)
+    # Когда снимок обновлялся последний раз (Stop-хук). Нужен /bg: пока ход не
+    # закончился, снимок не обновляется — а именно в таком «бесконечном ходе»
+    # фон и разрастается. Показываем возраст снимка, а не выдаём его за свежий.
+    bg_snapshot_at: float | None = None
     # id фоновых задач, о которых оператора уже уведомили (дедуп, без спама).
     bg_seen: set = field(default_factory=set)
     # Сериализация операций жизненного цикла этой сессии.

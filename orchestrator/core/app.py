@@ -41,6 +41,7 @@ from .termmode import TerminalMode
 from .errors import UserError
 from .history import HistoryLog
 from .permission import PermissionRelay
+from .proctree import list_descendants as proc_list_descendants
 from .reports import parse_cost
 from .sessions import Session, SessionError, SessionManager
 from .slug import slugify
@@ -1211,6 +1212,7 @@ class OrchestratorCore:
         crons = payload.get("session_crons")
         session.background_tasks = tasks if isinstance(tasks, list) else []
         session.session_crons = crons if isinstance(crons, list) else []
+        session.bg_snapshot_at = time.time()  # /bg честно скажет, насколько он свеж
         fresh = [
             t for t in session.background_tasks
             if isinstance(t, dict) and t.get("id") is not None
@@ -1236,13 +1238,38 @@ class OrchestratorCore:
         head = f"{kind} · {detail}" if detail else kind
         return f"{head} ({status})" if status else head
 
+    def bg_live_text(self, session: Session) -> str:
+        """Живые процессы сессии (дерево claude) — долгожители первыми.
+
+        Снимок Stop-хука обновляется только НА ГРАНИЦЕ хода, а разрастается фон
+        как раз внутри бесконечного хода: в ikar (2026-08-17) `/bg` показывал
+        пустоту, пока сутки крутились девять петель `until grep …; do sleep …;
+        done`, ждавших строку в мёртвом логе. Поэтому к снимку добавляем то,
+        что видно прямо сейчас в /proc — без модели и без хуков.
+        """
+        pid = session.process.pid if session.running and session.process else None
+        if pid is None:
+            return ""
+        rows = proc_list_descendants(pid)
+        if not rows:
+            return ""
+        lines = [self.t("bg_live_n", n=len(rows))]
+        for _pid, age, cmd in rows:
+            lines.append(f" • {self.fmt_duration(age)} · <code>{html.escape(cmd)}</code>")
+        return "\n".join(lines)
+
     def bg_text(self, session: Session) -> str:
-        """Текст `/bg`: фоновые задачи и кроны сессии из последнего снимка."""
+        """Текст `/bg`: снимок фоновых задач/кронов + живые процессы сессии."""
         tasks = [t for t in session.background_tasks if isinstance(t, dict)]
         crons = [c for c in session.session_crons if isinstance(c, dict)]
+        live = self.bg_live_text(session)
         if not tasks and not crons:
-            return self.t("bg_empty")
+            # Пусто в снимке — ещё не значит «в сессии ничего не крутится»:
+            # снимок мог просто ни разу не обновиться (ход не кончался).
+            return "\n\n".join(x for x in (self.t("bg_empty"), self.bg_stale_note(session), live) if x)
         lines = [self.t("bg_header", title=html.escape(session.title))]
+        if note := self.bg_stale_note(session):
+            lines.append(note)
         lines.append(self.t("bg_tasks_n", n=len(tasks)) if tasks else self.t("bg_no_tasks"))
         for task in tasks:
             tid = html.escape(str(task.get("id") or "?"))
@@ -1261,7 +1288,22 @@ class OrchestratorCore:
             raw_desc = str(cron.get("description") or cron.get("prompt") or "")
             desc = html.escape(" ".join(raw_desc.split())[:120])
             lines.append(f" • {sched} {desc}".rstrip())
+        if live:
+            lines.append("")
+            lines.append(live)
         return "\n".join(lines)
+
+    def bg_stale_note(self, session: Session) -> str:
+        """Пометка «снимку столько-то» — если он есть и не свежий.
+
+        Возраст снимка = возраст последнего Stop-хука. Пока ход идёт, снимок
+        стоит на месте, и без этой строки `/bg` выдаёт вчерашнее за сегодняшнее.
+        """
+        at = session.bg_snapshot_at
+        if at is None:
+            return self.t("bg_never")
+        age = time.time() - at
+        return self.t("bg_stale", age=self.fmt_duration(age)) if age > 300 else ""
 
     # ── permission relay ────────────────────────────────────────
 

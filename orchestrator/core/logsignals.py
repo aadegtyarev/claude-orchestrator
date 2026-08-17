@@ -78,6 +78,19 @@ _LOGIN_BANNER_RE = re.compile(
     re.IGNORECASE,
 )
 _SPACE_RE = re.compile(rb"\s+")
+# Лимит подписки на 5-часовое окно: Claude Code рисует
+# «Session limit reached · Retrying in 39m (9pm) · attempt 1/15» и ретраит сам
+# до сброса. Ход всё это время стоит: ни тула, ни ответа — со стороны сессия
+# выглядит мёртвой (живой случай: ikar 2026-08-17, окно выжжено на 100%).
+# Прежний quota-детектор мимо: он ждёт «API Error: … Limit Exhausted», а тут
+# баннер другой формы и без кода.
+#
+# Матчим по «экрану без пробелов»: TUI роняет символы при перерисовке — в логе
+# ikar встречались и «Retrying n 1h», и «atempt 1/15». Поэтому обязательным
+# считаем только сам триггер, а время сброса и остаток — необязательные.
+_SESSION_LIMIT_RE = re.compile(rb"sessionlimitreached", re.IGNORECASE)
+# Часы сброса в скобках сразу после триггера: «(9pm)», «(21:00)».
+_LIMIT_RESET_RE = re.compile(rb"\((\d{1,2}(?::\d{2})?(?:am|pm)?)\)", re.IGNORECASE)
 
 
 def classify_api_error(code: bytes, detail: bytes) -> str:
@@ -105,6 +118,21 @@ def has_login_banner(chunk: bytes) -> bool:
     return bool(_LOGIN_BANNER_RE.search(_SPACE_RE.sub(b"", chunk)))
 
 
+def find_session_limit(chunk: bytes) -> str | None:
+    """Баннер «Session limit reached» → время сброса («9pm») или "" , иначе None.
+
+    "" значит «лимит виден, а часы сброса разобрать не вышло» — это всё равно
+    повод сказать оператору, что ход стоит не просто так. Ищем часы в 80
+    символах после триггера: дальше начинается уже другой кусок экрана.
+    """
+    screen = _SPACE_RE.sub(b"", chunk)
+    m = _SESSION_LIMIT_RE.search(screen)
+    if not m:
+        return None
+    reset = _LIMIT_RESET_RE.search(screen, m.end(), m.end() + 80)
+    return reset.group(1).decode("ascii", "replace") if reset else ""
+
+
 def detect_log_signals(chunk: bytes) -> dict:
     """Разобрать кусок claude.log на классы сигналов.
 
@@ -112,11 +140,14 @@ def detect_log_signals(chunk: bytes) -> dict:
       • api_error — (code, klass) баннера «API Error: <код>» либо None;
       • retry — (attempt, total) из «attempt K/M», последний в куске, либо None;
       • restarts — сколько баннеров рестарта;
-      • login — виден баннер протухшей учётки (подтверждать `auth status`).
+      • login — виден баннер протухшей учётки (подтверждать `auth status`);
+      • session_limit — время сброса 5-часового окна («9pm»), "" если баннер
+        есть, а часы не разобрались, None — баннера нет.
     """
     out: dict = {
         "api_error": None, "retry": None, "restarts": 0, "pulse": None, "quota": None,
         "login": has_login_banner(chunk),
+        "session_limit": find_session_limit(chunk),
     }
     m = API_ERR_BANNER_RE.search(chunk)
     if m:
