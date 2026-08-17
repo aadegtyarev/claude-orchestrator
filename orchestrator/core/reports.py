@@ -28,8 +28,16 @@ def parse_cost(text: str) -> dict:
         out["session_pct"] = m.group(1)
     if m := re.search(r"Current week \(all models\).*?(\d+)%\s*used", t):
         out["week_pct"] = m.group(1)
+    # Дедуп по имени модели: в дельте лога экран /cost почти всегда лежит
+    # ДВАЖДЫ (TUI перерисовывает его целиком), и без этого «Неделя, Fable: 19%»
+    # приезжало в чат двумя одинаковыми строками (живой /usage ikar).
+    seen_models: set[str] = set()
     for mm in re.finditer(r"Current week \((?!all models)([^)]+)\).*?(\d+)%\s*used", t):
-        out.setdefault("models", []).append((mm.group(1).strip(), mm.group(2)))
+        name = mm.group(1).strip()
+        if name in seen_models:
+            continue
+        seen_models.add(name)
+        out.setdefault("models", []).append((name, mm.group(2)))
     resets = re.findall(r"Resets? ([A-Za-z0-9:, ]+?\([^)]+\))", t)
     if resets:
         out["session_reset"] = resets[0].strip()

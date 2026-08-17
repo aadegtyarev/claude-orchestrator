@@ -264,6 +264,8 @@ class TurnSupervisor:
         last_restart_at = -ERROR_RELAY_COOLDOWN
         last_quota_at = -ERROR_RELAY_REPEAT
         last_login_at = -ERROR_RELAY_REPEAT
+        last_limit_at = -ERROR_RELAY_REPEAT
+        last_limit_reset: str | None = None
         loop_time = asyncio.get_running_loop().time
 
         async def _surf(text: str) -> None:
@@ -325,6 +327,23 @@ class TurnSupervisor:
                 if expired:
                     last_login_at = now
                     await _surf(self.t("login_expired"))
+
+            # 0г. Лимит подписки на 5-часовое окно: «Session limit reached ·
+            #     Retrying in 39m (9pm)». Claude Code ретраит сам до сброса, но
+            #     ход всё это время стоит и новых сообщений модель не видит —
+            #     ровно то, что снаружи выглядит как «сессия не отвечает»
+            #     (ikar 2026-08-17). Показываем причину и час сброса: раз в
+            #     REPEAT, но заново — если час сброса сменился (новое окно).
+            if sig["session_limit"] is not None and (
+                sig["session_limit"] != last_limit_reset
+                or now - last_limit_at >= ERROR_RELAY_REPEAT
+            ):
+                last_limit_at = now
+                last_limit_reset = sig["session_limit"]
+                await _surf(
+                    self.t("session_limit", reset=sig["session_limit"])
+                    if sig["session_limit"] else self.t("session_limit_noreset")
+                )
 
             # 1. Ошибка API (с дедупом: раз в COOLDOWN, та же — раз в REPEAT).
             if sig["api_error"]:
