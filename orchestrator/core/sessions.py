@@ -796,6 +796,11 @@ class SessionManager:
             "command": f'"{self._guest_python(session)}" "{hook_script}"',
         }
         hooks: dict = {"Stop": [{"hooks": [hook_cmd]}]}  # Stop не поддерживает matcher
+        # PreCompact — вне show_tool_calls: это не про баблы тул-вызовов, а про
+        # то, что сессия не унаследует собственный отказ как факт (hookscript.py,
+        # originprompt.COMPACT_TRUST_INSTRUCTION). Матчер "" = любой триггер
+        # (manual и auto), stdout хука уезжает в промпт суммаризатора.
+        hooks["PreCompact"] = [{"matcher": "", "hooks": [hook_cmd]}]
         if self.config.show_tool_calls:
             hooks["PreToolUse"] = [{"matcher": "", "hooks": [hook_cmd]}]
             # Завершение вызова (bash: ✓/✗ + время) и сабагента; тот же
