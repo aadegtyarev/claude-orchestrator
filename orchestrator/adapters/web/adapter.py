@@ -373,6 +373,11 @@ class WebAdapter:
         # У веба нет reply-цитирования — токен произвольный, ядро его не трактует.
         return Origin(self.name, "0")
 
+    def known_origin(self, session: Session, token: str) -> bool:
+        """Веб адресуется по имени сессии: токен ни на что не влияет, значит и
+        сверять в нём нечего (см. Transport.known_origin)."""
+        return True
+
     # ── HTTP: WebSocket ─────────────────────────────────────────
 
     async def h_ws(self, request: web.Request) -> web.WebSocketResponse:

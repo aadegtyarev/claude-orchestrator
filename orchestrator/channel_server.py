@@ -21,6 +21,7 @@ import secrets
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 
 # Канал общается с оркестратором ТОЛЬКО по stdlib (urllib + http.server), без
@@ -491,6 +492,19 @@ class ChannelServer:
         try:
             await self._post(ORCH_URL, payload, timeout=30)
             result = {"content": [{"type": "text", "text": f"{ok_text} (ctx={payload.get('context_id')})"}]}
+        except urllib.error.HTTPError as e:
+            # 422 = оркестратор отверг адресата (кривой/чужой context_id) и
+            # положил в тело объяснение ДЛЯ МОДЕЛИ. Отдаём его дословно: иначе
+            # она увидит бессмысленное «HTTP Error 422» и не поймёт, что
+            # чинить. Прочие коды — обычная авария доставки.
+            body = ""
+            try:
+                body = e.read().decode("utf-8", "replace").strip()
+            except Exception:
+                pass
+            text = body if (e.code == 422 and body) else f"Failed: {e}"
+            logger.error("Оркестратор отверг %s: %s %s", ORCH_URL, e.code, body[:300])
+            result = {"isError": True, "content": [{"type": "text", "text": text}]}
         except Exception as e:
             logger.error("Не удалось передать оркестратору: %s", e)
             result = {

@@ -182,6 +182,40 @@ class TelegramAdapter:
                 self.chat_id, None, self.t("topic_delete_fail", error=e), core=True
             )
 
+    def known_origin(self, session: Session, token: str) -> bool:
+        """Мог ли этот токен родиться здесь: chat:thread:message с НАШИМ чатом
+        и топиком ЭТОЙ сессии (см. Transport.known_origin).
+
+        Сверяем чат и топик, а не message_id: id сообщения оператора мы не
+        храним, да и цитата — вещь необязательная. А вот чужой чат или чужой
+        топик — это уже другой адресат, и молча подменять его привязкой сессии
+        нельзя.
+        """
+        parts = token.split(":")
+        if len(parts) != 3:
+            return False
+        chat, thread, _msg = parts
+        # Чат ещё не привязан (нет TELEGRAM_CHAT_ID и не было ни одного
+        # сообщения) — сверять НЕ С ЧЕМ. Тогда не отказываем: отклонять надо
+        # доказанно чужой адрес, а не любой непроверяемый, иначе холодный старт
+        # съедал бы законные ответы (доставить их может, например, веб).
+        if self.chat_id is None:
+            return True
+        # Чат привязан, а у СЕССИИ топика нет — это не «сверять нечем», это
+        # «сверка провалилась»: здесь мы её доставить не можем в принципе
+        # (deliver_text выйдет на thread_id is None). Подставить сюда 0 значило
+        # бы принять выдуманный адрес и ответить модели «Reply sent», не
+        # доставив ничего — ровно та тихая потеря, которую чиним.
+        own = self._thread_of(session)
+        if own is None:
+            return False
+        try:
+            if int(chat) != self.chat_id:
+                return False
+            return int(thread) == own
+        except ValueError:
+            return False
+
     # ── Transport: доставка ─────────────────────────────────────
 
     @staticmethod
