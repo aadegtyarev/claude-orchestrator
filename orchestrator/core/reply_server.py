@@ -14,6 +14,7 @@ from typing import Awaitable, Callable
 from aiohttp import web
 
 from ..config import Config
+from .errors import ReplyRejected
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,13 @@ def _make_route(handler, *, needs_name: bool, swallow_errors: bool, what: str):
         args = (request.match_info["name"], payload) if needs_name else (payload,)
         try:
             await handler(*args)
+        except ReplyRejected as e:
+            # Не авария, а промах модели адресом: текст исключения написан ДЛЯ
+            # НЕЁ и должен доехать до неё как результат тула. 422 (а не 500,
+            # который канал показал бы как «Failed: HTTP Error 500») — тело
+            # запроса синтаксически валидно, но адресат не существует.
+            logger.warning("%s отклонён: %s", what, e)
+            return web.Response(status=422, text=str(e))
         except Exception:
             logger.exception("Ошибка обработки %s", what)
             if not swallow_errors:

@@ -38,7 +38,7 @@ from .bashshell import BashShellManager
 from .bubble import BubbleManager
 from .termhistory import TermHistory
 from .termmode import TerminalMode
-from .errors import UserError
+from .errors import ReplyRejected, UserError
 from .history import HistoryLog
 from .permission import PermissionRelay
 from .proctree import list_descendants as proc_list_descendants
@@ -309,17 +309,48 @@ class OrchestratorCore:
         return f"{origin.adapter}:{session.name}:{origin.token}"
 
     def _parse_context(self, context_id: str) -> tuple[Session | None, Origin | None]:
-        """context_id = <адаптер>:<имя-сессии>:<токен>. Кривой — drop, а не
-        «дефолт куда-нибудь»: иначе баг канала мог бы вбросить ответ не туда."""
+        """context_id = <адаптер>:<имя-сессии>:<токен>. Кривой — ReplyRejected,
+        а не «дефолт куда-нибудь»: иначе баг канала мог бы вбросить ответ не туда.
+
+        Отказ ГРОМКИЙ (исключение с текстом для модели), а не тихий drop. Тихий
+        drop давал модели «Reply sent» на неотправленный ответ: она считала, что
+        сказанное дошло, и строила дальнейшие рассуждения на несуществующей
+        доставке. Живой случай — сессия выдумала «личный канал» и требовала
+        подтверждения оттуда, куда никто не мог написать.
+        """
         parts = context_id.split(":", 2)
-        if len(parts) == 3:
-            adapter, sname, token = parts
-            session = self.manager.get(sname)
-            if session is not None:
-                origin = Origin(adapter, token) if adapter in self.adapters else None
-                return session, origin
-        logger.warning("Некорректный context_id (игнорирую): %r", context_id)
-        return None, None
+        if len(parts) != 3:
+            raise ReplyRejected(
+                f"Malformed context_id {context_id!r} — nothing was delivered. "
+                "Copy the context_id attribute verbatim from the <channel> tag "
+                "of the message you are answering."
+            )
+        adapter, sname, token = parts
+        session = self.manager.get(sname)
+        if session is None:
+            raise ReplyRejected(
+                f"Unknown session {sname!r} in context_id {context_id!r} — "
+                "nothing was delivered. Copy the context_id attribute verbatim "
+                "from the <channel> tag of the message you are answering."
+            )
+        transport = self.adapters.get(adapter)
+        if transport is None:
+            # Адаптер выключен (или его вовсе нет): сессия найдена, отвечаем в
+            # остальные транспорты без reply-цитаты — доставка не адресная.
+            return session, None
+        # Токен проверяет сам адаптер: структура токена — его знание. Адаптер
+        # без known_origin считается непроверяющим (метод в Transport
+        # опционален) — поведение как раньше.
+        check = getattr(transport, "known_origin", None)
+        if check is not None and not check(session, token):
+            raise ReplyRejected(
+                f"Unknown address in context_id {context_id!r} — nothing was "
+                f"delivered. The {adapter} adapter never issued that context "
+                f"for session {sname!r}; there is no separate chat to answer "
+                "in. Copy the context_id attribute verbatim from the <channel> "
+                "tag of the message you are answering."
+            )
+        return session, Origin(adapter, token)
 
     # ── статусы и справочная информация ─────────────────────────
 
@@ -887,10 +918,12 @@ class OrchestratorCore:
     # ── ответы Claude (вызывается reply_server'ом) ──────────────
 
     async def handle_reply(self, data: dict) -> None:
-        """Текстовый ответ или файл от Claude (тул reply_to_user)."""
+        """Текстовый ответ или файл от Claude (тул reply_to_user).
+
+        Кривой/чужой context_id поднимает ReplyRejected — reply-сервер вернёт
+        его текст модели (см. _parse_context).
+        """
         session, origin = self._parse_context(str(data.get("context_id", "")))
-        if session is None:
-            return
         self.manager.touch(session)  # ответ/файл = активность (таймер простоя)
 
         if data.get("file_path"):

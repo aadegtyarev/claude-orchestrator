@@ -36,6 +36,7 @@ from . import hookscript
 from . import resources
 from . import transcript
 from .ansi import strip_ansi
+from .originprompt import channel_trust_prompt
 from .channelstate import (
     BLOCKED as CHANNEL_BLOCKED,
     SCAN_BYTES,
@@ -954,7 +955,13 @@ class SessionManager:
                     "виден) — держи окружение в проекте %s (RW) или в ~ сессии "
                     "(персистентный дом)", session.name, session.linked_path,
                 )
-            extra: list[str] = []
+            # Канал оператора — не «внешний источник». Claude Code штампует
+            # каждое сообщение из MCP-канала как недоверенное и снаружи это не
+            # отключается; системный промпт под штамп не попадает, поэтому
+            # границу доверия объясняем здесь (см. originprompt.py).
+            extra: list[str] = [
+                "--append-system-prompt", channel_trust_prompt(session.name),
+            ]
             mcp_json = session.session_dir / ".mcp.json"
             if mcp_json.exists():
                 extra += ["--mcp-config", str(mcp_json)]

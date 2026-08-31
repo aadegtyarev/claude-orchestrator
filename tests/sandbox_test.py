@@ -225,8 +225,12 @@ def test_no_job_control_warning_stderr_still_works():
         )
         sh = BashSession(work, wrapper)
         try:
+            # Стартовый и конечный маркеры НЕ должны быть префиксом друг друга:
+            # прежний "START{marker}" сам содержал маркер конца, ожидание
+            # обрывалось на первом же echo — и под нагрузкой (полный прогон)
+            # тест падал, не дождавшись stderr от cat.
             marker = "JCDONE"
-            sh.write(f"echo START{marker}; cat /no/such/file/xyz; echo {marker}\n")
+            sh.write(f"echo BEGIN_CMD; cat /no/such/file/xyz; echo {marker}\n")
             deadline = time.time() + 15
             while time.time() < deadline:
                 if marker.encode() in sh.snapshot():

@@ -109,6 +109,9 @@ orchestrator/
     bashshell.py     — постоянные bash-терминалы (мимо Claude)
     reply_server.py  — HTTP-приёмник от channel-серверов и хуков
     channelstate.py  — загрузился ли dev-канал: баннер в claude.log → вердикт
+    originprompt.py  — блок --append-system-prompt: канал оператора не «внешний
+                       источник» (клиент штампует канал недоверенным, и снаружи
+                       это не отключается)
     toolline/texts/transcript/mdrender/logsignals/ansi/slug/proctree/hookscript
   adapters/
     telegram/        — aiogram: топики, кнопки, реакции, файлы
