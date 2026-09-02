@@ -6,7 +6,9 @@
   • стоп процесса не виснет: драйвер выходит, master закрыт (таймауты на join);
   • авто-ответ на стартовый диалог: `cat`-эхо кормит встроенный в launch
     _DialogAnswerer текстом диалога, тот пишет клавиши-ответ в PTY (видно по эху);
-  • сбой спавна (несуществующий бинарь) не течёт fd и пробрасывает исключение.
+  • сбой спавна (несуществующий бинарь) не течёт fd и пробрасывает исключение;
+  • oom_score_adj: ребёнок поднимает себе adj (и передаёт его внукам), а
+    невозможность записи не роняет запуск.
 
 box автономен — импортим из источника; launch зовётся из event loop (asyncio),
 поэтому тесты — корутины (conftest.py гоняет их без pytest-asyncio).
@@ -15,6 +17,7 @@ box автономен — импортим из источника; launch зо
 """
 import asyncio
 import os
+import re
 import sys
 import threading
 from pathlib import Path
@@ -122,10 +125,67 @@ async def test_launch_spawn_failure_no_fd_leak():
     print("OK сбой спавна: исключение проброшено, fd не утекли")
 
 
+async def test_launch_raises_oom_score_adj():
+    """oom_score_adj поднимает adj ребёнку И его потомкам.
+
+    Зачем: OOM-killer выбирает жертву по oom_score_adj, а у всего cgroup он
+    одинаковый — под нож шёл случайный процесс, часто не виновник (живой
+    инцидент 2026-09-02: течь в сессии уносила оркестратор и соседние сессии).
+    Сессия обязана быть более привлекательной жертвой, чем ядро, которое ею
+    управляет. Наследование внуками принципиально: течёт обычно не сам claude,
+    а то, что он запустил.
+
+    Непривилегированный процесс умеет только ПОВЫШАТЬ свой adj, поэтому берём
+    заведомо большее значение, чем у самого теста."""
+    on_output, snapshot = _collector()
+    mine = int(Path(f"/proc/{os.getpid()}/oom_score_adj").read_text().strip())
+    target = mine + 200
+    handle = await launch(
+        # внук: sh -c порождает второй sh, печатающий СВОЙ adj
+        ["/bin/sh", "-c", "cat /proc/self/oom_score_adj; sh -c 'cat /proc/self/oom_score_adj'"],
+        cwd=os.getcwd(),
+        env=dict(os.environ),
+        on_output=on_output,
+        name="oom",
+        oom_score_adj=target,
+    )
+    await asyncio.wait_for(handle.process.wait(), timeout=5)
+    handle.driver_thread.join(timeout=5)
+    got = [int(x) for x in re.findall(rb"\d+", snapshot())]
+    assert got == [target, target], f"adj не выставлен/не наследуется: {snapshot()!r}"
+    print("OK launch поднимает oom_score_adj ребёнку и внукам")
+
+
+async def test_launch_oom_score_adj_failure_is_not_fatal():
+    """Невозможность записать adj НЕ роняет запуск сессии.
+
+    Понижение adj непривилегированному запрещено (EACCES) — это ровно тот
+    случай, когда «сделать лучше» не вышло. Сессия важнее оптимизации выбора
+    жертвы: процесс обязан подняться, просто со старым adj."""
+    on_output, snapshot = _collector()
+    mine = int(Path(f"/proc/{os.getpid()}/oom_score_adj").read_text().strip())
+    handle = await launch(
+        ["/bin/sh", "-c", "cat /proc/self/oom_score_adj"],
+        cwd=os.getcwd(),
+        env=dict(os.environ),
+        on_output=on_output,
+        name="oom-deny",
+        oom_score_adj=mine - 500,  # понижение -> EACCES
+    )
+    await asyncio.wait_for(handle.process.wait(), timeout=5)
+    handle.driver_thread.join(timeout=5)
+    assert handle.process.returncode == 0, "запуск упал из-за отказа записи adj"
+    got = [int(x) for x in re.findall(rb"\d+", snapshot())]
+    assert got == [mine], f"adj неожиданно изменился: {snapshot()!r}"
+    print("OK отказ записи oom_score_adj не роняет запуск")
+
+
 def main():
     asyncio.run(test_launch_spawns_and_streams_output())
     asyncio.run(test_launch_auto_answers_dialog())
     asyncio.run(test_launch_spawn_failure_no_fd_leak())
+    asyncio.run(test_launch_raises_oom_score_adj())
+    asyncio.run(test_launch_oom_score_adj_failure_is_not_fatal())
     print("ALL BOX-LAUNCH OK")
 
 

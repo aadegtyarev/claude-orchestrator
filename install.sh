@@ -141,6 +141,19 @@ WorkingDirectory=$DIR
 # командную строку (иначе убивает свой control-process → старт падает).
 ExecStartPre=/bin/sh -c 'pkill -TERM -f "[.]venv/bin/python -m orchestrator" || true; sleep 1'
 ExecStart=$DIR/.venv/bin/python -m orchestrator
+# OOM внутри cgroup — НЕ повод гасить весь юнит. В cgroup живут независимые
+# сессии: течь в ОДНОЙ (живой инцидент 2026-09-02: pytest-xdist в сессии вырос
+# до 16 GiB) при дефолтном OOMPolicy=stop роняла весь control-group — то есть
+# оркестратор и все остальные сессии разом. continue = ядро убивает виновника,
+# юнит и соседи живут дальше.
+OOMPolicy=continue
+# Жертву OOM ядро выбирает по oom_score_adj, а у всего cgroup он одинаковый —
+# под нож шёл случайный процесс, часто не виновник. Опускаем оркестратор к 100:
+# это ПОЛ для user-юнитов (adj самого systemd --user) — непривилегированный
+# процесс умеет только ПОВЫШАТЬ свой adj, всё меньшее systemd схлопнет в 100.
+# Разрыв с сессиями делает надбавка, которую они ставят себе сами при спавне
+# (SESSION_OOM_SCORE_ADJ в orchestrator/core/sessions.py).
+OOMScoreAdjust=100
 Restart=on-failure
 RestartSec=5
 KillMode=control-group

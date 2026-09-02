@@ -68,6 +68,17 @@ from box.ready import (  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
+# Насколько сессия «привлекательнее» оркестратора как жертва OOM-killer.
+# Ядро выбирает жертву по oom_score_adj, а у всего cgroup он одинаковый —
+# поэтому под нож шёл случайный процесс, часто не виновник: течь в ОДНОЙ сессии
+# уносила и оркестратор, и соседние сессии (инцидент 2026-09-02, pytest-xdist
+# в сессии вырос до 16 GiB). Сессию с её деревом убить не жалко — она
+# перезапускаема и её потерю оператор увидит; ядро, которое ими управляет, —
+# нет. Отрицательный adj оркестратору задать НЕЛЬЗЯ (непривилегированный
+# процесс умеет только повышать свой adj, systemd схлопывает всё ниже 100 к
+# 100), поэтому разрыв делаем с этой стороны — надбавкой сессиям.
+SESSION_OOM_SCORE_ADJ = 500
+
 # Каталог пакета orchestrator/ (channel_server.py) и корень репозитория
 # (.venv, RO-бинд песочницы) — этот модуль лежит в orchestrator/core/.
 PKG_DIR = Path(__file__).resolve().parent.parent
@@ -1003,7 +1014,12 @@ class SessionManager:
             # готовые argv/env/cwd и колбэк вывода, забирает ручки из handle.
             # Сбой спавна launch чистит свои fd (master/slave); лог закрываем мы.
             handle = await box_launch(
-                argv, cwd=cwd, env=env, on_output=_on_output, name=session.name
+                argv,
+                cwd=cwd,
+                env=env,
+                on_output=_on_output,
+                name=session.name,
+                oom_score_adj=SESSION_OOM_SCORE_ADJ,
             )
         except Exception:
             self._close_log(session)
