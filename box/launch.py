@@ -44,6 +44,29 @@ class LaunchHandle:
     driver_thread: Thread
 
 
+def _oom_setter(adj: int | None) -> Callable[[], None] | None:
+    """preexec_fn, выставляющий oom_score_adj ребёнку. None -> не трогать.
+
+    Между fork и exec: значение переживает exec и наследуется потомками, то есть
+    накрывает всё дерево сессии, а не только сам claude.
+
+    Ошибка записи ГЛУШИТСЯ намеренно: исключение из preexec_fn убивает спавн, а
+    отказ ядра (понижение adj непривилегированному — EACCES) не повод не
+    поднимать сессию. Логировать отсюда нельзя — мы уже в форкнутом ребёнке.
+    """
+    if adj is None:
+        return None
+
+    def _set() -> None:
+        try:
+            with open("/proc/self/oom_score_adj", "w") as f:
+                f.write(str(adj))
+        except OSError:
+            pass
+
+    return _set
+
+
 async def launch(
     argv: Sequence[str],
     *,
@@ -53,6 +76,7 @@ async def launch(
     name: str = "",
     rows: int = TERM_ROWS,
     cols: int = TERM_COLS,
+    oom_score_adj: int | None = None,
 ) -> LaunchHandle:
     """Поднять готовую команду `argv` под PTY и запустить драйвер вывода.
 
@@ -65,6 +89,14 @@ async def launch(
     зондирует размер через CPR — под двойным PTY (agent-vm) ответы на зонды текут
     мусором в stdin. Драйвер владеет master-fd и закроет его сам, когда процесс
     закроет PTY.
+
+    oom_score_adj — сделать процесс более привлекательной жертвой для OOM-killer,
+    чем оркестратор, который им управляет. Ставится в preexec_fn (между fork и
+    exec), поэтому наследуется ВСЕМ деревом сессии: течёт обычно не сам claude,
+    а то, что он запустил. Ядро умеет только ПОВЫШАТЬ adj непривилегированному —
+    попытка понизить даёт EACCES и намеренно игнорируется: не выставленный adj
+    это упущенная оптимизация выбора жертвы, а упавший спавн — потерянная
+    сессия. None = не трогать.
 
     Сбой спавна: master и slave закрываются (fd не текут), исключение
     пробрасывается — вызывающий чистит своё (лог) и решает, что делать.
@@ -79,6 +111,7 @@ async def launch(
             stderr=slave,
             env=env,
             start_new_session=True,
+            preexec_fn=_oom_setter(oom_score_adj),
         )
     except Exception:
         os.close(master)
