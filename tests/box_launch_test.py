@@ -159,9 +159,13 @@ async def test_launch_raises_oom_score_adj():
 async def test_launch_oom_score_adj_failure_is_not_fatal():
     """Невозможность записать adj НЕ роняет запуск сессии.
 
-    Понижение adj непривилегированному запрещено (EACCES) — это ровно тот
-    случай, когда «сделать лучше» не вышло. Сессия важнее оптимизации выбора
-    жертвы: процесс обязан подняться, просто со старым adj."""
+    Живой отказ, ради которого это написано, — понижение adj непривилегированному
+    (EACCES). Но воспроизводить его понижением нельзя: под root (CI-раннер)
+    понижение РАЗРЕШЕНО, и тест там проверял бы не то. Берём отказ, который ядро
+    даёт всем одинаково: значение вне диапазона [-1000, 1000] -> EINVAL.
+
+    Сессия важнее оптимизации выбора жертвы: процесс обязан подняться, просто
+    со старым adj."""
     on_output, snapshot = _collector()
     mine = int(Path(f"/proc/{os.getpid()}/oom_score_adj").read_text().strip())
     handle = await launch(
@@ -170,7 +174,7 @@ async def test_launch_oom_score_adj_failure_is_not_fatal():
         env=dict(os.environ),
         on_output=on_output,
         name="oom-deny",
-        oom_score_adj=mine - 500,  # понижение -> EACCES
+        oom_score_adj=5000,  # вне диапазона -> EINVAL хоть под root, хоть под юзером
     )
     await asyncio.wait_for(handle.process.wait(), timeout=5)
     handle.driver_thread.join(timeout=5)
