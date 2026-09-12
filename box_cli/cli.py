@@ -192,7 +192,10 @@ _USAGE = (
     "                   и (под bwrap) свой $HOME; реальные ~/.claude/~/.ssh скрыты.\n"
     "                   Граница: из env вырезаются кредлы (*TOKEN/*SECRET/*KEY,\n"
     "                   SSH_AUTH_SOCK), остальное окружение хоста наследуется;\n"
-    "                   текущий каталог и установка claude остаются видны\n"
+    "                   текущий каталог и установка claude остаются видны.\n"
+    "                   Настройки профиля — profile.toml рядом с .claude: base_url\n"
+    "                   (адрес API), auth_token_file (токен из файла) и [env]\n"
+    "                   (свои переменные процесса claude)\n"
     "  --wallet         без имени — поднять ВСЕ секреты, которые policy разрешает\n"
     "                   claude-box (набор решает policy, как у сессии\n"
     "                   оркестратора); прокси-секреты в набор не входят — их\n"
@@ -795,9 +798,10 @@ async def main_async(argv: Sequence[str]) -> int:
     # Профиль-редирект поверх окружения (CLAUDE_CONFIG_DIR + HOME под bwrap);
     # wallet ниже добавляет свой HTTPS_PROXY/CA — не пересекается с этими ключами.
     env.update(profile_env_extra)
-    # Адрес API профиля (profile.toml → ANTHROPIC_BASE_URL) — ПОСЛЕ наследования
-    # окружения оператора: у профиля своя учётка, и эндпоинт у неё свой (пустой
-    # base_url снимает унаследованный прокси). Подробности — box/profiles.py.
+    # Настройки профиля (profile.toml → адрес API, [env], токен из файла) — ПОСЛЕ
+    # наследования окружения оператора: у профиля своя учётка, и эндпоинт у неё
+    # свой (пустой base_url снимает унаследованный прокси), а токен приходит уже
+    # после вычистки кредлов в build_env. Подробности — box/profiles.py.
     if opts.profile is not None:
         from .profiles import ProfileError as _ProfileError, apply_settings
         try:
@@ -1004,25 +1008,43 @@ def cmd_init(args: Sequence[str]) -> int:
     return 0
 
 
+def _tilde(path: str) -> str:
+    """Путь для показа: ~/… вместо полного (короче и без имени юзера)."""
+    home = str(Path.home())
+    return "~" + path[len(home):] if path == home or path.startswith(home + "/") else path
+
+
 def _profile_line(name: str, load_settings) -> str:
-    """Строка профиля для списка: имя и его адрес API (если задан)."""
+    """Строка профиля для списка: имя, адрес API, env и файл токена.
+
+    Токен НЕ читаем и не показываем — только путь: список отвечает на вопрос
+    «какой учёткой и куда», а значение секрета в терминале/чате не место.
+    """
     try:
-        base_url = load_settings(name).base_url
+        s = load_settings(name)
     except Exception as e:  # битый profile.toml — виден, но список не рушит
         return f"{name}  ← {e}"
-    if base_url is None:
+    parts: list[str] = []
+    if s.base_url is not None:
+        parts.append(s.base_url or "напрямую (api.anthropic.com)")
+    if s.env:
+        parts.append(f"env: {len(s.env)}")
+    if s.auth_token_file is not None:
+        parts.append(f"токен: {_tilde(s.auth_token_file)}")
+    if not parts:
         return name
-    return f"{name}  → {base_url or 'напрямую (api.anthropic.com)'}"
+    return f"{name}  → {'  ·  '.join(parts)}"
 
 
 def cmd_profile(args: Sequence[str]) -> int:
     """`profile` — список профилей; `profile rm <имя>` — удалить каталог профиля.
 
-    В списке показываем адрес API профиля (profile.toml): «какой учёткой я
-    работаю» и «куда она ходит» — один вопрос, разные ответы у разных профилей,
-    и молчать про второй значит прятать причину, по которой сессия ведёт себя
-    иначе. Сломанный profile.toml печатаем строкой ошибки рядом с именем, а не
-    роняем весь список: остальные профили тут ни при чём.
+    В списке показываем адрес API профиля, число его переменных [env] и путь к
+    файлу токена (profile.toml): «какой учёткой я работаю» и «куда она ходит» —
+    один вопрос, разные ответы у разных профилей, и молчать про второй значит
+    прятать причину, по которой сессия ведёт себя иначе. Значение токена не
+    показываем — только путь. Сломанный profile.toml печатаем строкой ошибки
+    рядом с именем, а не роняем весь список: остальные профили тут ни при чём.
     """
     from .profiles import ProfileError, list_profiles, load_settings, remove_profile
     if not args:

@@ -11,8 +11,9 @@ CLAUDE_CONFIG_DIR=<profile>/.claude валидны и снаружи, и изн�
 Это забота Слоя-CLI (box_cli), не автономного пакета box/: здесь только stdlib,
 никакого orchestrator — box_cli докидывает env-редирект + RW-бинд поверх Engine.
 
-Кроме учётки профиль несёт СВОЙ адрес API (`profile.toml`, ключ `base_url`) —
-см. раздел «настройки профиля» ниже.
+Кроме учётки профиль несёт СВОИ настройки процесса claude (`profile.toml`):
+адрес API (`base_url`), токен из файла (`auth_token_file`) и произвольные
+переменные окружения (`[env]`) — см. раздел «настройки профиля» ниже.
 
 БЕЗОПАСНОСТЬ. Имя профиля идёт в path-join, поэтому валидируется СТРОГО и ДО
 любого пути (validate_name): allowlist [A-Za-z0-9._-], без пустого/`.`/`..`/`/`/
@@ -27,7 +28,7 @@ import contextlib
 import os
 import re
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, MutableMapping
 
@@ -237,12 +238,35 @@ def remove_profile(name: str) -> Path:
 
 
 # ── настройки профиля (profile.toml) ─────────────────────────────────────────
-# Имя файла настроек внутри каталога профиля и переменная, которой он управляет.
+# Имя файла настроек внутри каталога профиля и переменные, которыми он управляет.
 SETTINGS_NAME = "profile.toml"
 BASE_URL_VAR = "ANTHROPIC_BASE_URL"
+AUTH_TOKEN_VAR = "ANTHROPIC_AUTH_TOKEN"
 # Список ключей закрытый: неизвестный ключ — почти всегда опечатка, а промолчать
 # здесь значит увести учётку не на тот эндпоинт (см. load_settings).
-_SETTINGS_KEYS = ("base_url",)
+_SETTINGS_KEYS = ("auth_token_file", "base_url", "env")
+
+# Имя переменной в [env] — то же, что допускает шелл: буква/подчёркивание, дальше
+# буквы/цифры/подчёркивания. TOML разрешает в голых ключах ещё «-», а в кавычках —
+# что угодно, поэтому проверяем своим regex.
+_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# Префикс проброса из .env оркестратора: в [env] он бессмыслен (см. ниже).
+_ENV_PREFIX_DENY = "CLAUDE_ENV_"
+# Токен — короткая строка. Файл длиннее — почти наверняка указан не тот файл,
+# и читать его целиком на старте сессии незачем.
+MAX_TOKEN_LEN = 8192
+
+# Переменные, которыми управляет САМ профиль (или его движок): задать их в [env]
+# нельзя — иначе env разъедется с биндом/каталогом/движком и симптом будет не
+# похож на причину. Значение — причина отказа с указанием правильного ключа.
+_MANAGED_ENV_KEYS = {
+    "CLAUDE_CONFIG_DIR": "каталог учётки задаёт сам профиль (<профиль>/.claude)",
+    "HOME": "домашний каталог задаёт движок изоляции (bwrap $HOME / HOME гостя)",
+    "XDG_STATE_HOME": "его фиксирует профиль (state agent-vm остаётся реальным)",
+    "PATH": "PATH собирают claude-box и оркестратор (bin/ репозитория, шимы кошелька)",
+    BASE_URL_VAR: "адрес API задаёт ключ base_url (пустая строка снимает переменную)",
+    AUTH_TOKEN_VAR: "токен берут из файла: auth_token_file (в profile.toml секрет не храним)",
+}
 
 
 @dataclass(frozen=True)
@@ -252,9 +276,22 @@ class ProfileSettings:
     base_url: None — ключа нет, окружение не трогаем (поведение как раньше);
     "" — ходить НАПРЯМУЮ (снять унаследованный ANTHROPIC_BASE_URL);
     строка — этот адрес API для сессий профиля.
+
+    auth_token_file: абсолютный путь к файлу, содержимое которого станет
+    ANTHROPIC_AUTH_TOKEN при запуске (см. apply_settings). Относительный путь
+    считается от каталога профиля. None — ключа нет, переменную не трогаем.
+    Файл читается ТОЛЬКО на запуске: load_settings его не открывает, иначе
+    `claude-box profile` падал бы от переехавшего токена.
+
+    env: переменные для процесса claude в порядке объявления. Значение "" —
+    СНЯТЬ переменную (как base_url = ""), иначе от унаследованной (в
+    оркестраторе — из CLAUDE_ENV_*) было бы не отписаться. Ключи, которыми
+    управляет сам профиль, отвергнуты ещё при разборе (_MANAGED_ENV_KEYS).
     """
 
     base_url: str | None = None
+    auth_token_file: str | None = None
+    env: dict[str, str] = field(default_factory=dict)
 
 
 def settings_path(name: str) -> Path:
@@ -268,6 +305,11 @@ def load_settings(name: str) -> ProfileSettings:
     Мусор в файле — ЧЕСТНЫЙ отказ, а не тихий игнор: опечатка в `base_url`
     иначе молча оставила бы сессию на прежнем адресе, и разбираться пришлось бы
     по симптому, который на адрес совсем не похож (см. apply_settings).
+
+    Читается ТОЛЬКО сам `profile.toml`: файл токена (auth_token_file) здесь не
+    открывается — его читает apply_settings на старте сессии, а `claude-box
+    profile` (и паспорт сессии) остаются дешёвыми и не падают от переехавшего
+    токена.
     """
     path = settings_path(name)
     if not path.is_file():
@@ -288,46 +330,149 @@ def load_settings(name: str) -> ProfileSettings:
             f"{path}: неизвестные ключи: {', '.join(unknown)}; "
             f"допустимо: {', '.join(_SETTINGS_KEYS)}.")
     base = data.get("base_url")
-    if base is None:
-        return ProfileSettings()
-    if not isinstance(base, str):
-        raise ProfileError(f"{path}: base_url должен быть строкой.")
-    base = base.strip()
-    if base and "://" not in base:
+    if base is not None:
+        if not isinstance(base, str):
+            raise ProfileError(f"{path}: base_url должен быть строкой.")
+        base = base.strip()
+        if base and "://" not in base:
+            raise ProfileError(
+                f"{path}: base_url «{base}» — ожидался URL со схемой "
+                "(https://api.anthropic.com); пустая строка = ходить напрямую.")
+
+    raw_env = data.get("env")
+    env: dict[str, str] = {}
+    if raw_env is not None:
+        if not isinstance(raw_env, dict):
+            raise ProfileError(
+                f"{path}: env должен быть таблицей ([env] и строки "
+                'ИМЯ = "значение").')
+        for key, value in raw_env.items():
+            if not _ENV_NAME_RE.fullmatch(key):
+                raise ProfileError(
+                    f"{path}: [env]: «{key}» — недопустимое имя переменной; "
+                    "разрешены буквы, цифры и «_», первый символ — не цифра.")
+            if key.startswith(_ENV_PREFIX_DENY):
+                raise ProfileError(
+                    f"{path}: [env]: {key} — префикс {_ENV_PREFIX_DENY} служит "
+                    "пробросу из .env оркестратора, а не процессу claude; "
+                    "пиши имя без него.")
+            reason = _MANAGED_ENV_KEYS.get(key)
+            if reason is not None:
+                raise ProfileError(f"{path}: [env]: {key} — {reason}.")
+            if not isinstance(value, str):
+                raise ProfileError(
+                    f"{path}: [env]: {key} должен быть строкой в кавычках "
+                    f'({key} = "значение"): окружение — это строки, а числа, '
+                    "списки и вложенные таблицы — нет.")
+            env[key] = value.strip()
+
+    token_file = data.get("auth_token_file")
+    token_path: str | None = None
+    if token_file is not None:
+        if not isinstance(token_file, str):
+            raise ProfileError(
+                f"{path}: auth_token_file должен быть строкой (путь к файлу с токеном).")
+        token_file = token_file.strip()
+        if not token_file:
+            raise ProfileError(
+                f"{path}: auth_token_file пустой — убери ключ, если токен из файла не нужен.")
+        p = Path(token_file).expanduser()
+        if not p.is_absolute():  # относительный путь — от каталога профиля
+            p = profile_dir(name) / p
+        token_path = str(p)
+
+    return ProfileSettings(base_url=base, auth_token_file=token_path, env=env)
+
+
+def _read_auth_token(name: str, path: Path) -> str:
+    """Содержимое файла-токена: одна непустая строка (ключ auth_token_file).
+
+    Читается только здесь — на старте сессии (см. apply_settings). Файл больше
+    MAX_TOKEN_LEN байт не читаем вовсе: такой файл можно указать только по
+    ошибке (креды, лог, ключ), а тянуть что попало в память на старте незачем.
+    """
+    with _fs_errors(f"не удалось прочитать токен профиля «{name}» ({path})"):
+        size = path.stat().st_size
+        if size > MAX_TOKEN_LEN:
+            raise ProfileError(
+                f"{path}: файл с токеном подозрительно велик ({size} байт) — "
+                "похоже, указан не тот файл.")
+        raw = path.read_bytes()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise ProfileError(f"{path}: токен — не текст в UTF-8: {e}") from e
+    token = text.strip()
+    if not token:
         raise ProfileError(
-            f"{path}: base_url «{base}» — ожидался URL со схемой "
-            "(https://api.anthropic.com); пустая строка = ходить напрямую.")
-    return ProfileSettings(base_url=base)
+            f"{path}: файл с токеном пуст — профиль «{name}» не аутентифицируется.")
+    if "\n" in token:
+        raise ProfileError(
+            f"{path}: в файле с токеном больше одной строки — похоже, указан не тот файл.")
+    return token
+
+
+def _set_base_url(env: MutableMapping[str, str], base_url: str | None) -> None:
+    """Наложить адрес профиля: None — не трогать, "" — снять, строка — поставить."""
+    if base_url is None:
+        return
+    if base_url:
+        env[BASE_URL_VAR] = base_url
+    else:
+        env.pop(BASE_URL_VAR, None)
+
+
+def apply_base_url(env: MutableMapping[str, str], name: str) -> None:
+    """Наложить ТОЛЬКО адрес API профиля (файлов не читает).
+
+    Нужен там, где адрес показывают, а сессию не запускают: у остановленной
+    сессии /info считает адрес из конфига (SessionManager.api_base_url). Полный
+    apply_settings тут не годится — он читает файл токена, а пропавший токен не
+    должен ломать паспорт: /info как раз и зовут, чтобы понять, почему сессия
+    не работает.
+    """
+    _set_base_url(env, load_settings(name).base_url)
 
 
 def apply_settings(env: MutableMapping[str, str], name: str) -> None:
     """Наложить настройки профиля на окружение claude (на месте).
 
-    Зачем это вообще есть. Адрес API — свойство УЧЁТКИ, а не машины. Учётка
-    Team берёт managed-настройки своей организации (`channelsEnabled`,
-    `enabledPlugins`, объявления, policy-limits) с эндпоинта настроек — и он
-    живёт только на прямом api.anthropic.com. Локальный прокси-релей обслуживает
-    один `/v1/messages`, всё остальное отдаёт 404, поэтому под таким адресом
-    орг-настройки до клиента НЕ доезжают: Claude Code честно считает каналы
-    выключенными и рисует «Channels are not enabled for your org», хотя админ их
-    включил. Проверено живьём 15.08.2026 на одних и тех же кредах Team-учётки:
-    прямой адрес — сообщение из канала приходит в сессию; тот же запуск через
-    прокси — /ping 200, /notify 200 и тишина (ровно баг из core/channelstate).
+    Три ключа `profile.toml`, в порядке наложения: `base_url` (адрес API) →
+    `[env]` (переменные процесса; пустое значение снимает унаследованную) →
+    `auth_token_file` (содержимое файла становится ANTHROPIC_AUTH_TOKEN; файл
+    читается ЗДЕСЬ и на каждом запуске — ротация это подмена файла, а
+    load_settings и `claude-box profile` файла не касаются).
+
+    Зачем адрес вообще есть в профиле. Адрес API — свойство УЧЁТКИ, а не
+    машины. Учётка Team берёт managed-настройки своей организации
+    (`channelsEnabled`, `enabledPlugins`, объявления, policy-limits) с эндпоинта
+    настроек — и он живёт только на прямом api.anthropic.com. Локальный
+    прокси-релей обслуживает один `/v1/messages`, всё остальное отдаёт 404,
+    поэтому под таким адресом орг-настройки до клиента НЕ доезжают: Claude Code
+    честно считает каналы выключенными и рисует «Channels are not enabled for
+    your org», хотя админ их включил. Проверено живьём 15.08.2026 на одних и тех
+    же кредах Team-учётки: прямой адрес — сообщение из канала приходит в сессию;
+    тот же запуск через прокси — /ping 200, /notify 200 и тишина (ровно баг из
+    core/channelstate).
 
     Один общий `CLAUDE_ENV_ANTHROPIC_BASE_URL` на весь оркестратор такой выбор
     выразить не мог: личной учётке прокси нужен, командной — противопоказан.
     Поэтому адрес переехал к профилю, а `base_url = ""` умеет СНЯТЬ
     унаследованную переменную — иначе от глобального прокси было бы не отписаться.
+    То же правило в `[env]`: пустое значение снимает унаследованную переменную.
 
     Профиль без `profile.toml` окружение не трогает — прежнее поведение.
     """
     settings = load_settings(name)
-    if settings.base_url is None:
-        return
-    if settings.base_url:
-        env[BASE_URL_VAR] = settings.base_url
-    else:
-        env.pop(BASE_URL_VAR, None)
+    _set_base_url(env, settings.base_url)
+    # Пересечений с адресом и токеном быть не может: их ключи запрещены в [env].
+    for key, value in settings.env.items():
+        if value:
+            env[key] = value
+        else:
+            env.pop(key, None)
+    if settings.auth_token_file is not None:
+        env[AUTH_TOKEN_VAR] = _read_auth_token(name, Path(settings.auth_token_file))
 
 
 def profile_env(name: str, *, engine: str) -> tuple[dict[str, str], Path]:

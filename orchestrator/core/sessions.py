@@ -1851,6 +1851,10 @@ class SessionManager:
 
         Под agent-vm процесс claude живёт в госте, и хостовый /proc про него
         ничего не знает — там честно считаем из конфига (False).
+
+        Из конфига берём только адрес (`apply_base_url`), не полный набор
+        настроек профиля: паспорт не читает файл токена, и пропавший токен не
+        ломает /info — туда как раз и приходят понять, что с сессией не так.
         """
         proc = session.process
         if proc is not None and proc.returncode is None and self.engine_of(session) != "agent-vm":
@@ -1865,24 +1869,35 @@ class SessionManager:
             if raw:
                 return None, True  # процесс есть, переменной нет = прямой адрес
         env = dict(self.config.claude_env)
-        self._apply_profile_env(session, env)
+        name = self.profile_of(session)  # под agent-vm профиля нет — вернёт None
+        if name:
+            # Считаем только АДРЕС: паспорт не повод читать файл токена (его могло
+            # и не быть на месте) — см. box/profiles.apply_base_url.
+            try:
+                profiles.apply_base_url(env, name)
+            except profiles.ProfileError as e:
+                raise SessionError(f"профиль «{name}»: {e}") from e
         return env.get("ANTHROPIC_BASE_URL") or None, False
 
     def _apply_profile_env(self, session: Session, env: dict[str, str]) -> None:
-        """Наложить настройки профиля сессии на окружение claude (адрес API).
+        """Наложить настройки профиля сессии на окружение claude.
 
-        Зовётся ПОСЛЕ `config.claude_env`: общий `CLAUDE_ENV_ANTHROPIC_BASE_URL`
-        описывает машину, а профиль — учётку, и учётка тут главнее. Почему адрес
-        обязан быть на профиле: у Team-учётки managed-настройки организации
-        (`channelsEnabled` и прочие) приходят с эндпоинта настроек прямого
-        api.anthropic.com — локальный прокси-релей его не обслуживает, и канал
-        сессии тихо умирает при живом `/notify` 200 (см. box/profiles.apply_settings
-        и core/channelstate). Сессия без профиля или профиль без profile.toml
-        окружение не трогают — поведение прежнее.
+        Настройки профиля: адрес API (`base_url`), переменные процесса (`[env]`,
+        пустое значение снимает унаследованную) и токен из файла
+        (`auth_token_file`). Зовётся ПОСЛЕ `config.claude_env` (общие
+        `CLAUDE_ENV_*` описывают машину, а профиль — учётку, и учётка тут
+        главнее) и ПЕРЕД env_hooks кошелька — тот остаётся последним. Почему
+        адрес обязан быть на профиле: у Team-учётки managed-настройки
+        организации (`channelsEnabled` и прочие) приходят с эндпоинта настроек
+        прямого api.anthropic.com — локальный прокси-релей его не обслуживает, и
+        канал сессии тихо умирает при живом `/notify` 200 (см.
+        box/profiles.apply_settings и core/channelstate). Сессия без профиля или
+        профиль без profile.toml окружение не трогают — поведение прежнее.
 
-        Битый profile.toml — SessionError (внятный отказ оператору), а не
-        трейсбек: с молча проглоченной ошибкой сессия поднялась бы не на том
-        эндпоинте, и симптом («каналы выключены») на причину не похож.
+        Битый profile.toml или пропавший/нечитаемый файл токена — SessionError
+        (внятный отказ оператору), а не трейсбек: с молча проглоченной ошибкой
+        сессия поднялась бы не на том эндпоинте или с чужой аутентификацией, и
+        симптом на причину не похож.
         """
         name = self.profile_of(session)  # под agent-vm профиля нет — вернёт None
         if not name:

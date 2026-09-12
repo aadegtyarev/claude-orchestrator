@@ -14,11 +14,13 @@
 from __future__ import annotations
 
 from box.profiles import (  # noqa: F401
+    AUTH_TOKEN_VAR,
     BASE_URL_VAR,
     MAX_NAME_LEN,
     ProfileError,
     ProfileSettings,
     SETTINGS_NAME,
+    apply_base_url,
     apply_settings,
     config_dir,
     ensure_profile,
@@ -34,11 +36,13 @@ from box.profiles import (  # noqa: F401
 )
 
 __all__ = [
+    "AUTH_TOKEN_VAR",
     "BASE_URL_VAR",
     "MAX_NAME_LEN",
     "ProfileError",
     "ProfileSettings",
     "SETTINGS_NAME",
+    "apply_base_url",
     "apply_settings",
     "config_dir",
     "ensure_profile",
