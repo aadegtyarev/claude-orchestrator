@@ -270,16 +270,79 @@ base_url = "http://127.0.0.1:8787"   # эта учётка — через лок
 enabled for your org», хотя админ их включил, а сессия оркестратора при этом
 внешне жива — `/ping` и `/notify` отвечают 200, сообщения уходят в никуда.
 
-Текущий адрес каждого профиля показывает `claude-box profile`:
+Текущий адрес каждого профиля показывает `claude-box profile` — вместе с числом
+переменных `[env]` и путём к файлу токена (само значение токена не печатается):
 
 ```
-home  → http://127.0.0.1:8787
-work  → напрямую (api.anthropic.com)
+ds         → https://api.deepseek.com/anthropic  ·  env: 7  ·  токен: ~/.config/deepseek/token
+openrouter → https://openrouter.ai/api  ·  env: 4  ·  токен: ~/.config/openrouter/token
+home       → http://127.0.0.1:8787
+work       → напрямую (api.anthropic.com)
 ```
 
 Ошибка в файле (неизвестный ключ, не строка, URL без схемы) — честный отказ:
 молча оставить сессию на прежнем эндпоинте хуже, чем не запуститься, потому что
 симптом на причину не похож.
+
+### Токен из файла и свои переменные окружения
+
+Кроме адреса профиль несёт всё, чем обычно обвешивают `claude` в шелле
+(bashrc-обёртки для провайдеров): токен и переменные модели. Токен в
+`profile.toml` класть нельзя — это файл настроек, а не хранилище секретов, —
+поэтому он читается из файла:
+
+```toml
+# ~/.local/share/claude-box/profiles/openrouter/profile.toml
+base_url = "https://openrouter.ai/api"
+auth_token_file = "~/.config/openrouter/token"   # содержимое → ANTHROPIC_AUTH_TOKEN
+
+[env]
+ANTHROPIC_DEFAULT_OPUS_MODEL = "@preset/deepseek-pro[1m]"
+ANTHROPIC_DEFAULT_SONNET_MODEL = "@preset/minimaxm3[1m]"
+ANTHROPIC_DEFAULT_HAIKU_MODEL = "@preset/deepseekflash[1m]"
+CLAUDE_CODE_SUBAGENT_MODEL = "@preset/deepseekflash[1m]"
+```
+
+| ключ | что делает |
+|---|---|
+| `auth_token_file` | содержимое файла (одна строка, обрезается по краям) становится `ANTHROPIC_AUTH_TOKEN` **в момент запуска** сессии. Файл читается на каждом старте — ротация это подмена файла, `profile.toml` не трогаем. Относительный путь считается от каталога профиля. Нет файла / пусто / больше одной строки / подозрительно велик — честный отказ на старте |
+| `[env]` | произвольные переменные процесса claude: `ИМЯ = "значение"` (значение обязательно строка, число — в кавычках). Пустая строка **снимает** унаследованную переменную — ровно как `base_url = ""` снимает унаследованный адрес |
+
+В `[env]` нельзя задавать переменные, которыми управляет сам профиль или его
+движок — иначе окружение разъедется с каталогом/биндами, и симптом не будет
+похож на причину: `CLAUDE_CONFIG_DIR`, `HOME`, `XDG_STATE_HOME`, `PATH`,
+`ANTHROPIC_BASE_URL` (есть `base_url`), `ANTHROPIC_AUTH_TOKEN` (есть
+`auth_token_file`). Префикс `CLAUDE_ENV_` тоже запрещён — он служит пробросу из
+`.env` оркестратора, а не процессу claude. Каждый такой отказ подсказывает
+правильный ключ.
+
+Настройки применяются одинаково в `claude-box --profile` и в сессиях
+оркестратора (там же лежат и `base_url`, и `[env]`, и токен). Токен при этом
+накладывается ПОСЛЕ вычистки кредлов из унаследованного окружения — он и есть
+учётка профиля. Под `--vm` / `SANDBOX=agent-vm` профиль выбирает только УЧЁТКУ:
+`[env]` и токен профиля до гостя не доезжают, у VM своё окружение (`--env-file`).
+
+Полный пример «провайдер целиком на профиле» (DeepSeek через
+Anthropic-совместимый эндпоинт) — то, что раньше жило в bashrc-обёртке:
+
+```toml
+# ~/.local/share/claude-box/profiles/ds/profile.toml
+base_url = "https://api.deepseek.com/anthropic"
+auth_token_file = "~/.config/deepseek/token"
+
+[env]
+ANTHROPIC_MODEL = "deepseek-v4-pro"
+ANTHROPIC_DEFAULT_OPUS_MODEL = "deepseek-v4-pro"
+ANTHROPIC_DEFAULT_SONNET_MODEL = "deepseek-flash"
+ANTHROPIC_DEFAULT_HAIKU_MODEL = "deepseek-flash"
+CLAUDE_CODE_SUBAGENT_MODEL = "deepseek-flash"
+CLAUDE_CODE_EFFORT_LEVEL = "max"
+CLAUDE_CODE_AUTO_COMPACT_WINDOW = "1000000"   # в TOML число обязано быть в кавычках
+```
+
+Учётку выбирают как обычно: `.claude` профиля — симлинк на
+`~/.claude-ds` (см. «Выбор учётки»). Внимание: если в `settings.json` учётки
+тоже прописан токен (блок `env`), при ротации меняй оба места.
 
 **Граница доверия.** Цель симлинка не валидируется — она считается учёткой,
 которую выбрал оператор. В standalone `claude-box --profile` каталог профиля
