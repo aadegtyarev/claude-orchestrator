@@ -10,13 +10,34 @@ stdin, остаётся у launcher'а (переедет следующим ср
 from __future__ import annotations
 
 import threading
+from typing import Callable
 
 from .ansi import strip_ansi
 
+
+def _trust_keys(screen: str) -> bytes:
+    """Клавиши для диалога доверия рабочей папке — по фактическому фокусу.
+
+    Диалог двухпунктовый, и пункт по умолчанию менялся от версии к версии:
+    старые версии ставили «Yes, I trust this folder» первым (хватало Enter),
+    а v2.1.275 рендерит «❯ No, exit» первым. Голый Enter там выбирал «No,
+    exit» → claude сразу выходил, и оркестратор крутил respawn-цикл сессии
+    (инцидент 2026-09-18, сессия ad-coder после смены профиля). Поэтому
+    смотрим рендер: ❯ вплотную перед «No, exit» — это новый диалог (пункты в
+    нём БЕЗ номеров; прочие диалоги рендерят «❯ 1. No, exit» с номером между
+    ❯ и текстом, и маркер «❯no,exit» в них не встречается) — спускаемся
+    стрелкой на «Yes, I trust this folder» и жмём Enter. Иначе — Enter как
+    раньше.
+    """
+    return b"\x1b[B\r" if "❯no,exit" in screen else b"\r"
+
+
 # Стартовые диалоги интерактивного claude и клавиши-ответы.
 # Маркеры ищутся в тексте экрана без пробелов и в нижном регистре.
-_DIALOGS = [
-    ("trustthisfolder", b"\r"),        # «Yes, I trust this folder» — пункт по умолчанию
+# Клавиши — байты ИЛИ функция (screen → bytes): функция нужна диалогам, где
+# ответ зависит от рендера (фокус пункта), а не только от факта показа.
+_DIALOGS: list[tuple[str, bytes | Callable[[str], bytes]]] = [
+    ("trustthisfolder", _trust_keys),
     # ВАЖНО: маркер — по тексту ПУНКТА диалога («Yes, I accept»), НЕ по
     # «bypasspermissions»: последнее ложно совпадает со строкой СТАТУСА
     # «⏵⏵ bypass permissions on» (постоянная UI-плашка, не диалог) → слался «2»
@@ -82,7 +103,7 @@ class _DialogAnswerer:
             for marker, keys in _DIALOGS:
                 if marker in screen_text and marker not in self._answered:
                     self._answered.add(marker)
-                    out.append(keys)
+                    out.append(keys(screen_text) if callable(keys) else keys)
             if out:
                 self._buf = b""
             if len(self._answered) == len(_DIALOGS):

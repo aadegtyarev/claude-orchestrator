@@ -8,8 +8,9 @@
 решает вызывающий; сюда он передаёт master-fd, ответчик и `on_output`.
 
 Что ЗДЕСЬ (box): openpty + размер терминала, поток-драйвер (дренаж PTY, чтобы
-буфер не переполнился и процесс не встал; авто-ответы на стартовые диалоги;
-владение master-fd и его закрытие на выходе).
+буфер не переполнился и процесс не встал; авто-ответы на стартовые диалоги —
+после тишины в выводе, иначе клавиши уходят в середину рендера; владение
+master-fd и его закрытие на выходе).
 
 Что НЕ здесь (оркестратор): сборка argv/env/cwd, изоляция раннером, сам спавн
 процесса (`asyncio.create_subprocess_exec` со slave-fd), запись вывода в
@@ -25,6 +26,7 @@ import fcntl
 import logging
 import os
 import pty
+import select
 import struct
 import termios
 import threading
@@ -47,6 +49,14 @@ TERM_COLS = 120
 # задержкой, иначе TUI не успевает перерисоваться и «проглатывает» ввод.
 KEY_DELAY_SEC = 0.3
 
+# Ответ на диалог шлём только когда вывод PTY затих: клавиши, посланные ПОКА
+# диалог ещё рендерится, обрабатываются криво — trust-диалог v2.1.275+
+# крутился ❯No→❯Yes→❯No и не подтверждался, сессия умирала на молчании 60 с
+# (инцидент 2026-09-18, сессия ad-coder). Ждём тишины DIALOG_SETTLE_QUIET
+# (суммарно не дольше DIALOG_SETTLE_MAX — бесконечный вывод не вешаем).
+DIALOG_SETTLE_QUIET = 1.0
+DIALOG_SETTLE_MAX = 5.0
+
 
 def open_pty(rows: int = TERM_ROWS, cols: int = TERM_COLS) -> tuple[int, int]:
     """Открыть PTY и задать размер терминала. Возвращает (master, slave).
@@ -64,6 +74,25 @@ def open_pty(rows: int = TERM_ROWS, cols: int = TERM_COLS) -> tuple[int, int]:
     return master, slave
 
 
+def _settle(master: int, on_output: Callable[[bytes], None], quiet: float) -> None:
+    """Дождаться, пока вывод PTY затихнет: диалог дорисовался, клавиши не уйдут
+    в середину рендера. Дренаж не прерываем — куски продолжают уходить в
+    `on_output` (иначе буфер PTY переполнится). Ответчик не трогаем: маркеры
+    уже отвечены, дедуп в нём не даст повторов."""
+    deadline = time.monotonic() + DIALOG_SETTLE_MAX
+    while time.monotonic() < deadline:
+        ready, _, _ = select.select([master], [], [], quiet)
+        if not ready:
+            return  # тишина — диалог стабилен, можно отвечать
+        try:
+            chunk = os.read(master, 65536)
+        except OSError:
+            return
+        if not chunk:
+            return
+        on_output(chunk)
+
+
 def pty_driver(
     master: int,
     on_output: Callable[[bytes], None],
@@ -71,6 +100,7 @@ def pty_driver(
     *,
     name: str = "",
     key_delay: float = KEY_DELAY_SEC,
+    settle_quiet: float = DIALOG_SETTLE_QUIET,
 ) -> None:
     """Тело потока-драйвера PTY: дренирует вывод процесса, отдаёт его через
     `on_output` и отвечает на стартовые диалоги.
@@ -78,7 +108,9 @@ def pty_driver(
     Дренаж обязателен: без чтения буфер PTY переполнится и процесс встанет.
     Каждый прочитанный кусок уходит в `on_output` (вызывающий пишет его в лог/
     экран). Тот же кусок скармливается `answerer`; на матч стартового диалога
-    его клавиши пишутся обратно в PTY по одной с паузой `key_delay`.
+    драйвер сначала ждёт тишины в выводе (`_settle` — диалог дорисовался) и
+    только потом пишет клавиши ответа обратно в PTY ОДНОЙ записью (между
+    ответами — пауза `key_delay`).
 
     Поток ВЛАДЕЕТ master-fd и сам закрывает его на выходе — закрытие из другого
     потока/цикла событий могло бы освободить номер fd, пока драйвер блокирован в
@@ -95,14 +127,24 @@ def pty_driver(
             if not chunk:
                 return
             on_output(chunk)
+            pending: list[bytes] = []
             for keys in answerer.feed(chunk):
+                pending.append(keys)
+            if pending:
+                _settle(master, on_output, settle_quiet)
+            for keys in pending:
                 logger.info("Драйвер %s: отвечаю на стартовый диалог", name)
-                for key in keys:
-                    try:
-                        os.write(master, bytes([key]))
-                    except OSError:
-                        return
-                    time.sleep(key_delay)
+                # Клавиши ответа пишем ОДНОЙ записью, не побайтно: побайтовая
+                # запись разрывает ESC-последовательности (↓ = \x1b[B), и
+                # голый ESC приходит отдельной клавишей. В trust-диалоге
+                # v2.1.275+ ESC = «Esc to cancel» — диалог отменялся, claude
+                # выходил, сессия крутилась в respawn-цикле на подтверждении
+                # папки (инцидент 2026-09-18, сессия ad-coder).
+                try:
+                    os.write(master, keys)
+                except OSError:
+                    return
+                time.sleep(key_delay)
     finally:
         try:
             os.close(master)

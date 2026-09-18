@@ -950,6 +950,10 @@ class SessionManager:
             # Claude грузит CLAUDE.md/.mcp.json/.claude проекта. Канал-сервер
             # и настройки бота подсасываем флагами ниже (consent не просят).
             cwd = str(self.effective_cwd(session))
+            # Доверие к папке вписываем в конфиг Claude ДО запуска (см.
+            # _ensure_folder_trusted): на свежем/другом профиле trust-диалог
+            # иначе останавливал старт сессии.
+            self._ensure_folder_trusted(config_dir, Path(cwd))
             # Подсказка: под bwrap $HOME процесса подменён приватным домом
             # сессии, поэтому реальный ~/.venv и глобальные инструменты не видны —
             # окружение проекта держи В ПРОЕКТЕ (он смонтирован RW). Персистентный
@@ -1929,6 +1933,48 @@ class SessionManager:
             return self.config.claude_config_dir
         profiles.ensure_profile(name)
         return profiles.real_config_dir(name)
+
+    @staticmethod
+    def _ensure_folder_trusted(config_dir: Path | None, cwd: Path) -> None:
+        """Доверие к рабочей папке сессии в конфиге Claude — заранее.
+
+        Claude Code хранит подтверждение trust-диалога в
+        `<CLAUDE_CONFIG_DIR>/.claude.json` → `projects[<cwd>].hasTrustDialogAccepted`.
+        В интерактивном терминале диалог подтверждает человек; у нас папку
+        выбирает оператор при создании сессии — это и есть решение о доверии.
+        А диалог под PTY, которого оператор не видит, старт только ломает:
+        после смены профиля флаг терялся, и сессия умирала на подтверждении
+        папки (инцидент 2026-09-18, сессия ad-coder). Поэтому вписываем флаг
+        ДО запуска процесса — диалог не показывается вовсе.
+
+        Чужой файл не калечим: при нечитаемом/битом JSON или неожиданной
+        форме молча уходим (claude сам пересоздаст файл и покажет диалог —
+        как и без нас). Отсутствующего файла не боимся — создаём с доверием
+        (claude дочитает остальное сам). Пишем атомарно (tmp + rename):
+        файл может читать другой запущенный claude.
+        """
+        if config_dir is None:
+            return
+        path = config_dir / ".claude.json"
+        try:
+            data = json.loads(path.read_text())
+        except FileNotFoundError:
+            data = {}  # файла ещё нет — создадим
+        except (OSError, ValueError):
+            return
+        try:
+            entry = data.setdefault("projects", {}).setdefault(str(cwd), {})
+            if entry.get("hasTrustDialogAccepted"):
+                return  # уже доверена
+            entry["hasTrustDialogAccepted"] = True
+        except (TypeError, AttributeError):
+            return
+        tmp = path.with_name(".claude.json.tmp")
+        try:
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+            os.replace(tmp, path)
+        except OSError:
+            return
 
     def runner_for(self, session: Session | None) -> runner_mod.Runner:
         """Раннер под движок сессии. Кэш по имени движка: раннеры без

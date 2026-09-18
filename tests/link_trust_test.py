@@ -72,8 +72,75 @@ def test_no_warn_on_clean():
     print("OK нет предупреждения на чистой папке (без хуков/mcp)")
 
 
+# ── _ensure_folder_trusted: доверие к папке сессии до запуска claude ─────
+
+def test_ensure_folder_trusted_writes_flag():
+    """Пустой конфиг → вписываем projects[<cwd>].hasTrustDialogAccepted=true."""
+    with tempfile.TemporaryDirectory() as d:
+        cfg = Path(d) / "cfg"
+        cfg.mkdir()
+        SessionManager._ensure_folder_trusted(cfg, Path(d) / "proj")
+        import json
+        data = json.loads((cfg / ".claude.json").read_text())
+        assert data["projects"][str(Path(d) / "proj")]["hasTrustDialogAccepted"] is True
+    print("OK флаг доверия к папке вписывается в .claude.json")
+
+
+def test_ensure_folder_trusted_preserves_other_projects():
+    """Чужие записи в .claude.json не трогаем — только добавляем свою."""
+    with tempfile.TemporaryDirectory() as d:
+        cfg = Path(d) / "cfg"
+        cfg.mkdir()
+        (cfg / ".claude.json").write_text(
+            '{"projects": {"/other": {"hasTrustDialogAccepted": false, "x": 1}}}'
+        )
+        SessionManager._ensure_folder_trusted(cfg, Path(d) / "proj")
+        import json
+        data = json.loads((cfg / ".claude.json").read_text())
+        assert data["projects"]["/other"] == {"hasTrustDialogAccepted": False, "x": 1}
+        assert data["projects"][str(Path(d) / "proj")]["hasTrustDialogAccepted"] is True
+    print("OK чужие проекты в .claude.json сохраняются")
+
+
+def test_ensure_folder_trusted_already_trusted_no_rewrite():
+    """Флаг уже стоит → файл не переписываем (mtime на месте)."""
+    with tempfile.TemporaryDirectory() as d:
+        cfg = Path(d) / "cfg"
+        cfg.mkdir()
+        cwd = Path(d) / "proj"
+        p = cfg / ".claude.json"
+        p.write_text('{"projects": {"%s": {"hasTrustDialogAccepted": true}}}' % cwd)
+        before = p.stat().st_mtime_ns
+        SessionManager._ensure_folder_trusted(cfg, cwd)
+        assert p.stat().st_mtime_ns == before
+    print("OK уже доверенная папка файл не переписывает")
+
+
+def test_ensure_folder_trusted_bad_json_ignored():
+    """Битый .claude.json не роняем и не трогаем — claude сам пересоздаст."""
+    with tempfile.TemporaryDirectory() as d:
+        cfg = Path(d) / "cfg"
+        cfg.mkdir()
+        p = cfg / ".claude.json"
+        p.write_text("{not json")
+        SessionManager._ensure_folder_trusted(cfg, Path(d) / "proj")
+        assert p.read_text() == "{not json"
+    print("OK битый .claude.json не трогаем")
+
+
+def test_ensure_folder_trusted_no_config_dir_noop():
+    """config_dir не задан (учётка по умолчанию) — тихо проходим мимо."""
+    SessionManager._ensure_folder_trusted(None, Path("/tmp/proj"))
+    print("OK config_dir=None — no-op")
+
+
 if __name__ == "__main__":
     test_warns_on_project_hooks()
     test_warns_on_mcp_json()
     test_no_warn_on_clean()
+    test_ensure_folder_trusted_writes_flag()
+    test_ensure_folder_trusted_preserves_other_projects()
+    test_ensure_folder_trusted_already_trusted_no_rewrite()
+    test_ensure_folder_trusted_bad_json_ignored()
+    test_ensure_folder_trusted_no_config_dir_noop()
     print("ALL LINK-TRUST OK")
