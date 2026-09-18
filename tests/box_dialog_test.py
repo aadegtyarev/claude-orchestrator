@@ -8,6 +8,10 @@
      самой беседы («yes, I accept») впечатывал «2\r» в stdin Claude — цифра
      уходила спурьёзным сообщением («your message was just 2»). Все маркеры —
      СТАРТОВЫЕ диалоги, поэтому матчер живёт только стартовое окно.
+Плюс регресс trust-диалога v2.1.275: там фокус стоит на «No, exit», и голый
+Enter выводил claude из процесса — сессия крутилась в respawn-цикле после
+смены профиля (инцидент 2026-09-18, сессия ad-coder). Ответ теперь зависит
+от фактического фокуса: ❯ перед «No, exit» → ↓ + Enter.
 
 Матчер переехал в автономный пакет box/ (box.dialog, Слой 2 редизайна) —
 импортим из источника; отдельным тестом проверяем, что sessions.py его
@@ -39,6 +43,21 @@ DIALOG_BYPASS = _screen(
     "❯ 1. No, exit\n  2. Yes, I accept\nEnter to confirm"
 )
 DIALOG_TRUST = _screen("Do you trust the files in this folder?\n1. Yes, I trust this folder")
+# v2.1.275 рендерит trust-диалог БЕЗ номеров пунктов и с фокусом (❯) на
+# «No, exit» — в отличие от старых версий, где «Yes, I trust this folder»
+# был пунктом по умолчанию. Голый Enter в новом рендере = «No, exit».
+DIALOG_TRUST_V2_NO_FOCUSED = _screen(
+    "Accessing workspace:\n/home/user/project\n"
+    "Quick safety check: Is this a project you created or one you trust?\n"
+    "❯ No, exit\nYes, I trust this folder\nEnter to confirm · Esc to cancel"
+)
+# Тот же рендер, но фокус уже на «Yes» (например, будущая версия вернёт
+# безопасный дефолт) — достаточно Enter.
+DIALOG_TRUST_V2_YES_FOCUSED = _screen(
+    "Accessing workspace:\n/home/user/project\n"
+    "Quick safety check: Is this a project you created or one you trust?\n"
+    "No, exit\n❯ Yes, I trust this folder\nEnter to confirm · Esc to cancel"
+)
 # agent-vm: managed-settings гостя. Enter = дефолтный (первый) пункт.
 DIALOG_MANAGED = _screen(
     "Managed settings require approval\n❯ 1. Continue\n  2. Exit\nEnter to confirm"
@@ -62,6 +81,20 @@ def test_bypass_marker_matches_dialog():
 def test_trust_dialog_matches():
     assert any(m in DIALOG_TRUST for m, _ in _DIALOGS)
     print("OK trust-диалог матчится")
+
+
+def test_trust_v2_no_exit_focused_sends_down_enter():
+    """v2.1.275: фокус на «No, exit» → ↓ + Enter (голый Enter выводил claude)."""
+    a = _DialogAnswerer()
+    assert a.feed(DIALOG_TRUST_V2_NO_FOCUSED.encode()) == [b"\x1b[B\r"]
+    print("OK trust v2 с фокусом на «No, exit» → ↓ + Enter")
+
+
+def test_trust_v2_yes_focused_sends_enter():
+    """Тот же рендер, но фокус уже на «Yes, I trust this folder» → просто Enter."""
+    a = _DialogAnswerer()
+    assert a.feed(DIALOG_TRUST_V2_YES_FOCUSED.encode()) == [b"\r"]
+    print("OK trust v2 с фокусом на «Yes» → Enter")
 
 
 def test_managed_settings_matches_with_enter():
@@ -170,6 +203,8 @@ def main():
     test_no_marker_matches_status_bar()
     test_bypass_marker_matches_dialog()
     test_trust_dialog_matches()
+    test_trust_v2_no_exit_focused_sends_down_enter()
+    test_trust_v2_yes_focused_sends_enter()
     test_managed_settings_matches_with_enter()
     test_answerer_replies_before_ready()
     test_answerer_answers_each_marker_once()
