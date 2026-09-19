@@ -84,6 +84,138 @@ def _prints_token(cmd: list[str]) -> bool:
     return subs[:1] == ["auth"] and (subs[1:2] == ["token"] or "--show-token" in cmd)
 
 
+# ── git -c: не флаг целиком, а пара key=value ───────────────────────────────
+# Раньше guard рубил ЛЮБОЙ `git -c`. Это ломало не модель, а сам Claude Code:
+# он добавляет к своим внутренним git-вызовам набор «закаливающих» пар
+# (`core.hooksPath=/dev/null`, `core.fsmonitor=`, `core.askPass=`,
+# `protocol.ext.allow=never`, `submodule.recurse=false`, `log.showSignature=
+# false`, `http.sslVerify=true`, …) — ровно чтобы репозиторий НЕ мог исполнить
+# свой код. Когда подкоманда сетевая (fetch/ls-remote/push), такой вызов уходит
+# в кошелёк, и оператор получал отказ на пустом месте, а фоновый опрос (PR
+# status) спамил чат.
+#
+# Поэтому смотрим на пары. Исполнение/увод кредов в git дают КОНКРЕТНЫЕ ключи
+# конфига (их список исторически известен: *Command/*.helper/hooks/filter/
+# alias/include/…). Такой ключ пропускаем ТОЛЬКО с обезвреживающим значением
+# (пусто / `false` / `never` / `/dev/null`), любое другое — отказ; остальные
+# ключи (fsck, pack.*, log.*, submodule.recurse, http.proxy…) кодом не
+# оборачиваются и проходят как есть. Пустое множество = ключ запрещён всегда.
+#
+# Ключ сравниваем в нижнем регистре: git считает регистр значимым только в
+# середине (`url.<ЭТО>.insteadOf`), а lowercase лишь РАСШИРЯЕТ совпадение —
+# промахнуться мимо запрета так нельзя.
+_GIT_C_NEUTRAL: tuple[tuple[re.Pattern[str], frozenset[str]], ...] = (
+    # Запускают программу (askPass/pager/editor/fsmonitor/hooks/ssh/proxy).
+    (re.compile(r"core\.sshcommand"),
+     frozenset({"", "ssh -o batchmode=yes -o stricthostkeychecking=yes"})),
+    (re.compile(r"core\.askpass"), frozenset({"", "true"})),
+    # core.pager и per-подкомандный pager.<sub> (`pager.log=evil`) — оба
+    # запускают программу на вывод; `cat`/`false` безобидны.
+    (re.compile(r"core\.pager|pager\..+"), frozenset({"", "false", "cat"})),
+    (re.compile(r"(core|sequence)\.editor"), frozenset({"", "true"})),
+    (re.compile(r"core\.fsmonitor"), frozenset({"", "false"})),
+    (re.compile(r"core\.hookspath"), frozenset({"/dev/null"})),
+    (re.compile(r"core\.(alternaterefscommand|externaldiff|gitproxy)"), frozenset({""})),
+    (re.compile(r"credential(\..*)?\.helper"), frozenset({""})),
+    (re.compile(r"diff\.external"), frozenset({""})),
+    (re.compile(r"diff\..*\.(command|textconv)"), frozenset({""})),
+    # filter.<x>.clean/smudge/process — код на checkout/add; `required=false`
+    # и `enabled=false` из того же набора Claude Code безобидны.
+    (re.compile(r"filter\..*"), frozenset({"", "false"})),
+    (re.compile(r"merge\..*\.driver"), frozenset({""})),
+    (re.compile(r"(diff|merge)tool\..*\.cmd"), frozenset({""})),
+    (re.compile(r"gpg(\..*)?\.program"), frozenset({""})),
+    (re.compile(r"uploadpack\.packobjectshook"), frozenset({""})),
+    # sendemail.smtpServer, будучи путём, запускается как программа-sendmail.
+    (re.compile(r"sendemail(\..*)?\.smtpserver"), frozenset({""})),
+    (re.compile(r"remote\..*\.(uploadpack|receivepack)"), frozenset({""})),
+    # Транспорт ext:: (произвольная команда) — только `never`.
+    (re.compile(r"protocol(\..*)?\.allow"), frozenset({"never"})),
+    # Подтягивают ЧУЖОЙ конфиг (в нём — любой ключ выше): запрещены всегда.
+    (re.compile(r"include(if\..*)?\.path"), frozenset()),
+    # alias.x=!команда — исполнение; пустой алиас безобиден (его ставит сам CC).
+    (re.compile(r"alias\..*"), frozenset({""})),
+    # templateDir приносит в новый репозиторий свои хуки.
+    (re.compile(r"init\.templatedir"), frozenset({""})),
+    # Отключённая проверка TLS = MITM хостовых кредов. CC ставит только `true`.
+    (re.compile(r"http(\..*)?\.sslverify"), frozenset({"true"})),
+)
+
+# url.<base>.insteadOf переписывает remote — уводит push/fetch (и хостовые креды)
+# на чужой хост. Claude Code ставит ТОЖДЕСТВЕННОЕ правило (`url.<u>.insteadOf=<u>`,
+# чтобы запретить чужие переписывания из конфига репозитория) — его и пропускаем.
+_GIT_C_INSTEADOF = re.compile(r"url\.(?P<base>.+)\.(insteadof|pushinsteadof)$")
+
+# Сеть второго рубежа: ключей, оборачивающих КОМАНДУ, в git больше, чем принято
+# помнить (`pager.<подкоманда>`, `trailer.<x>.command`, `imap.tunnel`,
+# `instaweb.httpd`, `browser.<x>.cmd`, …), и в новых версиях их прибавляется.
+# Поэтому любой НЕизвестный ключ, чьё имя оканчивается «командным» словом,
+# пропускаем только с обезвреживающим значением. Список суффиксов намеренно без
+# `path` — под него попал бы безобидный `core.quotePath=true`, который ставит
+# сам Claude Code (а опасные `core.hooksPath`/`include.path` разобраны выше).
+_GIT_C_CODE_SUFFIX = re.compile(
+    r".*\.(command|cmd|program|helper|hook|pager|editor|askpass|browser|tunnel"
+    r"|driver|textconv|smudge|clean|process|httpd)$"
+)
+_GIT_C_CODE_SUFFIX_NEUTRAL = frozenset({"", "false", "never", "0", "/dev/null"})
+
+
+def _git_config_denied(pair: str) -> str | None:
+    """Причина отказа для одной пары `git -c key[=value]` либо None.
+
+    Ключ без `=` git трактует как `key=true` — так же трактуем и мы (для
+    «опасных» ключей `true` не входит в обезвреживающие значения → отказ).
+    """
+    key, sep, value = pair.partition("=")
+    key_l = key.strip().lower()
+    value_l = (value if sep else "true").strip().lower()
+    bad = (f"Пара `git -c {pair[:80]}` может запустить произвольный код на хосте "
+           "или увести креды — поэтому запрещена. Безопасные «закаливающие» пары "
+           "(core.hooksPath=/dev/null, core.fsmonitor=, core.askPass=, "
+           "protocol.ext.allow=never …) кошелёк пропускает. Запусти git без этой "
+           "пары; нужен особый git-конфиг — попроси оператора настроить его на хосте.")
+    if (m := _GIT_C_INSTEADOF.match(key_l)) is not None:
+        # Тождественное правило (или пустое) — no-op; всё прочее уводит remote.
+        base = m.group("base")
+        return None if value_l in ("", base) else bad
+    for rx, neutral in _GIT_C_NEUTRAL:
+        if rx.fullmatch(key_l):
+            return None if value_l in neutral else bad
+    if _GIT_C_CODE_SUFFIX.fullmatch(key_l):
+        return None if value_l in _GIT_C_CODE_SUFFIX_NEUTRAL else bad
+    return None
+
+
+def _git_config_pairs(toks: list[str]) -> tuple[list[str], bool]:
+    """Пары из `-c`/`--config`(`=`) и признак `--config-env` в argv.
+
+    `-c` ищем ВЕЗДЕ, а не только до подкоманды: у `git clone` есть свой `-c`
+    (`--config`), который пишет ключ в конфиг нового репозитория — та же
+    поверхность. Ложных срабатываний это не даёт: до кошелька доезжают только
+    сетевые подкоманды (GIT_NETWORK), и ни у одной из них `-c` не значит
+    что-то другое.
+
+    `--config-env=KEY=VAR` берёт значение из переменной окружения песочницы —
+    проверить его тут нельзя, поэтому он запрещён целиком (второй элемент).
+    """
+    pairs: list[str] = []
+    config_env = False
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if t in ("-c", "--config"):
+            if i + 1 < len(toks):
+                pairs.append(toks[i + 1])
+            i += 2
+            continue
+        if t.startswith("--config="):
+            pairs.append(t[len("--config="):])
+        elif t == "--config-env" or t.startswith("--config-env="):
+            config_env = True
+        i += 1
+    return pairs, config_env
+
+
 def _always_denied(cmd: list[str]) -> str | None:
     """Опасные вызовы, запрещённые guard'ом — при любой policy, даже `commands=["gh"]`.
 
@@ -113,11 +245,15 @@ def _always_denied(cmd: list[str]) -> str | None:
     # 2. git → произвольное исполнение на хосте через конфиг/транспорт/флаги.
     if binary == "git":
         toks = cmd[1:]
-        if "-c" in toks:  # -c core.sshCommand=… / protocol.ext.allow=… / core.fsmonitor=…
-            return ("Флаг `git -c` переопределяет конфиг и может запустить произвольный "
-                    "код на хосте — поэтому запрещён. Запусти git push/pull/fetch БЕЗ "
-                    "`-c`; если нужен особый git-конфиг, попроси оператора настроить "
-                    "его на хосте.")
+        pairs, config_env = _git_config_pairs(toks)
+        if config_env:
+            return ("Флаг `git --config-env` берёт значение конфига из переменной "
+                    "окружения песочницы — проверить его на хосте нельзя, поэтому он "
+                    "запрещён. Передай пару явно через `-c key=value` (безопасные "
+                    "«закаливающие» пары кошелёк пропускает).")
+        for pair in pairs:
+            if (reason := _git_config_denied(pair)) is not None:
+                return reason
         for t in toks:
             if t.startswith("ext::"):
                 return ("git-транспорт `ext::` запускает произвольную команду — запрещён. "

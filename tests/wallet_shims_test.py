@@ -8,6 +8,7 @@
 Запуск: .venv/bin/python tests/wallet_shims_test.py
 """
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -81,6 +82,35 @@ def test_wallet_shims():
     assert git.rstrip().endswith('git "$@"')          # последняя строка — реальный git
     assert "status" not in git and "commit" not in git  # локальные не перечислены
     print("OK git-обёртка: сетевые через кошелёк, локальные напрямую")
+
+    # Живой прогон обёртки: глобальные флаги со ЗНАЧЕНИЕМ отдельным аргументом
+    # шим обязан проглотить вместе с флагом, иначе примет значение за подкоманду
+    # и уведёт сетевой вызов в локальный git БЕЗ кредов хоста. Именно так когда-то
+    # ломался `git -C <dir> push`; у --git-dir/--work-tree/--namespace та же форма.
+    from vault.shims import git_shim
+    bin_dir = Path(tempfile.mkdtemp())
+    (bin_dir / "wallet").write_text('#!/bin/sh\necho "WALLET $*"\n')
+    (bin_dir / "realgit").write_text('#!/bin/sh\necho "LOCAL $*"\n')
+    (bin_dir / "git").write_text(git_shim(str(bin_dir / "realgit")))
+    for name in ("wallet", "realgit", "git"):
+        os.chmod(bin_dir / name, 0o755)
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+
+    def route(*argv: str) -> str:
+        out = subprocess.run([str(bin_dir / "git"), *argv], capture_output=True,
+                             text=True, env=env).stdout
+        return out.split()[0]  # WALLET | LOCAL
+
+    assert route("fetch", "origin") == "WALLET"
+    assert route("--git-dir", "/x/.git", "fetch") == "WALLET"
+    assert route("--work-tree", "/x", "push") == "WALLET"
+    assert route("--namespace", "ns", "ls-remote") == "WALLET"
+    assert route("-C", "/x", "-c", "core.fsmonitor=", "push") == "WALLET"
+    assert route("--git-dir=/x/.git", "fetch") == "WALLET"   # форма с «=» одним арг.
+    assert route("status") == "LOCAL"
+    assert route("-C", "/x", "commit", "-m", "x") == "LOCAL"
+    assert route("--attr-source", "HEAD", "log") == "LOCAL"
+    print("OK git-обёртка: значение глобального флага не принимается за подкоманду")
 
     # session_path — путь, ВИДИМЫЙ в песочнице ($HOME/.wallet-bin), а не хостовый
     # session_home/.wallet-bin (под bwrap session_home смонтирован как $HOME).
