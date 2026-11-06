@@ -82,49 +82,87 @@ async def main() -> None:
         core.register_adapter(adapter)
     core.modules = make_modules(config)
 
-    reply_runner = await start_reply_server(
-        config,
-        core.handle_reply,
-        core.handle_tool_event,
-        core.handle_permission_request,
-        core.handle_stop_event,
-    )
-
-    sweeper = asyncio.create_task(_idle_sweeper(config, manager, core))
+    reply_runner = None
+    sweeper = None
+    startup_task = None
+    core_start_task = None
+    stop_wait_task = None
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop_event.set)
 
-    try:
-        await core.start()
-        # Убрать баблы, осиротевшие при НЕ-graceful смерти прошлого процесса
-        # (краш/SIGKILL — тогда close_all не отработал). Адаптеры уже подняты.
-        await core.cleanup_stale_bubbles()
-        # Стартовое уведомление после короткой паузы (адаптеры должны
-        # подняться). Держим ссылку на задачу — asyncio хранит только слабую,
-        # без ссылки её мог бы собрать GC; отменяем при shutdown, иначе
-        # уведомление выстрелило бы уже во время остановки.
-        async def _delayed_startup() -> None:
-            await asyncio.sleep(2)
-            await core.notify_startup(restored)
+    async def _cleanup_step(label, action) -> None:
+        try:
+            await action()
+        except Exception:
+            logger.exception("Ошибка при остановке: %s", label)
 
-        startup_task = asyncio.ensure_future(_delayed_startup())
-        await stop_event.wait()
+    async def _cancel_task(task, label) -> None:
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Фоновая задача завершилась с ошибкой при остановке: %s", label)
+
+    try:
+        reply_runner = await start_reply_server(
+            config,
+            core.handle_reply,
+            core.handle_tool_event,
+            core.handle_permission_request,
+            core.handle_stop_event,
+        )
+        sweeper = asyncio.create_task(_idle_sweeper(config, manager, core))
+        # Startup может включать отменяемый сетевой backoff (Telegram). SIGTERM
+        # должен прервать его, а не ждать завершения core.start().
+        core_start_task = asyncio.create_task(core.start(), name="core-start")
+        stop_wait_task = asyncio.create_task(stop_event.wait(), name="shutdown-signal")
+        done, _ = await asyncio.wait(
+            (core_start_task, stop_wait_task), return_when=asyncio.FIRST_COMPLETED
+        )
+        if core_start_task in done:
+            await core_start_task  # сохранить исходную startup-ошибку
+        else:
+            await _cancel_task(core_start_task, "core-start")
+
+        if core_start_task in done and not stop_event.is_set():
+            # Убрать баблы после поднятия адаптеров и сохранения состояния.
+            await core.cleanup_stale_bubbles()
+
+            # Стартовое уведомление после короткой паузы (адаптеры уже готовы).
+            async def _delayed_startup() -> None:
+                await asyncio.sleep(2)
+                await core.notify_startup(restored)
+
+            startup_task = asyncio.create_task(_delayed_startup(), name="startup-notification")
+
+        if not stop_event.is_set():
+            await stop_wait_task
     finally:
         logger.info("Останавливаю сессии (записи сохраняются)…")
-        startup_task.cancel()
-        sweeper.cancel()
-        core.save_history()  # веб-история переживёт рестарт
-        # Убрать активные баблы, ПОКА адаптеры живы: иначе при рестарте refs
-        # теряются и бабл висит сиротой с мёртвыми кнопками.
+        await _cancel_task(startup_task, "startup-notification")
+        await _cancel_task(core_start_task, "core-start")
+        await _cancel_task(sweeper, "idle-sweeper")
+        await _cancel_task(stop_wait_task, "shutdown-signal")
         try:
-            await asyncio.wait_for(core.bubbles.close_all(), timeout=8)
-        except Exception as e:
-            logger.debug("close_all при остановке: %s", e)
-        await manager.shutdown()
-        await reply_runner.cleanup()
-        await core.close()
+            core.save_history()  # веб-история переживёт рестарт
+        except Exception:
+            logger.exception("Не удалось сохранить веб-историю")
+        # Баблы удаляем ПОКА адаптеры живы; последующие shutdown-шаги
+        # выполняются независимо, даже если этот запрос/cleanup завершится ошибкой.
+        await _cleanup_step(
+            "закрытие статус-баблов",
+            lambda: asyncio.wait_for(core.bubbles.close_all(), timeout=8),
+        )
+        await _cleanup_step("завершение сессий", manager.shutdown)
+        if reply_runner is not None:
+            await _cleanup_step("reply server", reply_runner.cleanup)
+        await _cleanup_step("ядро и адаптеры", core.close)
         logger.info("Готово.")
 
 

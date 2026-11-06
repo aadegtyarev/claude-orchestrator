@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramNetworkError
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     BotCommand,
@@ -44,6 +45,13 @@ logger = logging.getLogger(__name__)
 FILE_LIMIT = 50 * 1024 * 1024
 # Сколько привязок «сообщение → статус терминала» помним ради правок команд.
 TERM_MSGS_LIMIT = 500
+# Общий потолок сетевой подготовки Telegram до готовности адаптера.
+STARTUP_NETWORK_BUDGET_S = 300.0
+STARTUP_RETRY_DELAYS_S = (1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
+
+
+async def _startup_sleep(seconds: float) -> None:
+    await asyncio.sleep(seconds)
 
 
 class TelegramAdapter:
@@ -80,15 +88,44 @@ class TelegramAdapter:
     # ── Transport: жизненный цикл ───────────────────────────────
 
     async def start(self) -> None:
-        await self._set_command_menu()
-        # Поллинг — своей задачей; сигналы обрабатывает __main__ (адаптеров
-        # может быть несколько, aiogram не владеет процессом).
+        deadline = time.monotonic() + STARTUP_NETWORK_BUDGET_S
+        await self._set_command_menu(deadline)
+        # aiogram 3.30 делает bot.me() перед входом в getUpdates, внутри
+        # фоновой задачи. Прогреваем кэш здесь, чтобы сетевой отказ был частью
+        # ожидаемого startup и не оставлял core уже запущенным без poller.
+        await self._retry_startup_request("bot identity", self.bot.me, deadline)
+        # _polling использует закэшированный bot.me(); getUpdates сам имеет
+        # собственный aiogram backoff. Сессию закрывает владелец — stop().
         self._poll_task = asyncio.create_task(
-            self.dp.start_polling(self.bot, handle_signals=False),
+            self.dp.start_polling(
+                self.bot, handle_signals=False, close_bot_session=False
+            ),
             name="tg-polling",
         )
 
-    async def _set_command_menu(self) -> None:
+    async def _retry_startup_request(self, label: str, request, deadline: float):
+        """Повторить только сетевой отказ конкретного startup API вызова."""
+        delay_index = 0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(f"Telegram startup timed out during {label}") from None
+            try:
+                return await asyncio.wait_for(request(), timeout=remaining)
+            except TimeoutError:
+                raise RuntimeError(f"Telegram startup timed out during {label}") from None
+            except TelegramNetworkError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(f"Telegram startup timed out during {label}") from None
+                delay = STARTUP_RETRY_DELAYS_S[
+                    min(delay_index, len(STARTUP_RETRY_DELAYS_S) - 1)
+                ]
+                delay_index += 1
+                logger.warning("Telegram startup network error during %s; retrying", label)
+                await _startup_sleep(min(delay, remaining))
+
+    async def _set_command_menu(self, deadline: float | None = None) -> None:
         # Меню команд в интерфейсе Telegram (кнопка «/» у поля ввода).
         # Недоступные при этой конфигурации команды отсеиваем ниже одним
         # фильтром — решает ядро (core.command_available), не адаптер.
@@ -122,8 +159,20 @@ class TelegramAdapter:
         # Бот работает в группах — меню «/» там берёт команды из группового
         # scope; без него список часто пуст. Ставим и default, и для групп.
         if self.config.show_command_menu:
-            await self.bot.set_my_commands(commands)
-            await self.bot.set_my_commands(commands, scope=BotCommandScopeAllGroupChats())
+            if deadline is None:
+                await self.bot.set_my_commands(commands)
+                await self.bot.set_my_commands(commands, scope=BotCommandScopeAllGroupChats())
+            else:
+                await self._retry_startup_request(
+                    "default command menu", lambda: self.bot.set_my_commands(commands), deadline
+                )
+                await self._retry_startup_request(
+                    "group command menu",
+                    lambda: self.bot.set_my_commands(
+                        commands, scope=BotCommandScopeAllGroupChats()
+                    ),
+                    deadline,
+                )
         else:
             try:
                 await self.bot.delete_my_commands()
