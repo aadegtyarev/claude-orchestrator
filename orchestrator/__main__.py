@@ -130,10 +130,7 @@ async def main() -> None:
         else:
             await _cancel_task(core_start_task, "core-start")
 
-        if stop_wait_task not in done:
-            await stop_wait_task
-
-        if not stop_event.is_set():
+        if core_start_task in done and not stop_event.is_set():
             # Убрать баблы после поднятия адаптеров и сохранения состояния.
             await core.cleanup_stale_bubbles()
 
@@ -143,6 +140,8 @@ async def main() -> None:
                 await core.notify_startup(restored)
 
             startup_task = asyncio.create_task(_delayed_startup(), name="startup-notification")
+
+        if not stop_event.is_set():
             await stop_wait_task
     finally:
         logger.info("Останавливаю сессии (записи сохраняются)…")

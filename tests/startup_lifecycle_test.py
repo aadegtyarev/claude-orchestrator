@@ -248,6 +248,124 @@ async def test_main_start_failure_preserves_error_and_runs_all_cleanup(monkeypat
     assert cores[0].startup_notifications == 0
 
 
+def _configure_mock_main(monkeypatch, tmp_path, calls, signal_handlers, state):
+    config = SimpleNamespace(
+        sessions_dir=tmp_path / "sessions",
+        max_instances=1,
+        adapters=(),
+        sandbox="off",
+        sandbox_docker=False,
+        allowed_user_ids=(),
+        idle_timeout_h=0,
+    )
+
+    class Manager:
+        def load_state(self):
+            pass
+
+        def total(self):
+            return 0
+
+        async def shutdown(self):
+            calls.append("manager")
+
+    class Core:
+        def __init__(self, _config, manager):
+            state["core"] = self
+            self.manager = manager
+            self.modules = []
+            self.startup_notifications = 0
+            self.bubbles = SimpleNamespace(close_all=self._close_bubbles)
+            self.handle_reply = self.handle_tool_event = None
+            self.handle_permission_request = self.handle_stop_event = None
+
+        async def _close_bubbles(self):
+            calls.append("bubbles")
+
+        def register_adapter(self, _adapter):
+            pass
+
+        async def start(self):
+            calls.append("start")
+            if state.get("entered"):
+                state["entered"].set()
+            if state.get("wait_start"):
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    calls.append("start-cancelled")
+                    raise
+
+        async def cleanup_stale_bubbles(self):
+            calls.append("stale")
+
+        async def notify_startup(self, _restored):
+            self.startup_notifications += 1
+            calls.append("notify")
+            if state.get("signal_on_notify"):
+                signal_handlers[1]()
+
+        def save_history(self):
+            calls.append("history")
+
+        async def close(self):
+            calls.append("core")
+
+    class Runner:
+        name = "direct"
+
+        def preflight(self):
+            return True, ""
+
+    class ReplyRunner:
+        async def cleanup(self):
+            calls.append("reply")
+
+    monkeypatch.setattr(entrypoint.Config, "from_env", lambda: config)
+    monkeypatch.setattr(entrypoint, "SessionManager", lambda _config: Manager())
+    monkeypatch.setattr(entrypoint, "OrchestratorCore", Core)
+    monkeypatch.setattr(entrypoint, "make_adapters", lambda *_args: [])
+    monkeypatch.setattr(entrypoint, "make_modules", lambda *_args: [])
+    monkeypatch.setattr(entrypoint, "make_runner", lambda *_args: Runner())
+
+    async def start_server(*_args):
+        return ReplyRunner()
+
+    monkeypatch.setattr(entrypoint, "start_reply_server", start_server)
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(
+        loop, "add_signal_handler", lambda _sig, callback: signal_handlers.append(callback)
+    )
+
+
+async def test_main_success_cleans_stale_and_notifies_before_shutdown(monkeypatch, tmp_path):
+    calls = []
+    signal_handlers = []
+    state = {"signal_on_notify": True}
+    _configure_mock_main(monkeypatch, tmp_path, calls, signal_handlers, state)
+
+    await entrypoint.main()
+
+    assert calls == ["start", "stale", "notify", "history", "bubbles", "manager", "reply", "core"]
+    assert state["core"].startup_notifications == 1
+    assert signal_handlers
+
+
+async def test_main_sigterm_during_start_cancels_startup_without_notify(monkeypatch, tmp_path):
+    calls = []
+    signal_handlers = []
+    entered = asyncio.Event()
+    state = {"wait_start": True, "entered": entered}
+    _configure_mock_main(monkeypatch, tmp_path, calls, signal_handlers, state)
+
+    main_task = asyncio.create_task(entrypoint.main())
+    await entered.wait()
+    signal_handlers[1]()
+    await main_task
+
+    assert calls == ["start", "start-cancelled", "history", "bubbles", "manager", "reply", "core"]
+
+
 def main():
     tests = (
         test_telegram_start_retries_only_failed_menu_call_and_warms_bot_me,
@@ -263,15 +381,16 @@ def main():
         finally:
             patcher.undo()
     with tempfile.TemporaryDirectory() as temp_dir:
-        patcher = pytest.MonkeyPatch()
-        try:
-            asyncio.run(
-                test_main_start_failure_preserves_error_and_runs_all_cleanup(
-                    monkeypatch=patcher, tmp_path=Path(temp_dir)
-                )
-            )
-        finally:
-            patcher.undo()
+        for test in (
+            test_main_success_cleans_stale_and_notifies_before_shutdown,
+            test_main_sigterm_during_start_cancels_startup_without_notify,
+            test_main_start_failure_preserves_error_and_runs_all_cleanup,
+        ):
+            patcher = pytest.MonkeyPatch()
+            try:
+                asyncio.run(test(monkeypatch=patcher, tmp_path=Path(temp_dir)))
+            finally:
+                patcher.undo()
     print("ALL STARTUP-LIFECYCLE OK")
 
 
